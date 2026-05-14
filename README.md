@@ -4,6 +4,12 @@ Noether keeps the invariants of LLM usage: budget, policy, evaluation, and obser
 
 The command-line tool is `noet`.
 
+## North-star docs
+
+- [Product vision](./docs/product-vision.md)
+- [High-level solution design](./docs/solution-design.md)
+- [Roadmap](./docs/roadmap.md)
+
 ## Current spike
 
 This repository currently contains a capture-only local sidecar:
