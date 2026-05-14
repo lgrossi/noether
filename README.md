@@ -10,17 +10,20 @@ The command-line tool is `noet`.
 - [High-level solution design](./docs/solution-design.md)
 - [Roadmap](./docs/roadmap.md)
 
-## Current spike
+## Current build
 
-This repository currently contains a capture-only local sidecar:
+This repository currently contains a local sidecar and CLI tracer bullet:
 
 - accepts OpenAI-compatible `/v1/chat/completions`;
 - accepts Anthropic-compatible `/v1/messages`;
 - accepts OpenAI Responses-style `/v1/responses`;
-- redacts sensitive headers;
+- redacts sensitive headers and credential-like JSON body keys;
 - writes capture fixtures to `.noet/fixtures`;
 - returns mock responses when no upstream is configured;
 - forwards to an upstream base URL when configured.
+- validates `policy.noet.yaml`;
+- evaluates a minimal in-memory fixed-window budget;
+- exposes `POST /v1/authorize`, `POST /v1/reservations/{id}/finalize`, and `POST /v1/events`.
 
 It is not a production router yet. The goal is to collect real harness traffic and shape Noether's control contract without taking ownership of provider protocol correctness.
 
@@ -40,6 +43,24 @@ Custom fixture directory:
 
 ```bash
 cargo run --bin noet -- serve --fixture-dir .noet/fixtures
+```
+
+Validate a policy:
+
+```bash
+cargo run --bin noet -- policy check examples/policy.noet.yaml
+```
+
+Run capture with policy decisions recorded but not enforced:
+
+```bash
+cargo run --bin noet -- serve --policy examples/policy.noet.yaml --decision-mode dry-run
+```
+
+Run capture with deny decisions blocking before mock/upstream:
+
+```bash
+cargo run --bin noet -- serve --policy examples/policy.noet.yaml --decision-mode enforce
 ```
 
 Health check:
@@ -65,5 +86,12 @@ Fixtures use schema `noether.capture.v1` and include:
 - captured timestamp;
 - redacted request method/path/headers/body;
 - response source, status, redacted headers, body, and chunks.
+- optional decision metadata when `--policy` is configured.
 
 Prompt and response bodies are captured during this spike. Retention and redaction policy will become explicit before any central or shared deployment.
+
+See:
+
+- [Capture fixture schema v1](./docs/capture-fixtures.md)
+- [Control contract v0](./docs/control-contract-v0.md)
+- [Policy v0](./docs/policy-v0.md)

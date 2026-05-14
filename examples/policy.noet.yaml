@@ -1,0 +1,14 @@
+version: 0
+budgets:
+  - id: noether-dev-daily
+    limit_usd: 1.00
+    warn_at_fraction: 0.8
+    window_seconds: 86400
+    match:
+      project: noether
+policies:
+  - id: require-project
+    effect: deny
+    reason: project is required for budget attribution
+    when:
+      missing: project
