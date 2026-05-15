@@ -17,17 +17,17 @@ Pi normal extension
         |
  allow/warn continues, deny calls ctx.abort()
         |
- after_provider_response/message_end/turn_end/agent_end
+ message_end/turn_end/agent_end/tool hooks
         v
- POST /v1/events
- POST /v1/reservations/{id}/finalize
+ enqueue async POST /v1/events
+ enqueue async POST /v1/reservations/{id}/finalize
 ```
 
 The extension package lives at [`extensions/pi-noether`](../../extensions/pi-noether). It is commit-safe: no credentials, no real Pi config, and no captured prompts are stored in the repository.
 
 ## Hook flow and emitted payloads
 
-Noether currently uses eight Pi hooks:
+Noether currently uses seven normal-path Pi hooks:
 
 ```text
 before_agent_start
@@ -35,29 +35,30 @@ before_agent_start
 
 before_provider_request
   ├─ build bodyless authorization metadata + cached agent context
-  ├─ POST /v1/authorize
-  ├─ POST /v1/events kind=pi.agent_context
+  ├─ POST /v1/authorize with a strict timeout
+  ├─ enqueue POST /v1/events kind=pi.agent_context
   └─ deny => ctx.abort(); allow/warn => continue
 
-after_provider_response
-  └─ POST /v1/events kind=pi.provider_response
-
 tool_call
-  └─ POST /v1/events kind=pi.tool_call
+  └─ enqueue POST /v1/events kind=pi.tool_call
 
 tool_result
-  └─ POST /v1/events kind=tool.observed
+  └─ enqueue POST /v1/events kind=tool.observed
 
 message_end
-  ├─ POST /v1/events kind=pi.message_end
-  └─ POST /v1/reservations/{id}/finalize
+  ├─ enqueue POST /v1/events kind=pi.message_end
+  └─ enqueue POST /v1/reservations/{id}/finalize
 
 turn_end
-  └─ POST /v1/events kind=pi.turn_end
+  └─ enqueue POST /v1/events kind=pi.turn_end
 
 agent_end
-  └─ POST /v1/events kind=pi.agent_end
+  └─ enqueue POST /v1/events kind=pi.agent_end
 ```
+
+Only `before_provider_request` waits for Noether, because it is the authorization point before Pi
+sends the provider request. All lifecycle reporting, reservation finalization, and debug logging is
+queued and delivered best-effort so Noether persistence cannot degrade Pi interaction latency.
 
 ### `before_agent_start`
 
@@ -170,28 +171,12 @@ Noether authorization request:
 If Noether returns `deny`, the extension calls `ctx.abort()`. Throwing an error from the hook is not
 used as a deny path because Pi catches extension errors and continues.
 
-### `after_provider_response`
+### Response-level signal
 
-Pi exposes response status and headers before stream/body parsing. Noether emits status, sanitized
-headers, and elapsed time; usage is not available at this hook.
-
-```json
-{
-  "trace_id": "generated-trace-id",
-  "kind": "pi.provider_response",
-  "payload": {
-    "source": "noether-pi",
-    "decision_id": "decision-id",
-    "reservation_id": "reservation-id",
-    "status": 200,
-    "headers": {
-      "content-type": "text/event-stream",
-      "authorization": "[redacted]"
-    },
-    "latency_ms": 1450
-  }
-}
-```
+The normal extension path does not use `after_provider_response`. Real Pi hook observations showed
+that it may not fire for the active provider path, while finalized usage and assistant content are
+available later from `message_end` and turn lifecycle hooks. Response-level persistence therefore
+starts from `message_end` and is delivered asynchronously.
 
 ### `tool_call` and `tool_result`
 
@@ -393,22 +378,26 @@ Configure the extension with environment variables:
 | `NOET_PI_FAIL_MODE` | `fail_open` | Use `fail_closed` to abort provider sends when Noether is unavailable. |
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |
-| `NOET_PI_HOOK_LOG_DIR` | unset | Optional debug-only directory for raw `before_provider_request` and `after_provider_response` JSONL hook dumps. |
+| `NOET_PI_AUTHORIZE_TIMEOUT_MS` | `1000` | Maximum time the hot-path authorization hook waits for Noether. |
+| `NOET_PI_QUEUE_MAX_ITEMS` | `100` | Bounded async delivery queue size for events, finalization, and debug logs. |
+| `NOET_PI_DEBUG_HOOKS` | unset | Set to `raw` to enable local raw hook dump mode. |
+| `NOET_PI_DEBUG_HOOK_LOG_DIR` | unset | Directory for raw debug hook JSONL files when debug mode is enabled. |
 
 ## Raw hook dump mode
 
-For live Pi inspection, set `NOET_PI_HOOK_LOG_DIR` before starting Pi:
+For live Pi inspection, explicitly enable raw debug hooks before starting Pi:
 
 ```bash
-export NOET_PI_HOOK_LOG_DIR="$PWD/.noet/pi-hook-logs"
-tail -f .noet/pi-hook-logs/before_provider_request.jsonl
-tail -f .noet/pi-hook-logs/after_provider_response.jsonl
+export NOET_PI_DEBUG_HOOKS=raw
+export NOET_PI_DEBUG_HOOK_LOG_DIR="$PWD/.noet/pi-hook-logs"
+tail -f .noet/pi-hook-logs/before_provider_request.raw.jsonl
+tail -f .noet/pi-hook-logs/message_end.raw.jsonl
 ```
 
 When enabled, the extension appends one JSON object per hook call:
 
-- `before_provider_request.jsonl`: raw Pi hook `event`, raw hook `ctx` after JSON-safe serialization, generated `trace_id` / `request_id`, and the Noether authorization request built from that hook.
-- `after_provider_response.jsonl`: raw Pi hook `event`, raw hook `ctx`, active Noether request correlation, and response status/header data as exposed by Pi.
+- `before_provider_request.raw.jsonl`: raw Pi hook `event`, raw hook `ctx` after JSON-safe serialization, generated `trace_id` / `request_id`, and the Noether authorization request built from that hook.
+- `message_update.raw.jsonl`, `message_end.raw.jsonl`, `turn_end.raw.jsonl`, and `agent_end.raw.jsonl`: raw lifecycle hook payloads when those hooks fire.
 
 This mode is intentionally separate from normal Noether event ingestion. It is for discovering what
 Pi actually exposes during a real conversation. It may include prompt/provider payload data and should
@@ -458,6 +447,6 @@ Generated proof files stay under ignored `.noet/`.
 ## Known limits
 
 - The extension uses Pi 0.74.0 hook behavior. `ctx.abort()` should remain under regression proof because `before_provider_request` is not documented as a dedicated policy API.
-- `after_provider_response` exposes status and headers, not parsed usage. Usage is reported later from assistant messages in `message_end`/`turn_end`.
+- The normal path does not rely on `after_provider_response`; usage is reported from assistant messages in `message_end`/`turn_end`.
 - User-controlled extension enablement means plain Pi runs without the extension are intentionally outside Noether's local personal setup.
 - Usage/reservation matching is sequential and prototype-level. Parallel provider sends would need stronger correlation if Pi adds them.
