@@ -343,8 +343,18 @@ function fakeContext(overrides = {}) {
 			fakeContext(),
 		);
 
-		const before = JSON.parse(await readFile(resolve(hookLogDir, "before_provider_request.jsonl"), "utf8"));
-		const after = JSON.parse(await readFile(resolve(hookLogDir, "after_provider_response.jsonl"), "utf8"));
+		const beforeLines = (await readFile(resolve(hookLogDir, "before_provider_request.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const afterLines = (await readFile(resolve(hookLogDir, "after_provider_response.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const before = beforeLines.find((line) => line.payload.event);
+		const after = afterLines.find((line) => line.payload.event);
+		assert.equal(beforeLines[0].payload.extension_loaded, true);
+		assert.equal(afterLines[0].payload.extension_loaded, true);
 		assert.equal(before.hook, "before_provider_request");
 		assert.equal(before.payload.event.payload.messages[0].content, "log me raw");
 		assert.equal(before.payload.noether_authorize_request.metadata.payload_summary.messages.length, 1);

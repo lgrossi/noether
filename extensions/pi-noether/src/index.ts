@@ -403,6 +403,18 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	let pendingAgentContext: Record<string, unknown> | undefined;
 	const completedReservations = new Set<string>();
 	const toolStartedAt = new Map<string, number>();
+	writeHookLog(config, "before_provider_request", {
+		extension_loaded: true,
+		noether_url: config.noetherUrl,
+		fail_mode: config.failMode,
+		version: config.version,
+	}).catch(() => undefined);
+	writeHookLog(config, "after_provider_response", {
+		extension_loaded: true,
+		noether_url: config.noetherUrl,
+		fail_mode: config.failMode,
+		version: config.version,
+	}).catch(() => undefined);
 
 	async function safePostEvent(kind: string, payload: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
 		try {
