@@ -1,3 +1,6 @@
+// @ts-ignore: Pi runs extensions in Node; this package intentionally avoids a local @types/node dependency.
+import { appendFile, mkdir } from "node:fs/promises";
+
 declare const process: {
 	env: Record<string, string | undefined>;
 };
@@ -260,9 +263,8 @@ async function writeHookLog(
 	if (!path) {
 		return;
 	}
-	const fs = await loadNodeFs();
-	await fs.mkdir(config.hookLogDir!, { recursive: true });
-	await fs.appendFile(
+	await mkdir(config.hookLogDir!, { recursive: true });
+	await appendFile(
 		path,
 		`${JSON.stringify({
 			at: new Date().toISOString(),
@@ -289,17 +291,6 @@ async function safeWriteHookLog(
 			);
 		}
 	}
-}
-
-async function loadNodeFs(): Promise<{
-	appendFile(path: string, data: string, encoding: string): Promise<void>;
-	mkdir(path: string, options: { recursive: boolean }): Promise<void>;
-}> {
-	const load = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
-	return (await load("node:fs/promises")) as {
-		appendFile(path: string, data: string, encoding: string): Promise<void>;
-		mkdir(path: string, options: { recursive: boolean }): Promise<void>;
-	};
 }
 
 function safeForHookLog(value: unknown, depth = 8, seen = new WeakSet<object>()): unknown {
