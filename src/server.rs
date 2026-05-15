@@ -55,6 +55,7 @@ impl AppState {
 pub struct ServeConfig {
     pub bind: SocketAddr,
     pub fixture_dir: PathBuf,
+    pub db_path: PathBuf,
     pub upstream: Option<url::Url>,
     pub routes: Vec<ProxyRoute>,
     pub policy: Option<PolicyFile>,
@@ -63,7 +64,11 @@ pub struct ServeConfig {
 
 pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     fs::create_dir_all(&config.fixture_dir).await?;
+    if let Some(parent) = config.db_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
     let bind = config.bind;
+    let ledger = BudgetLedger::open_sqlite(&config.db_path)?;
     let mut state = AppState::new(
         config.fixture_dir,
         config.upstream,
@@ -71,6 +76,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         config.decision_mode,
     );
     state.routes = config.routes;
+    state.ledger = Arc::new(Mutex::new(ledger));
     let app = build_router(state);
 
     info!(bind = %bind, "starting noet capture server");
@@ -100,13 +106,13 @@ async fn health() -> impl IntoResponse {
 async fn authorize(
     State(state): State<AppState>,
     Json(request): Json<AuthorizeRequest>,
-) -> Json<AuthorizeDecision> {
+) -> Result<Json<AuthorizeDecision>, NoetError> {
     let decision = state
         .ledger
         .lock()
         .await
-        .authorize(state.policy.as_deref(), &request);
-    Json(decision)
+        .try_authorize(state.policy.as_deref(), &request)?;
+    Ok(Json(decision))
 }
 
 async fn finalize_reservation(
@@ -121,12 +127,12 @@ async fn finalize_reservation(
 async fn record_event(
     State(state): State<AppState>,
     Json(event): Json<TraceEvent>,
-) -> impl IntoResponse {
-    state.ledger.lock().await.record_event(event);
-    (
+) -> Result<impl IntoResponse, NoetError> {
+    state.ledger.lock().await.record_event(event)?;
+    Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": true })),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -739,6 +745,109 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_persists_decision_reservation_usage_and_events() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
+        let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let mut state = test_state(Some(strict_policy()));
+        state.ledger = Arc::new(Mutex::new(ledger));
+        let app = build_router(state);
+
+        let authorize_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project":"noether",
+                            "provider":"openai",
+                            "model":"gpt-test",
+                            "estimated_cost_usd":0.001,
+                            "metadata":{"trace_id":"trace-sqlite","request_id":"request-1"}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("authorize request"),
+            )
+            .await
+            .expect("authorize response");
+        assert_eq!(authorize_response.status(), StatusCode::OK);
+        let body = to_bytes(authorize_response.into_body(), usize::MAX)
+            .await
+            .expect("authorize body");
+        let decision: Value = serde_json::from_slice(&body).expect("authorize json");
+        let reservation_id = decision["reservation"]["id"]
+            .as_str()
+            .expect("reservation id");
+
+        let finalize_response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/reservations/{reservation_id}/finalize"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "actual_cost_usd":0.0008,
+                            "usage":{
+                                "provider":"openai",
+                                "model":"gpt-test",
+                                "input_tokens":10,
+                                "output_tokens":20,
+                                "total_tokens":30,
+                                "cost_usd":0.0008,
+                                "stop_reason":"stop"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("finalize request"),
+            )
+            .await
+            .expect("finalize response");
+        assert_eq!(finalize_response.status(), StatusCode::OK);
+
+        let event_response = app
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "trace_id":"trace-sqlite",
+                            "kind":"tool.observed",
+                            "payload":{"source":"test","name":"shell","duration_ms":5,"success":true}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("event request"),
+            )
+            .await
+            .expect("event response");
+        assert_eq!(event_response.status(), StatusCode::ACCEPTED);
+
+        let report = BudgetLedger::open_sqlite(&db_path)
+            .expect("reopen sqlite")
+            .usage_report()
+            .expect("usage report");
+        assert_eq!(report.total_cost_usd, 0.0008);
+        assert_eq!(report.rows[0].project.as_deref(), Some("noether"));
+        assert_eq!(report.rows[0].total_tokens, 30);
+
+        let trace = BudgetLedger::open_sqlite(&db_path)
+            .expect("reopen sqlite")
+            .trace_report("trace-sqlite")
+            .expect("trace report");
+        assert!(trace.items.iter().any(|item| item.kind == "decision.allow"));
+        assert!(
+            trace
+                .items
+                .iter()
+                .any(|item| item.kind == "usage.finalized")
+        );
+        assert!(trace.items.iter().any(|item| item.kind == "tool.observed"));
     }
 
     #[tokio::test]

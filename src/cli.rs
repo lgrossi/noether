@@ -8,6 +8,7 @@ use tokio::fs;
 use crate::contract::DecisionMode;
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
+use crate::ledger::BudgetLedger;
 use crate::policy::load_policy;
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
@@ -29,6 +30,8 @@ enum Command {
     Policy(PolicyCommand),
     /// Inspect captured fixture files.
     Fixtures(FixturesCommand),
+    /// Report persisted decisions, usage, traces, and observations.
+    Report(ReportCommand),
 }
 
 #[derive(Parser)]
@@ -40,6 +43,10 @@ struct ServeArgs {
     /// Directory where redacted capture fixtures are written.
     #[arg(long, default_value = ".noet/fixtures")]
     fixture_dir: PathBuf,
+
+    /// SQLite ledger path for durable local state.
+    #[arg(long, default_value = ".noet/noether.sqlite")]
+    db_path: PathBuf,
 
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
@@ -89,6 +96,35 @@ enum FixturesSubcommand {
     RedactCheck { path: PathBuf },
 }
 
+#[derive(Parser)]
+struct ReportCommand {
+    /// SQLite ledger path.
+    #[arg(long, default_value = ".noet/noether.sqlite")]
+    db_path: PathBuf,
+
+    /// Emit JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: ReportSubcommand,
+}
+
+#[derive(Subcommand)]
+enum ReportSubcommand {
+    /// Summarize finalized usage and cost.
+    Usage,
+    /// List authorization decisions.
+    Decisions,
+    /// Show one trace story.
+    Trace { trace_id: String },
+    /// List tool/eval observations.
+    Observations {
+        #[arg(long)]
+        kind: Option<String>,
+    },
+}
+
 pub async fn run() -> Result<(), NoetError> {
     let cli = Cli::parse();
 
@@ -105,6 +141,7 @@ pub async fn run() -> Result<(), NoetError> {
             serve(ServeConfig {
                 bind: args.bind,
                 fixture_dir: args.fixture_dir,
+                db_path: args.db_path,
                 upstream: args.upstream,
                 routes,
                 policy,
@@ -114,6 +151,7 @@ pub async fn run() -> Result<(), NoetError> {
         }
         Command::Policy(command) => run_policy(command).await,
         Command::Fixtures(command) => run_fixtures(command).await,
+        Command::Report(command) => run_report(command).await,
     }
 }
 
@@ -161,4 +199,77 @@ async fn run_fixtures(command: FixturesCommand) -> Result<(), NoetError> {
             }
         }
     }
+}
+
+async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
+    let ledger = BudgetLedger::open_sqlite(&command.db_path)?;
+    match command.command {
+        ReportSubcommand::Usage => {
+            let report = ledger.usage_report()?;
+            if command.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("total_cost_usd\t{:.6}", report.total_cost_usd);
+                println!("project\tprovider\tmodel\tsubject\ttokens\tcost_usd\treservations");
+                for row in report.rows {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
+                        row.project.as_deref().unwrap_or("-"),
+                        row.provider.as_deref().unwrap_or("-"),
+                        row.model.as_deref().unwrap_or("-"),
+                        row.subject.as_deref().unwrap_or("-"),
+                        row.total_tokens,
+                        row.total_cost_usd,
+                        row.reservations
+                    );
+                }
+            }
+        }
+        ReportSubcommand::Decisions => {
+            print_items(ledger.decisions_report()?, command.json)?;
+        }
+        ReportSubcommand::Trace { trace_id } => {
+            let report = ledger.trace_report(&trace_id)?;
+            if command.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("trace\t{}", report.trace_id);
+                for item in report.items {
+                    println!(
+                        "{}\t{}\t{}",
+                        item.occurred_at.to_rfc3339(),
+                        item.kind,
+                        item.summary
+                    );
+                }
+            }
+        }
+        ReportSubcommand::Observations { kind } => {
+            let prefix = match kind.as_deref() {
+                Some("tool") => Some("tool."),
+                Some("eval") => Some("eval."),
+                Some(value) => Some(value),
+                None => None,
+            };
+            print_items(ledger.observations_report(prefix)?, command.json)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_items(items: Vec<crate::ledger::TraceReportItem>, json: bool) -> Result<(), NoetError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else {
+        println!("occurred_at\tkind\tsummary");
+        for item in items {
+            println!(
+                "{}\t{}\t{}",
+                item.occurred_at.to_rfc3339(),
+                item.kind,
+                item.summary
+            );
+        }
+    }
+    Ok(())
 }

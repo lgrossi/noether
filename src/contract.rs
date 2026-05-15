@@ -100,6 +100,8 @@ pub struct FinalizeReservation {
     pub usage: Option<UsageObservation>,
     #[serde(default)]
     pub actual_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

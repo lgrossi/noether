@@ -55,7 +55,7 @@ pub async fn capture(
         headers: redact_headers(&headers),
         body: capture_body(&body),
     };
-    let decision = evaluate_capture_decision(&state, &request).await;
+    let decision = evaluate_capture_decision(&state, &request).await?;
 
     if state.decision_mode == DecisionMode::Enforce
         && decision
@@ -97,18 +97,20 @@ pub async fn capture(
 async fn evaluate_capture_decision(
     state: &AppState,
     request: &CapturedRequest,
-) -> Option<CapturedDecision> {
-    let policy = state.policy.as_ref()?;
+) -> Result<Option<CapturedDecision>, NoetError> {
+    let Some(policy) = state.policy.as_ref() else {
+        return Ok(None);
+    };
     let authorize_request = authorize_request_from_capture(request);
     let decision = state
         .ledger
         .lock()
         .await
-        .authorize(Some(policy.as_ref()), &authorize_request);
-    Some(CapturedDecision {
+        .try_authorize(Some(policy.as_ref()), &authorize_request)?;
+    Ok(Some(CapturedDecision {
         mode: state.decision_mode,
         decision,
-    })
+    }))
 }
 
 async fn deny_capture(
