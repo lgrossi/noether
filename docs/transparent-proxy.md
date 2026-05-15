@@ -64,9 +64,20 @@ Transparent proxy forwarding preserves:
 - authorization, account, provider-specific, and custom headers except hop-by-hop headers;
 - upstream response status, non-hop-by-hop headers, and body bytes.
 
-Noether strips hop-by-hop headers such as `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, and `upgrade`.
+Noether strips hop-by-hop headers such as `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, and `upgrade`. It also strips extension headers named by the `Connection` header.
 
 Fixture files redact secret-like request and response headers and credential-like JSON body keys. The actual upstream request and downstream response are not redacted by Noether.
+
+## Streaming behavior
+
+Streaming upstream responses are passed through progressively. For SSE and chunked/no-`content-length` responses, Noether starts returning upstream body chunks to the client as they arrive instead of waiting for upstream completion. This preserves agent/provider streaming behavior as far as Axum and reqwest expose it.
+
+Streaming fixtures are written after the stream finishes or fails. They store bounded chunk metadata:
+
+- at most the first 128 chunk previews;
+- per-chunk byte counts and UTF-8 text previews when available;
+- total streamed byte count as a binary body summary;
+- an `error` field when the upstream stream fails or the client closes before upstream completion.
 
 ## Policy behavior
 
@@ -74,9 +85,3 @@ Policy decisions run before forwarding:
 
 - `dry-run` records allow/warn/deny decision metadata and still forwards;
 - `enforce` denies before any upstream request when the decision outcome is `deny`.
-
-## Current streaming limitation
-
-This slice buffers upstream responses before returning them. That proves byte-preserving non-stream forwarding, but it is not exact streaming pass-through yet.
-
-TODO: forward `reqwest` response byte streams directly to the Axum response body while capturing bounded chunk metadata without delaying the client response.

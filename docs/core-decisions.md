@@ -40,10 +40,10 @@ Rationale: harnesses already construct provider-correct requests and credentials
 
 TODO for human review: decide whether route IDs should be persisted in fixture schema v2 as non-secret provider identity metadata.
 
-## 2026-05-15: Upstream responses are buffered before client return in the first transparent slice
+## 2026-05-15: Transparent proxy streams upstream responses progressively
 
-Decision: transparent proxy mode preserves response status, non-hop-by-hop headers, and body bytes, but buffers upstream responses before returning them to the client.
+Decision: transparent proxy mode returns SSE and chunked/no-`content-length` upstream response bodies progressively while capturing bounded chunk metadata in fixtures after stream completion or failure.
 
-Rationale: buffering matches the existing fixture capture implementation and keeps this slice focused on route matching, policy-before-forwarding, header/body preservation, and fixture redaction. Exact stream pass-through needs a different capture path that records bounded chunk metadata without delaying the downstream response.
+Rationale: buffering streamed agent responses breaks interactive agent UX and changes provider semantics. The proxy must preserve streaming behavior on the hot path, so capture stores chunk summaries asynchronously instead of waiting for the full upstream body before returning data to the client.
 
-TODO: implement true streaming pass-through with simultaneous bounded fixture chunk capture.
+TODO: decide whether fixture schema v2 should separate full-body captures from streaming summaries more explicitly.

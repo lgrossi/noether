@@ -31,7 +31,8 @@ Prompt and response text are not automatically removed. Body retention is explic
     "status": 200,
     "headers": { "content-type": "application/json" },
     "body": { "kind": "json", "value": { "id": "chatcmpl-example" } },
-    "chunks": [{ "index": 0, "bytes": 42, "text": "{\"id\":\"chatcmpl-example\"}" }]
+    "chunks": [{ "index": 0, "bytes": 42, "text": "{\"id\":\"chatcmpl-example\"}" }],
+    "error": null
   },
   "decision": {
     "mode": "dry_run",
@@ -54,6 +55,10 @@ Prompt and response text are not automatically removed. Body retention is explic
 ```
 
 `decision` is present only when the server was started with `--policy`.
+
+`response.error` is omitted when no streaming error occurred. For progressive upstream streams,
+`response.body` is a bounded byte-count summary, `response.chunks` stores the first chunk previews,
+and `response.error` records an upstream stream failure or client disconnect when one occurs.
 
 ## Inspection commands
 

@@ -133,13 +133,15 @@ async fn record_event(
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
     use axum::routing::any;
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex as TokioMutex;
+    use tokio::sync::{Mutex as TokioMutex, Notify};
+    use tokio_stream::StreamExt;
     use tower::ServiceExt;
 
     use crate::contract::{BudgetRule, PolicyCondition, PolicyEffect, PolicyRule, RuleMatch};
@@ -301,6 +303,85 @@ mod tests {
             observed,
             handle,
         }
+    }
+
+    async fn start_streaming_upstream(
+        first_chunk: &'static [u8],
+        second_chunk: &'static [u8],
+    ) -> (TestUpstream, Arc<Notify>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("upstream local addr");
+        let observed = Arc::new(TokioMutex::new(Vec::new()));
+        let handler_observed = Arc::clone(&observed);
+        let release_completion = Arc::new(Notify::new());
+        let handler_release_completion = Arc::clone(&release_completion);
+        let app = Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: axum::body::Bytes| {
+                let handler_observed = Arc::clone(&handler_observed);
+                let handler_release_completion = Arc::clone(&handler_release_completion);
+                async move {
+                    handler_observed.lock().await.push(ObservedUpstreamRequest {
+                        method: method.to_string(),
+                        path_and_query: uri
+                            .path_and_query()
+                            .map(|path| path.as_str().to_owned())
+                            .unwrap_or_else(|| uri.path().to_owned()),
+                        headers: headers
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.as_str().to_ascii_lowercase(),
+                                    value.to_str().unwrap_or("<non-utf8>").to_owned(),
+                                )
+                            })
+                            .collect(),
+                        body: body.to_vec(),
+                    });
+
+                    let (sender, receiver) =
+                        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+                    tokio::spawn(async move {
+                        sender
+                            .send(Ok(axum::body::Bytes::from_static(first_chunk)))
+                            .await
+                            .expect("send first upstream chunk");
+                        handler_release_completion.notified().await;
+                        sender
+                            .send(Ok(axum::body::Bytes::from_static(second_chunk)))
+                            .await
+                            .expect("send second upstream chunk");
+                    });
+
+                    let mut response = axum::response::Response::new(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    ));
+                    *response.status_mut() = StatusCode::OK;
+                    response.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("text/event-stream"),
+                    );
+                    response.headers_mut().insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-cache"),
+                    );
+                    response
+                }
+            },
+        ));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("upstream server");
+        });
+
+        (
+            TestUpstream {
+                base_url: url::Url::parse(&format!("http://{addr}/")).expect("upstream url"),
+                observed,
+                handle,
+            },
+            release_completion,
+        )
     }
 
     #[tokio::test]
@@ -483,6 +564,101 @@ mod tests {
             .expect("fixture paths");
         let fixture = read_fixture(&paths[0]).await.expect("fixture");
         assert_eq!(fixture.response.source, ResponseSource::DecisionDenied);
+    }
+
+    #[tokio::test]
+    async fn transparent_route_streams_first_chunk_before_upstream_completes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture_dir = tempdir.path().join("fixtures");
+        let (upstream, release_completion) =
+            start_streaming_upstream(b"data: first\n\n", b"data: second\n\n").await;
+        let app = build_router(state_with_policy_routes(
+            fixture_dir.clone(),
+            require_project_policy(),
+            DecisionMode::DryRun,
+            proxy_routes(upstream.base_url.clone()),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/providers/openai/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"model":"gpt-test"}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("first chunk before upstream completion")
+            .expect("first chunk present")
+            .expect("first chunk ok");
+        assert_eq!(&first[..], b"data: first\n\n");
+        let fixture_paths_before_completion = if fixture_dir.exists() {
+            list_fixture_paths(&fixture_dir)
+                .await
+                .expect("fixture paths before completion")
+        } else {
+            Vec::new()
+        };
+        assert!(fixture_paths_before_completion.is_empty());
+
+        release_completion.notify_one();
+        let second = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("second chunk after release")
+            .expect("second chunk present")
+            .expect("second chunk ok");
+        assert_eq!(&second[..], b"data: second\n\n");
+        assert!(body.next().await.is_none());
+
+        let paths = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let paths = list_fixture_paths(&fixture_dir)
+                    .await
+                    .expect("fixture paths after completion");
+                if !paths.is_empty() {
+                    break paths;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture written after stream completion");
+        let fixture = read_fixture(&paths[0]).await.expect("fixture");
+        assert_eq!(fixture.response.source, ResponseSource::Upstream);
+        match fixture.response.body {
+            CapturedBody::Binary { bytes } => assert_eq!(bytes, 27),
+            CapturedBody::Json { .. } | CapturedBody::Text { .. } | CapturedBody::Empty => {
+                panic!("expected streaming fixture body summary")
+            }
+        }
+        assert_eq!(fixture.response.chunks.len(), 2);
+        assert_eq!(
+            fixture.response.chunks[0].text.as_deref(),
+            Some("data: first\n\n")
+        );
+        assert_eq!(
+            fixture.response.chunks[1].text.as_deref(),
+            Some("data: second\n\n")
+        );
+        assert!(fixture.response.error.is_none());
+        let decision = fixture.decision.expect("decision metadata");
+        assert_eq!(decision.mode, DecisionMode::DryRun);
+        assert_eq!(
+            decision.decision.outcome,
+            crate::contract::DecisionOutcome::Deny
+        );
     }
 
     #[tokio::test]

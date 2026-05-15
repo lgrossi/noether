@@ -56,6 +56,8 @@ pub struct CapturedResponse {
     pub headers: BTreeMap<String, String>,
     pub body: CapturedBody,
     pub chunks: Vec<CapturedChunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,6 +183,7 @@ mod tests {
                     value: "ok".to_owned(),
                 },
                 chunks: Vec::new(),
+                error: None,
             },
             None,
         );

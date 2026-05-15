@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
@@ -8,17 +9,22 @@ use reqwest::header::{
     CONNECTION as REQWEST_CONNECTION, HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue,
 };
 use serde_json::{Value, json};
+use tokio_stream::StreamExt;
+use tracing::warn;
 
 use crate::contract::{AuthorizeRequest, DecisionMode, DecisionOutcome};
 use crate::error::NoetError;
 use crate::fixture::{
-    CaptureFixture, CapturedChunk, CapturedDecision, CapturedRequest, CapturedResponse,
-    ResponseSource, capture_body, persist_fixture, request_streamed, text_preview,
+    CaptureFixture, CapturedBody, CapturedChunk, CapturedDecision, CapturedRequest,
+    CapturedResponse, ResponseSource, capture_body, persist_fixture, request_streamed,
+    text_preview,
 };
 use crate::mock::{mock_json, mock_stream};
 use crate::proxy::ProxyRoutes;
 use crate::redaction::{redact_headers, redact_reqwest_headers};
 use crate::server::AppState;
+
+const MAX_CAPTURED_STREAM_CHUNKS: usize = 128;
 
 struct ForwardContext {
     trace_id: String,
@@ -127,6 +133,7 @@ async fn deny_capture(
             headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
             body: capture_body(&body_bytes),
             chunks: Vec::new(),
+            error: None,
         },
         decision,
     );
@@ -158,7 +165,7 @@ async fn forward_upstream(
         .client
         .request(reqwest_method, target)
         .headers(upstream_headers)
-        .body(context.body)
+        .body(context.body.clone())
         .send()
         .await?;
 
@@ -167,6 +174,17 @@ async fn forward_upstream(
     let response_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let captured_headers = redact_reqwest_headers(&response_headers);
     let public_headers = response_headers_for_client(&response_headers);
+    if should_stream_response(&response_headers) {
+        return Ok(stream_upstream_response(
+            state,
+            context,
+            response_status,
+            captured_headers,
+            public_headers,
+            upstream_response.bytes_stream(),
+        ));
+    }
+
     let response_bytes = upstream_response.bytes().await?;
     let fixture = CaptureFixture::new(
         context.trace_id.clone(),
@@ -181,6 +199,7 @@ async fn forward_upstream(
                 bytes: response_bytes.len(),
                 text: text_preview(&response_bytes),
             }],
+            error: None,
         },
         context.decision,
     );
@@ -196,6 +215,103 @@ async fn forward_upstream(
     );
 
     Ok(response)
+}
+
+fn stream_upstream_response(
+    state: AppState,
+    context: ForwardContext,
+    response_status: StatusCode,
+    captured_headers: BTreeMap<String, String>,
+    public_headers: HeaderMap,
+    stream: impl tokio_stream::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+) -> Response {
+    let trace_id = context.trace_id.clone();
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(1);
+    let fixture_dir = state.fixture_dir;
+    let mut stream = Box::pin(stream);
+
+    tokio::spawn(async move {
+        let mut capture = StreamCapture::default();
+        let mut error = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    capture.record_chunk(&bytes);
+                    if sender.send(Ok(bytes)).await.is_err() {
+                        error = Some("client stream closed before upstream completed".to_owned());
+                        break;
+                    }
+                }
+                Err(upstream_error) => {
+                    let message = format!("upstream stream failed: {upstream_error}");
+                    error = Some(message.clone());
+                    let _ = sender.send(Err(io::Error::other(message))).await;
+                    break;
+                }
+            }
+        }
+
+        let fixture = CaptureFixture::new(
+            context.trace_id,
+            context.request,
+            CapturedResponse {
+                source: ResponseSource::Upstream,
+                status: response_status.as_u16(),
+                headers: captured_headers,
+                body: capture.body(),
+                chunks: capture.chunks,
+                error,
+            },
+            context.decision,
+        );
+        if let Err(error) = persist_fixture(&fixture_dir, &fixture).await {
+            warn!(error = %error, "failed to persist streaming capture fixture");
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(receiver),
+    ));
+    *response.status_mut() = response_status;
+    *response.headers_mut() = public_headers;
+    response.headers_mut().insert(
+        "x-noet-trace-id",
+        axum::http::HeaderValue::from_str(&trace_id)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("invalid")),
+    );
+    response
+}
+
+#[derive(Default)]
+struct StreamCapture {
+    chunks: Vec<CapturedChunk>,
+    seen_chunks: usize,
+    total_bytes: usize,
+}
+
+impl StreamCapture {
+    fn record_chunk(&mut self, bytes: &Bytes) {
+        if self.chunks.len() < MAX_CAPTURED_STREAM_CHUNKS {
+            self.chunks.push(CapturedChunk {
+                index: self.seen_chunks,
+                bytes: bytes.len(),
+                text: text_preview(bytes),
+            });
+        }
+        self.seen_chunks += 1;
+        self.total_bytes += bytes.len();
+    }
+
+    fn body(&self) -> CapturedBody {
+        if self.total_bytes == 0 {
+            CapturedBody::Empty
+        } else {
+            CapturedBody::Binary {
+                bytes: self.total_bytes,
+            }
+        }
+    }
 }
 
 async fn mock_response(
@@ -227,6 +343,7 @@ async fn mock_response(
                 bytes: body_bytes.len(),
                 text: text_preview(&body_bytes),
             }],
+            error: None,
         },
         decision,
     );
@@ -315,6 +432,18 @@ fn f64_at(value: Option<&Value>, path: &[&str]) -> Option<f64> {
                 .try_fold(value, |current, key| current.get(*key))
         })
         .and_then(Value::as_f64)
+}
+
+fn should_stream_response(headers: &ReqwestHeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+        || !headers.contains_key(reqwest::header::CONTENT_LENGTH)
 }
 
 fn upstream_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
