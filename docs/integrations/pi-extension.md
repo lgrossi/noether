@@ -27,16 +27,26 @@ The extension package lives at [`extensions/pi-noether`](../../extensions/pi-noe
 
 ## Hook flow and emitted payloads
 
-Noether currently uses five Pi hooks:
+Noether currently uses eight Pi hooks:
 
 ```text
+before_agent_start
+  └─ cache bodyless agent context: selected tools, skills, context files
+
 before_provider_request
-  ├─ build bodyless authorization metadata
+  ├─ build bodyless authorization metadata + cached agent context
   ├─ POST /v1/authorize
+  ├─ POST /v1/events kind=pi.agent_context
   └─ deny => ctx.abort(); allow/warn => continue
 
 after_provider_response
   └─ POST /v1/events kind=pi.provider_response
+
+tool_call
+  └─ POST /v1/events kind=pi.tool_call
+
+tool_result
+  └─ POST /v1/events kind=tool.observed
 
 message_end
   ├─ POST /v1/events kind=pi.message_end
@@ -47,6 +57,45 @@ turn_end
 
 agent_end
   └─ POST /v1/events kind=pi.agent_end
+```
+
+### `before_agent_start`
+
+Pi exposes the prompt startup context before the agent loop. Noether does not send the prompt text,
+but it records the workflow shape: active tools, loaded skills, context files, and cwd. This cached
+context is attached to the next authorization request and emitted as `pi.agent_context`.
+
+Example Pi-side input:
+
+```json
+{
+  "prompt": "not sent to Noether by default",
+  "systemPromptOptions": {
+    "selectedTools": ["read", "bash", "edit"],
+    "skills": [{ "name": "diagnose" }, { "name": "tdd" }],
+    "contextFiles": [{ "path": "AGENTS.md" }],
+    "cwd": "/repo"
+  }
+}
+```
+
+Noether event:
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.agent_context",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "selected_tools": ["read", "bash", "edit"],
+    "skills": ["diagnose", "tdd"],
+    "context_files": ["AGENTS.md"],
+    "cwd": "/repo",
+    "prompt": { "type": "string", "length": 30 }
+  }
+}
 ```
 
 ### `before_provider_request`
@@ -107,6 +156,11 @@ Noether authorization request:
       "model": { "type": "string", "length": 7 },
       "stream": true
     },
+    "agent_context": {
+      "selected_tools": ["read", "bash", "edit"],
+      "skills": ["diagnose", "tdd"],
+      "context_files": ["AGENTS.md"]
+    },
     "context_window": 128000,
     "context_usage_percent": 0.96
   }
@@ -135,6 +189,57 @@ headers, and elapsed time; usage is not available at this hook.
       "authorization": "[redacted]"
     },
     "latency_ms": 1450
+  }
+}
+```
+
+### `tool_call` and `tool_result`
+
+`tool_call` fires before Pi executes a tool. Noether records the tool name, tool call id, and a
+shape-only input summary. It does not send command text, file contents, or tool arguments verbatim.
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.tool_call",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "tool_name": "bash",
+    "tool_call_id": "toolu_123",
+    "input_summary": {
+      "command": { "type": "string", "length": 42 },
+      "timeout": 1000
+    }
+  }
+}
+```
+
+`tool_result` fires after execution. Noether emits the generic `tool.observed` event family so the
+result appears in `noet report observations --kind tool`.
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "tool.observed",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "name": "bash",
+    "duration_ms": 240,
+    "success": true,
+    "metadata": {
+      "tool_call_id": "toolu_123",
+      "input_summary": {
+        "command": { "type": "string", "length": 42 }
+      },
+      "content_summary": { "type": "array", "length": 1 },
+      "details_summary": {
+        "exitCode": 0
+      }
+    }
   }
 }
 ```
@@ -227,7 +332,9 @@ turn message:
 }
 ```
 
-The extension does not currently use `context`, `before_agent_start`, or `message_update`.
+The extension does not currently use `context`, `message_start`, `message_update`,
+`tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `turn_start`, or
+`agent_start`.
 
 ## Installation and enabling
 
