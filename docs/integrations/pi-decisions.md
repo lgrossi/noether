@@ -31,6 +31,8 @@ TODO for human review:
 
 ## 2026-05-14: Treat extension-only authorization as weaker than proxy authorization
 
+Superseded on 2026-05-15 by [`pi-wrapper-research.md`](./pi-wrapper-research.md) and [`pi-extension-wrapper.md`](./pi-extension-wrapper.md): hard-deny through `ctx.abort()` in `before_provider_request` is now the primary subscription-backed path for wrapped Pi runs.
+
 Decision: Docs classify Pi extension hooks as observation and possible soft-gate mechanisms, not as proven hard budget enforcement.
 
 Rationale:
@@ -56,4 +58,3 @@ Rationale:
 TODO for human review:
 
 - Decide whether the next spike should add only enough Codex Responses support for pass-through capture, or a generic event-normalization layer for subscription providers.
-
