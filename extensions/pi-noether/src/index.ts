@@ -244,13 +244,16 @@ function summarizeToolMetadata(event: unknown): Record<string, unknown> {
 	});
 }
 
-function hookLogPath(config: NoetherConfig, hook: "before_provider_request" | "after_provider_response"): string | undefined {
+function hookLogPath(
+	config: NoetherConfig,
+	hook: "session_start" | "before_provider_request" | "after_provider_response",
+): string | undefined {
 	return config.hookLogDir ? `${config.hookLogDir.replace(/\/+$/, "")}/${hook}.jsonl` : undefined;
 }
 
 async function writeHookLog(
 	config: NoetherConfig,
-	hook: "before_provider_request" | "after_provider_response",
+	hook: "session_start" | "before_provider_request" | "after_provider_response",
 	payload: Record<string, unknown>,
 ): Promise<void> {
 	const path = hookLogPath(config, hook);
@@ -268,6 +271,24 @@ async function writeHookLog(
 		})}\n`,
 		"utf8",
 	);
+}
+
+async function safeWriteHookLog(
+	config: NoetherConfig,
+	hook: "session_start" | "before_provider_request" | "after_provider_response",
+	payload: Record<string, unknown>,
+): Promise<void> {
+	try {
+		await writeHookLog(config, hook, payload);
+	} catch (error) {
+		if (config.hookLogDir) {
+			console.error(
+				`[noether-pi] failed to write ${hook} hook log to ${config.hookLogDir}: ${
+					error instanceof Error ? error.stack || error.message : String(error)
+				}`,
+			);
+		}
+	}
 }
 
 async function loadNodeFs(): Promise<{
@@ -403,18 +424,18 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	let pendingAgentContext: Record<string, unknown> | undefined;
 	const completedReservations = new Set<string>();
 	const toolStartedAt = new Map<string, number>();
-	writeHookLog(config, "before_provider_request", {
+	safeWriteHookLog(config, "before_provider_request", {
 		extension_loaded: true,
 		noether_url: config.noetherUrl,
 		fail_mode: config.failMode,
 		version: config.version,
-	}).catch(() => undefined);
-	writeHookLog(config, "after_provider_response", {
+	});
+	safeWriteHookLog(config, "after_provider_response", {
 		extension_loaded: true,
 		noether_url: config.noetherUrl,
 		fail_mode: config.failMode,
 		version: config.version,
-	}).catch(() => undefined);
+	});
 
 	async function safePostEvent(kind: string, payload: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
 		try {
@@ -426,6 +447,17 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 
 	pi.on("before_agent_start", (event) => {
 		pendingAgentContext = summarizeAgentContext(event);
+	});
+
+	pi.on("session_start", async (event, ctx) => {
+		await safeWriteHookLog(config, "session_start", {
+			event,
+			ctx,
+			noether_url: config.noetherUrl,
+			fail_mode: config.failMode,
+			version: config.version,
+			hook_log_dir: config.hookLogDir,
+		});
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
@@ -441,13 +473,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				agent_context: pendingAgentContext,
 			};
 		}
-		await writeHookLog(config, "before_provider_request", {
+		await safeWriteHookLog(config, "before_provider_request", {
 			trace_id: traceId,
 			request_id: requestId,
 			event,
 			ctx,
 			noether_authorize_request: request,
-		}).catch(() => undefined);
+		});
 		activeRequest = {
 			traceId,
 			requestId,
@@ -516,13 +548,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	});
 
 	pi.on("after_provider_response", async (event, ctx) => {
-		await writeHookLog(config, "after_provider_response", {
+		await safeWriteHookLog(config, "after_provider_response", {
 			trace_id: activeRequest?.traceId,
 			request_id: activeRequest?.requestId,
 			event,
 			ctx,
 			active_request: activeRequest,
-		}).catch(() => undefined);
+		});
 		await safePostEvent(
 			"pi.provider_response",
 			{
