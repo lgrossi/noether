@@ -27,6 +27,7 @@ type NoetherConfig = {
 	failMode: FailMode;
 	includeBody: boolean;
 	version: string;
+	hookLogDir?: string;
 };
 
 type ActiveRequest = {
@@ -68,6 +69,7 @@ export function extensionConfig(env: Record<string, string | undefined> = proces
 		failMode: env.NOET_PI_FAIL_MODE === "fail_closed" ? "fail_closed" : DEFAULT_FAIL_MODE,
 		includeBody: env.NOET_PI_INCLUDE_BODY === "1" || env.NOET_PI_INCLUDE_BODY === "true",
 		version: env.NOET_PI_EXTENSION_VERSION || "dev",
+		hookLogDir: emptyToUndefined(env.NOET_PI_HOOK_LOG_DIR),
 	};
 }
 
@@ -242,6 +244,74 @@ function summarizeToolMetadata(event: unknown): Record<string, unknown> {
 	});
 }
 
+function hookLogPath(config: NoetherConfig, hook: "before_provider_request" | "after_provider_response"): string | undefined {
+	return config.hookLogDir ? `${config.hookLogDir.replace(/\/+$/, "")}/${hook}.jsonl` : undefined;
+}
+
+async function writeHookLog(
+	config: NoetherConfig,
+	hook: "before_provider_request" | "after_provider_response",
+	payload: Record<string, unknown>,
+): Promise<void> {
+	const path = hookLogPath(config, hook);
+	if (!path) {
+		return;
+	}
+	const fs = await loadNodeFs();
+	await fs.mkdir(config.hookLogDir!, { recursive: true });
+	await fs.appendFile(
+		path,
+		`${JSON.stringify({
+			at: new Date().toISOString(),
+			hook,
+			payload: safeForHookLog(payload),
+		})}\n`,
+		"utf8",
+	);
+}
+
+async function loadNodeFs(): Promise<{
+	appendFile(path: string, data: string, encoding: string): Promise<void>;
+	mkdir(path: string, options: { recursive: boolean }): Promise<void>;
+}> {
+	const load = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
+	return (await load("node:fs/promises")) as {
+		appendFile(path: string, data: string, encoding: string): Promise<void>;
+		mkdir(path: string, options: { recursive: boolean }): Promise<void>;
+	};
+}
+
+function safeForHookLog(value: unknown, depth = 8, seen = new WeakSet<object>()): unknown {
+	if (depth <= 0) {
+		return summarizeValue(value);
+	}
+	if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+		return value;
+	}
+	if (typeof value === "undefined") {
+		return "[undefined]";
+	}
+	if (typeof value === "function") {
+		return "[function]";
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => safeForHookLog(item, depth - 1, seen));
+	}
+	if (!isRecord(value)) {
+		return summarizeValue(value);
+	}
+	if (seen.has(value)) {
+		return "[circular]";
+	}
+	seen.add(value);
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value)) {
+		output[key] = safeForHookLog(nested, depth - 1, seen);
+	}
+	seen.delete(value);
+	return output;
+}
+
 async function authorize(noetherUrl: string, request: unknown, signal?: AbortSignal): Promise<AuthorizeDecision> {
 	const response = await fetch(`${noetherUrl}/v1/authorize`, {
 		method: "POST",
@@ -359,6 +429,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				agent_context: pendingAgentContext,
 			};
 		}
+		await writeHookLog(config, "before_provider_request", {
+			trace_id: traceId,
+			request_id: requestId,
+			event,
+			ctx,
+			noether_authorize_request: request,
+		}).catch(() => undefined);
 		activeRequest = {
 			traceId,
 			requestId,
@@ -427,6 +504,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	});
 
 	pi.on("after_provider_response", async (event, ctx) => {
+		await writeHookLog(config, "after_provider_response", {
+			trace_id: activeRequest?.traceId,
+			request_id: activeRequest?.requestId,
+			event,
+			ctx,
+			active_request: activeRequest,
+		}).catch(() => undefined);
 		await safePostEvent(
 			"pi.provider_response",
 			{

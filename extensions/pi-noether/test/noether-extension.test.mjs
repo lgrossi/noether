@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -294,6 +296,63 @@ function fakeContext(overrides = {}) {
 		assert.equal(JSON.stringify(calls).includes("secret output"), false);
 	} finally {
 		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const hookLogDir = await mkdtemp(resolve(tmpdir(), "pi-noether-hooks-"));
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_hook",
+				outcome: "allow",
+				reservation: { id: "res_hook" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				hookLogDir,
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local", messages: [{ role: "user", content: "log me raw" }] } },
+			fakeContext(),
+		);
+		await handlers.get("after_provider_response")(
+			{ status: 200, headers: { "content-type": "text/event-stream" } },
+			fakeContext(),
+		);
+
+		const before = JSON.parse(await readFile(resolve(hookLogDir, "before_provider_request.jsonl"), "utf8"));
+		const after = JSON.parse(await readFile(resolve(hookLogDir, "after_provider_response.jsonl"), "utf8"));
+		assert.equal(before.hook, "before_provider_request");
+		assert.equal(before.payload.event.payload.messages[0].content, "log me raw");
+		assert.equal(before.payload.noether_authorize_request.metadata.payload_summary.messages.length, 1);
+		assert.equal(after.hook, "after_provider_response");
+		assert.equal(after.payload.event.status, 200);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(hookLogDir, { recursive: true, force: true });
 	}
 }
 
