@@ -9,6 +9,7 @@ use crate::contract::DecisionMode;
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
 use crate::policy::load_policy;
+use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
 use crate::server::{ServeConfig, serve};
 
@@ -43,6 +44,10 @@ struct ServeArgs {
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
     upstream: Option<url::Url>,
+
+    /// Optional transparent proxy route config YAML.
+    #[arg(long)]
+    routes: Option<PathBuf>,
 
     /// Optional policy.noet.yaml file for decisions and capture enforcement.
     #[arg(long)]
@@ -93,10 +98,15 @@ pub async fn run() -> Result<(), NoetError> {
                 Some(path) => Some(load_policy(&path).await?),
                 None => None,
             };
+            let routes = match args.routes {
+                Some(path) => load_proxy_routes(&path).await?.routes,
+                None => Vec::new(),
+            };
             serve(ServeConfig {
                 bind: args.bind,
                 fixture_dir: args.fixture_dir,
                 upstream: args.upstream,
+                routes,
                 policy,
                 decision_mode: args.decision_mode,
             })

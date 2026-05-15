@@ -21,6 +21,7 @@ This repository currently contains a local sidecar and CLI tracer bullet:
 - writes capture fixtures to `.noet/fixtures`;
 - returns mock responses when no upstream is configured;
 - forwards to an upstream base URL when configured.
+- supports transparent provider-wrapper routes that strip a local wrapper prefix and forward to the original upstream without provider translation;
 - validates `policy.noet.yaml`;
 - evaluates a minimal in-memory fixed-window budget;
 - exposes `POST /v1/authorize`, `POST /v1/reservations/{id}/finalize`, and `POST /v1/events`.
@@ -38,6 +39,22 @@ With an upstream:
 ```bash
 cargo run --bin noet -- serve --upstream http://127.0.0.1:11434/
 ```
+
+Transparent provider-wrapper routes:
+
+```yaml
+# noet.routes.yaml
+routes:
+  - id: openai
+    path_prefix: /providers/openai
+    upstream_base_url: https://api.openai.com/
+```
+
+```bash
+cargo run --bin noet -- serve --routes noet.routes.yaml
+```
+
+Requests to `/providers/openai/v1/responses` are forwarded to `/v1/responses` at the configured upstream. Noether preserves method, query, body, auth/account/provider headers, and response status/headers/body except hop-by-hop headers.
 
 Custom fixture directory:
 
@@ -93,5 +110,6 @@ Prompt and response bodies are captured during this spike. Retention and redacti
 See:
 
 - [Capture fixture schema v1](./docs/capture-fixtures.md)
+- [Transparent proxy mode](./docs/transparent-proxy.md)
 - [Control contract v0](./docs/control-contract-v0.md)
 - [Policy v0](./docs/policy-v0.md)

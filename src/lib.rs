@@ -6,5 +6,6 @@ pub mod fixture;
 pub mod ledger;
 pub mod mock;
 pub mod policy;
+pub mod proxy;
 pub mod redaction;
 pub mod server;

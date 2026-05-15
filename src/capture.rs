@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    CONNECTION as REQWEST_CONNECTION, HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue,
+};
 use serde_json::{Value, json};
 
 use crate::contract::{AuthorizeRequest, DecisionMode, DecisionOutcome};
@@ -14,6 +16,7 @@ use crate::fixture::{
     ResponseSource, capture_body, persist_fixture, request_streamed, text_preview,
 };
 use crate::mock::{mock_json, mock_stream};
+use crate::proxy::ProxyRoutes;
 use crate::redaction::{redact_headers, redact_reqwest_headers};
 use crate::server::AppState;
 
@@ -21,7 +24,7 @@ struct ForwardContext {
     trace_id: String,
     method: Method,
     headers: HeaderMap,
-    path: String,
+    upstream_path: String,
     body: Bytes,
     request: CapturedRequest,
     decision: Option<CapturedDecision>,
@@ -56,13 +59,25 @@ pub async fn capture(
         return deny_capture(state, trace_id, request, decision).await;
     }
 
-    match state.upstream.clone() {
-        Some(upstream) => {
+    let route_match = ProxyRoutes {
+        routes: state.routes.clone(),
+    }
+    .match_request(&path, &headers);
+
+    match route_match
+        .map(|route| (route.upstream_base_url, route.upstream_path))
+        .or_else(|| {
+            state
+                .upstream
+                .clone()
+                .map(|upstream| (upstream, path.clone()))
+        }) {
+        Some((upstream, upstream_path)) => {
             let context = ForwardContext {
                 trace_id,
                 method,
                 headers,
-                path,
+                upstream_path,
                 body,
                 request,
                 decision,
@@ -135,7 +150,7 @@ async fn forward_upstream(
     upstream: url::Url,
     context: ForwardContext,
 ) -> Result<Response, NoetError> {
-    let target = upstream.join(context.path.trim_start_matches('/'))?;
+    let target = upstream.join(context.upstream_path.trim_start_matches('/'))?;
     let reqwest_method = reqwest::Method::from_bytes(context.method.as_str().as_bytes())
         .map_err(|error| NoetError::Method(error.to_string()))?;
     let upstream_headers = upstream_headers(&context.headers);
@@ -304,8 +319,9 @@ fn f64_at(value: Option<&Value>, path: &[&str]) -> Option<f64> {
 
 fn upstream_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut upstream_headers = ReqwestHeaderMap::new();
+    let hop_by_hop_headers = request_hop_by_hop_headers(headers);
     for (name, value) in headers {
-        if hop_by_hop_header(name.as_str()) || name == header::HOST {
+        if hop_by_hop_headers.contains(name.as_str()) || name == header::HOST {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -320,8 +336,9 @@ fn upstream_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
 
 fn response_headers_for_client(headers: &ReqwestHeaderMap) -> HeaderMap {
     let mut client_headers = HeaderMap::new();
+    let hop_by_hop_headers = response_hop_by_hop_headers(headers);
     for (name, value) in headers {
-        if hop_by_hop_header(name.as_str()) {
+        if hop_by_hop_headers.contains(name.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -334,16 +351,46 @@ fn response_headers_for_client(headers: &ReqwestHeaderMap) -> HeaderMap {
     client_headers
 }
 
-fn hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+fn request_hop_by_hop_headers(headers: &HeaderMap) -> BTreeSet<String> {
+    let mut names = default_hop_by_hop_headers();
+    for value in headers.get_all(header::CONNECTION) {
+        collect_connection_header_names(value.as_bytes(), &mut names);
+    }
+    names
+}
+
+fn response_hop_by_hop_headers(headers: &ReqwestHeaderMap) -> BTreeSet<String> {
+    let mut names = default_hop_by_hop_headers();
+    for value in headers.get_all(REQWEST_CONNECTION) {
+        collect_connection_header_names(value.as_bytes(), &mut names);
+    }
+    names
+}
+
+fn default_hop_by_hop_headers() -> BTreeSet<String> {
+    [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn collect_connection_header_names(value: &[u8], names: &mut BTreeSet<String>) {
+    if let Ok(value) = std::str::from_utf8(value) {
+        names.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_ascii_lowercase),
+        );
+    }
 }

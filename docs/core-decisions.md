@@ -31,3 +31,19 @@ Decision: Noether's primary integration shape is a transparent or forward contro
 Rationale: Pi and similar harnesses already know how to build provider-correct paths, headers, bodies, auth, account metadata, and streaming protocols. Noether should leverage that by sitting on the transport path, applying policy/budget/trace/redaction before forwarding, and returning upstream responses without changing provider semantics. Provider emulation remains useful for local mocks and deterministic tests, but it is not the default product direction.
 
 TODO for human review: define the wrapper configuration contract for mapping intercepted provider traffic to original upstream base URLs, including how provider identity is carried without leaking secrets into fixtures.
+
+## 2026-05-15: Transparent proxy routes strip only local wrapper prefixes
+
+Decision: add a local `--routes` YAML contract with `routes[].id`, optional `path_prefix`, optional `header_name`/`header_value`, and `upstream_base_url`. When a path-prefixed route matches, Noether strips that local wrapper prefix and forwards the remaining path/query to the configured upstream.
+
+Rationale: harnesses already construct provider-correct requests and credentials. A small wrapper prefix such as `/providers/openai` gives local routing identity without requiring provider request translation or real credential changes. Header matching supports wrapper setups that cannot or should not change paths.
+
+TODO for human review: decide whether route IDs should be persisted in fixture schema v2 as non-secret provider identity metadata.
+
+## 2026-05-15: Upstream responses are buffered before client return in the first transparent slice
+
+Decision: transparent proxy mode preserves response status, non-hop-by-hop headers, and body bytes, but buffers upstream responses before returning them to the client.
+
+Rationale: buffering matches the existing fixture capture implementation and keeps this slice focused on route matching, policy-before-forwarding, header/body preservation, and fixture redaction. Exact stream pass-through needs a different capture path that records bounded chunk metadata without delaying the downstream response.
+
+TODO: implement true streaming pass-through with simultaneous bounded fixture chunk capture.

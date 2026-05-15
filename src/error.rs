@@ -27,6 +27,9 @@ pub enum NoetError {
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
 
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 }
@@ -35,7 +38,9 @@ impl IntoResponse for NoetError {
     fn into_response(self) -> Response {
         error!(error = %self, "request failed");
         let status = match self {
-            Self::InvalidPolicy(_) | Self::Json(_) | Self::Yaml(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidPolicy(_) | Self::InvalidConfig(_) | Self::Json(_) | Self::Yaml(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Io(_) | Self::Upstream(_) | Self::Url(_) | Self::Method(_) => {
                 StatusCode::BAD_GATEWAY
