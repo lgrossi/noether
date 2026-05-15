@@ -24,10 +24,48 @@ This repository currently contains a local sidecar and CLI tracer bullet:
 - supports transparent provider-wrapper routes that strip a local wrapper prefix and forward to the original upstream without provider translation;
 - includes a normal Pi extension package that authorizes provider requests through local Noether before Pi sends them;
 - validates `policy.noet.yaml`;
-- evaluates a minimal in-memory fixed-window budget;
+- evaluates a minimal fixed-window budget;
 - exposes `POST /v1/authorize`, `POST /v1/reservations/{id}/finalize`, and `POST /v1/events`.
+- persists local decisions, reservations, usage, and events to SQLite;
+- reports usage, decisions, trace stories, and observations from the local ledger.
 
 It is not a production router yet. The goal is to collect real harness traffic and shape Noether's control contract without taking ownership of provider protocol correctness.
+
+## Current control flow
+
+Noether is a sidecar control plane. A harness, app, or proxy asks before model spend and reports what
+happened afterward:
+
+1. Client calls `POST /v1/authorize` with subject/project/provider/model estimates and correlation metadata.
+2. Noether evaluates policy and budget, then returns `allow`, `warn`, or `deny`.
+3. `allow`/`warn` creates a reservation. `deny` has no reservation and the integration should not call the provider.
+4. The integration sends the provider request normally when allowed.
+5. After the response, the integration calls `POST /v1/reservations/{id}/finalize` with actual usage/cost.
+6. The integration can also send `POST /v1/events` for timeline, tool, usage, and eval observations.
+7. `noet report ...` reads the SQLite ledger and shows usage totals, decisions, trace stories, and observations.
+
+For Pi, the primary integration is `extensions/pi-noether`: the extension runs this flow from Pi hooks,
+keeps prompts/body content private by default, and propagates `trace_id` / `request_id` for reporting.
+
+## Vertical MVP demo
+
+Run a safe local demo with no provider credentials:
+
+```bash
+./examples/vertical-mvp-demo.sh
+```
+
+The demo starts `noet serve`, authorizes one bodyless Pi-shaped request, finalizes usage, ingests
+request/tool/eval events, and prints:
+
+```bash
+noet report usage
+noet report decisions
+noet report trace <trace_id>
+noet report observations
+```
+
+It writes its disposable SQLite ledger under `.noet/demo/vertical-mvp.sqlite`.
 
 ## Run
 
