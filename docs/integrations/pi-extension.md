@@ -25,6 +25,210 @@ Pi normal extension
 
 The extension package lives at [`extensions/pi-noether`](../../extensions/pi-noether). It is commit-safe: no credentials, no real Pi config, and no captured prompts are stored in the repository.
 
+## Hook flow and emitted payloads
+
+Noether currently uses five Pi hooks:
+
+```text
+before_provider_request
+  ├─ build bodyless authorization metadata
+  ├─ POST /v1/authorize
+  └─ deny => ctx.abort(); allow/warn => continue
+
+after_provider_response
+  └─ POST /v1/events kind=pi.provider_response
+
+message_end
+  ├─ POST /v1/events kind=pi.message_end
+  └─ POST /v1/reservations/{id}/finalize
+
+turn_end
+  └─ POST /v1/events kind=pi.turn_end
+
+agent_end
+  └─ POST /v1/events kind=pi.agent_end
+```
+
+### `before_provider_request`
+
+Pi provides the provider-shaped payload and context immediately before transport. The payload may
+contain prompt-like fields, so Noether summarizes it by default instead of sending bodies.
+
+Example Pi-side inputs:
+
+```json
+{
+  "event": {
+    "payload": {
+      "model": "gpt-5.5",
+      "input": [{ "role": "user", "content": "not sent to Noether by default" }],
+      "instructions": "not sent to Noether by default",
+      "stream": true
+    }
+  },
+  "ctx": {
+    "cwd": "/repo",
+    "model": {
+      "provider": "openai-codex",
+      "id": "gpt-5.5",
+      "api": "openai-codex-responses"
+    },
+    "context_usage": {
+      "tokens": 1234,
+      "contextWindow": 128000,
+      "percent": 0.96
+    }
+  }
+}
+```
+
+Noether authorization request:
+
+```json
+{
+  "subject": "user:demo",
+  "project": "noether",
+  "provider": "openai-codex",
+  "model": "gpt-5.5",
+  "estimated_tokens": 1234,
+  "metadata": {
+    "harness": "pi",
+    "extension": "noether-pi",
+    "extension_version": "dev",
+    "trace_id": "generated-trace-id",
+    "request_id": "generated-request-id",
+    "cwd": "/repo",
+    "model_api": "openai-codex-responses",
+    "payload_kind": "object",
+    "payload_keys": ["input", "instructions", "model", "stream"],
+    "payload_summary": {
+      "input": { "type": "array", "length": 1 },
+      "instructions": { "type": "string", "length": 31 },
+      "model": { "type": "string", "length": 7 },
+      "stream": true
+    },
+    "context_window": 128000,
+    "context_usage_percent": 0.96
+  }
+}
+```
+
+If Noether returns `deny`, the extension calls `ctx.abort()`. Throwing an error from the hook is not
+used as a deny path because Pi catches extension errors and continues.
+
+### `after_provider_response`
+
+Pi exposes response status and headers before stream/body parsing. Noether emits status, sanitized
+headers, and elapsed time; usage is not available at this hook.
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.provider_response",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream",
+      "authorization": "[redacted]"
+    },
+    "latency_ms": 1450
+  }
+}
+```
+
+### `message_end`
+
+Pi exposes the parsed assistant message after streaming completes. Noether extracts usage from the
+assistant message, emits a timeline event, and finalizes the reservation once.
+
+Example usage event:
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.message_end",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "usage": {
+      "provider": "openai-codex",
+      "model": "gpt-5.5",
+      "input_tokens": 900,
+      "output_tokens": 180,
+      "total_tokens": 1080,
+      "cost_usd": 0.0019,
+      "stop_reason": "stop"
+    }
+  }
+}
+```
+
+Finalize payload:
+
+```json
+{
+  "reservation_id": "reservation-id",
+  "actual_cost_usd": 0.0019,
+  "usage": {
+    "provider": "openai-codex",
+    "model": "gpt-5.5",
+    "input_tokens": 900,
+    "output_tokens": 180,
+    "total_tokens": 1080,
+    "cost_usd": 0.0019,
+    "stop_reason": "stop"
+  },
+  "metadata": {
+    "trace_id": "generated-trace-id",
+    "request_id": "generated-request-id",
+    "source": "noether-pi"
+  }
+}
+```
+
+### `turn_end` and `agent_end`
+
+`turn_end` records turn-level lifecycle metadata and any usage that can be extracted from the final
+turn message:
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.turn_end",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "turn_index": 0,
+    "usage": {
+      "total_tokens": 1080,
+      "cost_usd": 0.0019
+    }
+  }
+}
+```
+
+`agent_end` records coarse lifecycle completion:
+
+```json
+{
+  "trace_id": "generated-trace-id",
+  "kind": "pi.agent_end",
+  "payload": {
+    "source": "noether-pi",
+    "decision_id": "decision-id",
+    "reservation_id": "reservation-id",
+    "message_count": 4
+  }
+}
+```
+
+The extension does not currently use `context`, `before_agent_start`, or `message_update`.
+
 ## Installation and enabling
 
 Pi auto-discovers extensions from:
