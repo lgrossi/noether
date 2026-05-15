@@ -332,6 +332,15 @@ fn render_dashboard(
 ) -> String {
     let totals = usage_totals(usage);
     let latest_decision = decisions.first();
+    let activity = dashboard_activity(trace, observations);
+    let tool_count = activity
+        .iter()
+        .filter(|item| is_tool_kind(&item.kind))
+        .count();
+    let agent_count = activity
+        .iter()
+        .filter(|item| is_agent_kind(&item.kind))
+        .count();
     let mut html = String::new();
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
@@ -412,10 +421,25 @@ fn render_dashboard(
             .map(|item| item.summary.as_str())
             .unwrap_or("no authorization decisions yet"),
     );
+    metric_card(
+        &mut html,
+        "Tools",
+        &tool_count.to_string(),
+        "tool calls/results observed for the featured run",
+    );
+    metric_card(
+        &mut html,
+        "Agent activity",
+        &agent_count.to_string(),
+        "provider, message, turn, and agent lifecycle events",
+    );
     html.push_str("</section>");
 
     token_mix_panel(&mut html, &totals);
     usage_rows_panel(&mut html, usage);
+    tools_panel(&mut html, &activity);
+    agent_activity_panel(&mut html, &activity);
+    skill_context_panel(&mut html, &activity);
     decisions_panel(&mut html, decisions);
     timeline_panel(&mut html, trace, observations);
 
@@ -448,6 +472,15 @@ fn usage_totals(usage: &UsageReport) -> UsageTotals {
         totals.finalized_reservations += row.finalized_reservations;
     }
     totals
+}
+
+fn dashboard_activity<'a>(
+    trace: Option<&'a TraceReport>,
+    observations: &'a [TraceReportItem],
+) -> Vec<&'a TraceReportItem> {
+    trace
+        .map(|trace| trace.items.iter().collect())
+        .unwrap_or_else(|| observations.iter().collect())
 }
 
 fn metric_card(html: &mut String, label: &str, value: &str, hint: &str) {
@@ -510,6 +543,88 @@ fn usage_rows_panel(html: &mut String, usage: &UsageReport) {
     html.push_str("</tbody></table></section>");
 }
 
+fn tools_panel(html: &mut String, activity: &[&TraceReportItem]) {
+    html.push_str("<section class=\"panel\"><h2>Tool usage</h2>");
+    let tools: Vec<_> = activity
+        .iter()
+        .copied()
+        .filter(|item| is_tool_kind(&item.kind))
+        .collect();
+    if tools.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No tool calls or tool results were observed for this run yet. If Pi did not use tools, this is expected.</div></section>",
+        );
+        return;
+    }
+    html.push_str("<table><thead><tr><th>When</th><th>Tool event</th><th>What happened</th></tr></thead><tbody>");
+    for item in tools {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            event_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
+fn agent_activity_panel(html: &mut String, activity: &[&TraceReportItem]) {
+    html.push_str("<section class=\"panel\"><h2>Agent activity</h2>");
+    let agent_events: Vec<_> = activity
+        .iter()
+        .copied()
+        .filter(|item| is_agent_kind(&item.kind))
+        .collect();
+    if agent_events.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No Pi agent lifecycle events were observed yet. This usually means the run came from the vertical demo or Pi did not emit lifecycle hooks for this trace.</div></section>",
+        );
+        return;
+    }
+    html.push_str(
+        "<table><thead><tr><th>When</th><th>Agent event</th><th>Signal</th></tr></thead><tbody>",
+    );
+    for item in agent_events {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            event_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
+fn skill_context_panel(html: &mut String, activity: &[&TraceReportItem]) {
+    html.push_str("<section class=\"panel\"><h2>Skills and context</h2>");
+    let context_events: Vec<_> = activity
+        .iter()
+        .copied()
+        .filter(|item| is_skill_context_kind(&item.kind))
+        .collect();
+    if context_events.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No skill/context event was observed yet. When Pi provides agent context, this section will show selected tools, skills, and context-file summaries without prompt text.</div></section>",
+        );
+        return;
+    }
+    html.push_str(
+        "<table><thead><tr><th>When</th><th>Context event</th><th>Summary</th></tr></thead><tbody>",
+    );
+    for item in context_events {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            event_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
 fn decisions_panel(html: &mut String, decisions: &[TraceReportItem]) {
     html.push_str("<section class=\"panel\"><h2>Recent decisions</h2>");
     if decisions.is_empty() {
@@ -562,6 +677,27 @@ fn timeline_panel(
         );
     }
     html.push_str("</ol></section>");
+}
+
+fn is_tool_kind(kind: &str) -> bool {
+    kind == "tool.observed" || kind == "pi.tool_call"
+}
+
+fn is_agent_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "pi.provider_call.started"
+            | "pi.message_end"
+            | "pi.stream_summary"
+            | "pi.turn_end"
+            | "pi.agent_end"
+            | "pi.authorize"
+            | "pi.authorize_error"
+    )
+}
+
+fn is_skill_context_kind(kind: &str) -> bool {
+    kind == "pi.agent_context"
 }
 
 fn outcome_pill(kind: &str) -> String {
