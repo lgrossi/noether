@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -8,7 +9,7 @@ use tokio::fs;
 use crate::contract::DecisionMode;
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
-use crate::ledger::BudgetLedger;
+use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
 use crate::policy::load_policy;
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
@@ -122,6 +123,15 @@ enum ReportSubcommand {
     Observations {
         #[arg(long)]
         kind: Option<String>,
+        #[arg(long)]
+        trace: Option<String>,
+    },
+    /// Write a self-contained visual HTML dashboard.
+    Dashboard {
+        /// Output HTML path.
+        #[arg(long, default_value = ".noet/noether-dashboard.html")]
+        out: PathBuf,
+        /// Trace to feature. Defaults to the latest decision trace when available.
         #[arg(long)]
         trace: Option<String>,
     },
@@ -268,6 +278,31 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
                 command.json,
             )?;
         }
+        ReportSubcommand::Dashboard { out, trace } => {
+            let usage = ledger.usage_report()?;
+            let decisions = ledger.decisions_report()?;
+            let trace_id = trace.or_else(|| {
+                decisions
+                    .iter()
+                    .find_map(|item| summary_value(&item.summary, "trace"))
+            });
+            let trace_report = trace_id
+                .as_deref()
+                .map(|trace_id| ledger.trace_report(trace_id))
+                .transpose()?;
+            let observations = ledger.observations_report(None, trace_id.as_deref())?;
+            let html = render_dashboard(&usage, &decisions, trace_report.as_ref(), &observations);
+            if let Some(parent) = out.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(&out, html).await?;
+            println!("dashboard\t{}", out.display());
+            if let Some(trace_id) = trace_id {
+                println!("featured_trace\t{trace_id}");
+            }
+        }
     }
     Ok(())
 }
@@ -287,4 +322,322 @@ fn print_items(items: Vec<crate::ledger::TraceReportItem>, json: bool) -> Result
         }
     }
     Ok(())
+}
+
+fn render_dashboard(
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+    trace: Option<&TraceReport>,
+    observations: &[TraceReportItem],
+) -> String {
+    let totals = usage_totals(usage);
+    let latest_decision = decisions.first();
+    let mut html = String::new();
+    html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    html.push_str("<title>Noether dashboard</title>");
+    html.push_str(
+        "<style>
+        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --blue:#38bdf8; --violet:#a78bfa; }
+        * { box-sizing: border-box; }
+        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:radial-gradient(circle at top left,#172554,#0f172a 42%); color:var(--text); }
+        main { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
+        h1 { margin:0 0 4px; font-size:34px; letter-spacing:-0.04em; }
+        h2 { margin:28px 0 12px; font-size:20px; }
+        .sub { color:var(--muted); margin-bottom:24px; }
+        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); }
+        .card, .panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 55px rgba(0,0,0,.22); }
+        .card { padding:18px; }
+        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .value { font-size:30px; font-weight:800; margin-top:6px; letter-spacing:-0.03em; }
+        .hint { color:var(--muted); margin-top:4px; }
+        .panel { padding:18px; margin-top:14px; overflow:hidden; }
+        .bar { height:12px; display:flex; overflow:hidden; border-radius:999px; background:#1e293b; margin:10px 0; }
+        .in { background:var(--blue); }
+        .out { background:var(--violet); }
+        .cache { background:var(--warn); }
+        .legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
+        .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+        .timeline { list-style:none; margin:0; padding:0; }
+        .event { display:grid; grid-template-columns:165px 210px 1fr; gap:12px; padding:13px 0; border-top:1px solid var(--line); align-items:start; }
+        .event:first-child { border-top:0; }
+        .time, .summary { color:var(--muted); }
+        .kind { font-weight:700; }
+        .pill { display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; background:#1e293b; border:1px solid var(--line); font-size:13px; }
+        .ok { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+        table { width:100%; border-collapse:collapse; }
+        th, td { text-align:left; padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
+        th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .empty { color:var(--muted); padding:18px; border:1px dashed var(--line); border-radius:14px; }
+        @media (max-width:760px) { .event { grid-template-columns:1fr; gap:2px; } h1 { font-size:28px; } }
+        </style>",
+    );
+    html.push_str("</head><body><main>");
+    html.push_str("<h1>Noether run dashboard</h1>");
+    html.push_str("<div class=\"sub\">Readable local view of decisions, cost, usage, and trace events. Raw hook logs are not needed here.</div>");
+
+    html.push_str("<section class=\"grid\">");
+    metric_card(
+        &mut html,
+        "Spend",
+        &format_money(usage.total_cost_usd),
+        "finalized local ledger cost",
+    );
+    metric_card(
+        &mut html,
+        "Tokens",
+        &compact_number(totals.total_tokens),
+        &format!(
+            "{} input / {} output",
+            compact_number(totals.input_tokens),
+            compact_number(totals.output_tokens)
+        ),
+    );
+    metric_card(
+        &mut html,
+        "Reservations",
+        &totals.reservations.to_string(),
+        &format!(
+            "{} finalized, {} active",
+            totals.finalized_reservations, totals.active_reservations
+        ),
+    );
+    metric_card(
+        &mut html,
+        "Latest decision",
+        latest_decision
+            .map(|item| decision_label(&item.kind))
+            .unwrap_or("none"),
+        latest_decision
+            .map(|item| item.summary.as_str())
+            .unwrap_or("no authorization decisions yet"),
+    );
+    html.push_str("</section>");
+
+    token_mix_panel(&mut html, &totals);
+    usage_rows_panel(&mut html, usage);
+    decisions_panel(&mut html, decisions);
+    timeline_panel(&mut html, trace, observations);
+
+    html.push_str("</main></body></html>");
+    html
+}
+
+#[derive(Default)]
+struct UsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    total_tokens: u64,
+    reservations: u64,
+    active_reservations: u64,
+    finalized_reservations: u64,
+}
+
+fn usage_totals(usage: &UsageReport) -> UsageTotals {
+    let mut totals = UsageTotals::default();
+    for row in &usage.rows {
+        totals.input_tokens += row.input_tokens;
+        totals.output_tokens += row.output_tokens;
+        totals.cache_read_tokens += row.cache_read_tokens;
+        totals.cache_write_tokens += row.cache_write_tokens;
+        totals.total_tokens += row.total_tokens;
+        totals.reservations += row.reservations;
+        totals.active_reservations += row.active_reservations;
+        totals.finalized_reservations += row.finalized_reservations;
+    }
+    totals
+}
+
+fn metric_card(html: &mut String, label: &str, value: &str, hint: &str) {
+    let _ = write!(
+        html,
+        "<article class=\"card\"><div class=\"label\">{}</div><div class=\"value\">{}</div><div class=\"hint\">{}</div></article>",
+        escape_html(label),
+        escape_html(value),
+        escape_html(hint)
+    );
+}
+
+fn token_mix_panel(html: &mut String, totals: &UsageTotals) {
+    html.push_str("<section class=\"panel\"><h2>Token mix</h2>");
+    if totals.total_tokens == 0 {
+        html.push_str("<div class=\"empty\">No finalized token usage yet.</div></section>");
+        return;
+    }
+    let input = percent(totals.input_tokens, totals.total_tokens);
+    let output = percent(totals.output_tokens, totals.total_tokens);
+    let cache = percent(
+        totals.cache_read_tokens + totals.cache_write_tokens,
+        totals.total_tokens,
+    );
+    let _ = write!(
+        html,
+        "<div class=\"bar\"><div class=\"in\" style=\"width:{input:.2}%\"></div><div class=\"out\" style=\"width:{output:.2}%\"></div><div class=\"cache\" style=\"width:{cache:.2}%\"></div></div>"
+    );
+    let _ = write!(
+        html,
+        "<div class=\"legend\"><span><span class=\"dot in\"></span>input {}</span><span><span class=\"dot out\"></span>output {}</span><span><span class=\"dot cache\"></span>cache {}</span></div>",
+        compact_number(totals.input_tokens),
+        compact_number(totals.output_tokens),
+        compact_number(totals.cache_read_tokens + totals.cache_write_tokens)
+    );
+    html.push_str("</section>");
+}
+
+fn usage_rows_panel(html: &mut String, usage: &UsageReport) {
+    html.push_str("<section class=\"panel\"><h2>Where the spend went</h2>");
+    if usage.rows.is_empty() {
+        html.push_str("<div class=\"empty\">No usage has been finalized yet.</div></section>");
+        return;
+    }
+    html.push_str("<table><thead><tr><th>Project</th><th>Provider / model</th><th>Subject</th><th>Cost</th><th>Tokens</th><th>Status</th></tr></thead><tbody>");
+    for row in &usage.rows {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}<br><span class=\"summary\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{} finalized / {} active</td></tr>",
+            escape_html(row.project.as_deref().unwrap_or("-")),
+            escape_html(row.provider.as_deref().unwrap_or("-")),
+            escape_html(row.model.as_deref().unwrap_or("-")),
+            escape_html(row.subject.as_deref().unwrap_or("-")),
+            format_money(row.total_cost_usd),
+            compact_number(row.total_tokens),
+            row.finalized_reservations,
+            row.active_reservations
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
+fn decisions_panel(html: &mut String, decisions: &[TraceReportItem]) {
+    html.push_str("<section class=\"panel\"><h2>Recent decisions</h2>");
+    if decisions.is_empty() {
+        html.push_str("<div class=\"empty\">No authorization decisions yet.</div></section>");
+        return;
+    }
+    html.push_str(
+        "<table><thead><tr><th>When</th><th>Outcome</th><th>Summary</th></tr></thead><tbody>",
+    );
+    for item in decisions.iter().take(8) {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            outcome_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
+fn timeline_panel(
+    html: &mut String,
+    trace: Option<&TraceReport>,
+    observations: &[TraceReportItem],
+) {
+    html.push_str("<section class=\"panel\"><h2>Run timeline</h2>");
+    let items: Vec<&TraceReportItem> = trace
+        .map(|trace| trace.items.iter().collect())
+        .unwrap_or_else(|| observations.iter().take(12).collect());
+    if items.is_empty() {
+        html.push_str("<div class=\"empty\">No trace or observation events yet.</div></section>");
+        return;
+    }
+    if let Some(trace) = trace {
+        let _ = write!(
+            html,
+            "<div class=\"hint\">Featured trace: <code>{}</code></div>",
+            escape_html(&trace.trace_id)
+        );
+    }
+    html.push_str("<ol class=\"timeline\">");
+    for item in items {
+        let _ = write!(
+            html,
+            "<li class=\"event\"><div class=\"time\">{}</div><div class=\"kind\">{}</div><div class=\"summary\">{}</div></li>",
+            escape_html(&short_time(item)),
+            event_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</ol></section>");
+}
+
+fn outcome_pill(kind: &str) -> String {
+    let class = if kind.ends_with(".deny") {
+        "bad"
+    } else if kind.ends_with(".warn") {
+        "warn"
+    } else {
+        "ok"
+    };
+    format!(
+        "<span class=\"pill {class}\">{}</span>",
+        escape_html(decision_label(kind))
+    )
+}
+
+fn event_pill(kind: &str) -> String {
+    format!("<span class=\"pill\">{}</span>", escape_html(kind))
+}
+
+fn decision_label(kind: &str) -> &'static str {
+    if kind.ends_with(".deny") {
+        "deny"
+    } else if kind.ends_with(".warn") {
+        "warn"
+    } else if kind.ends_with(".allow") {
+        "allow"
+    } else {
+        "unknown"
+    }
+}
+
+fn summary_value(summary: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    summary
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix).map(ToOwned::to_owned))
+}
+
+fn short_time(item: &TraceReportItem) -> String {
+    item.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn compact_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_money(value: f64) -> String {
+    if value == 0.0 {
+        "$0".to_owned()
+    } else if value < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
+    }
+}
+
+fn percent(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (value as f64 / total as f64) * 100.0
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
