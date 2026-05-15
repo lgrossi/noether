@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const require = createRequire(import.meta.url);
-const extension = require("./noether-extension.js");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const extension = await import(resolve(__dirname, "../../../.noet/build/pi-noether/index.js"));
 
 function fakeContext(overrides = {}) {
 	return {
@@ -38,6 +39,8 @@ function fakeContext(overrides = {}) {
 		{
 			subject: "user@example.test",
 			project: "noether",
+			failMode: "fail_open",
+			noetherUrl: "http://127.0.0.1:4040",
 			version: "test",
 			includeBody: false,
 		},
@@ -95,31 +98,34 @@ function fakeContext(overrides = {}) {
 		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
 	};
 
-	let aborted = false;
-	const handlers = new Map();
-	extension(
-		{
-			on(event, handler) {
-				handlers.set(event, handler);
+	try {
+		let aborted = false;
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
 			},
-		},
-		{
-			noetherUrl: "http://127.0.0.1:1",
-			failMode: "fail_open",
-			includeBody: false,
-			version: "test",
-		},
-	);
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
 
-	await handlers.get("before_provider_request")(
-		{ payload: { model: "local", messages: [{ role: "user", content: "do not send" }] } },
-		fakeContext({ abort: () => { aborted = true; } }),
-	);
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local", messages: [{ role: "user", content: "do not send" }] } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
 
-	globalThis.fetch = originalFetch;
-	assert.equal(aborted, true);
-	assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
-	assert.equal(JSON.stringify(calls).includes("do not send"), false);
+		assert.equal(aborted, true);
+		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
+		assert.equal(JSON.stringify(calls).includes("do not send"), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 }
 
-console.log("noether-extension tests ok");
+console.log("pi-noether extension tests ok");

@@ -31,7 +31,7 @@ TODO for human review:
 
 ## 2026-05-14: Treat extension-only authorization as weaker than proxy authorization
 
-Superseded on 2026-05-15 by [`pi-wrapper-research.md`](./pi-wrapper-research.md) and [`pi-extension-wrapper.md`](./pi-extension-wrapper.md): hard-deny through `ctx.abort()` in `before_provider_request` is now the primary subscription-backed path for wrapped Pi runs.
+Superseded on 2026-05-15 by [`pi-wrapper-research.md`](./pi-wrapper-research.md) and [`pi-extension.md`](./pi-extension.md): hard-deny through `ctx.abort()` in `before_provider_request` is now the primary subscription-backed path for Pi runs with the Noether extension enabled.
 
 Decision: Docs classify Pi extension hooks as observation and possible soft-gate mechanisms, not as proven hard budget enforcement.
 

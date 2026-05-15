@@ -5,7 +5,7 @@
 For the validated Pi 0.74.0 setup on 2026-05-14:
 
 1. **Can subscription-backed Pi traffic be routed through Noether?** Yes, for the tested `openai-codex/gpt-5.5` subscription provider, by overriding the built-in provider `baseUrl` so Pi sends Codex Responses traffic to `noet`.
-2. **Can it be pre-authorized?** Yes only when Noether is on the hot path, for example through the `baseUrl` override or a custom provider. Without route-through, Noether cannot enforce a hard pre-spend authorization decision.
+2. **Can it be pre-authorized?** Yes. The primary path is now the Noether Pi extension: it calls Noether in `before_provider_request` and calls `ctx.abort()` on deny before Pi sends the provider request. Route-through remains a fallback when Noether intentionally sits on the HTTP path.
 3. **Can it be observed after the fact?** Yes. Pi session JSONL records model/provider, user message, assistant message, usage, cost, stop reason, and response id. Pi extensions can also capture provider payload summaries and response metadata during the call.
 
 ## Validated normal subscription-backed behavior
@@ -108,7 +108,7 @@ This should be done through a documented template or extension for real usage. S
 
 Noether can pre-authorize if Pi sends traffic to Noether first. The natural enforcement point is inside `noet` before mock/upstream forwarding.
 
-Noether cannot pre-authorize ordinary built-in subscription traffic that goes directly from Pi to the provider unless a Pi extension enforces a policy before the provider request. Extension enforcement is weaker than proxy enforcement because Pi still owns the transport and hook semantics.
+Noether can pre-authorize ordinary built-in subscription traffic that goes directly from Pi to the provider when the Noether Pi extension is enabled. The extension enforces policy in `before_provider_request` and calls `ctx.abort()` on deny before Pi sends the provider request. This keeps Pi's transport/auth path intact, so the regression proof should stay tied to Pi hook behavior.
 
 ### Observe
 
@@ -126,4 +126,3 @@ Session ingestion gives provider/model/usage/cost/message metadata after complet
 - Noether does not yet have a real upstream-forwarding template for `openai-codex` subscription traffic.
 - Noether does not yet have a bodyless or sanitized session ingester for Pi JSONL sessions.
 - Extension hook enforcement needs a dedicated test before treating it as a hard policy gate.
-

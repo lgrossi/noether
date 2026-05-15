@@ -1,0 +1,29 @@
+{
+  "name": "pi-noether",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Noether authorization and event reporting extension for Pi",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "noether"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node ./test/noether-extension.test.mjs",
+    "proof:deny": "npm run build && node ./test/proof-deny-local.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

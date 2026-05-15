@@ -22,7 +22,7 @@ This repository currently contains a local sidecar and CLI tracer bullet:
 - returns mock responses when no upstream is configured;
 - forwards to an upstream base URL when configured.
 - supports transparent provider-wrapper routes that strip a local wrapper prefix and forward to the original upstream without provider translation;
-- includes a prototype `noet pi ...` wrapper that launches Pi with a Noether authorization extension;
+- includes a normal Pi extension package that authorizes provider requests through local Noether before Pi sends them;
 - validates `policy.noet.yaml`;
 - evaluates a minimal in-memory fixed-window budget;
 - exposes `POST /v1/authorize`, `POST /v1/reservations/{id}/finalize`, and `POST /v1/events`.
@@ -110,7 +110,7 @@ Prompt and response bodies are captured during this spike. Retention and redacti
 
 See:
 
-- [Pi extension and wrapper prototype](./docs/integrations/pi-extension-wrapper.md)
+- [Pi extension integration](./docs/integrations/pi-extension.md)
 - [Capture fixture schema v1](./docs/capture-fixtures.md)
 - [Transparent proxy mode](./docs/transparent-proxy.md)
 - [Control contract v0](./docs/control-contract-v0.md)

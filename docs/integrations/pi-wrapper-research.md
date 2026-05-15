@@ -1,13 +1,15 @@
-# Pi wrapper research for subscription-backed providers
+# Pi extension and wrapper research for subscription-backed providers
 
 Date: 2026-05-15
 Pi package inspected: `@earendil-works/pi-coding-agent` 0.74.0
+
+Status: superseded for product direction by [`pi-extension.md`](./pi-extension.md). The primary path is now a normal Pi extension installed/enabled by the user, not a `noet pi` launcher wrapper. The wrapper and `baseUrl` material below remains research context for fallback and debug paths.
 
 ## Question
 
 Can Noether wrap Pi subscription-backed providers without brittle manual upstream mapping, while Pi keeps provider routing, auth, request shaping, and streaming?
 
-Short answer: yes, for a Pi-specific path, the best evidenced direction is a Pi extension loaded by a Noether wrapper. The extension can run an async Noether authorization call in `before_provider_request` and can hard-stop the turn with `ctx.abort()` before the local proof server receives a provider request. Pi still owns provider auth, routing, payload serialization, HTTP/WebSocket/SSE transport, and stream parsing. Usage and traces can be ingested from Pi session/events after the response.
+Short answer: yes, for a Pi-specific path, the best evidenced direction is a normal Pi extension. The extension can run an async Noether authorization call in `before_provider_request` and can hard-stop the turn with `ctx.abort()` before the local proof server receives a provider request. Pi still owns provider auth, routing, payload serialization, HTTP/WebSocket/SSE transport, and stream parsing. Usage and traces can be ingested from Pi session/events after the response.
 
 This is different from Noether's normal proxy scenario. For normal app/proxy integrations, the caller can ask Noether before sending upstream and Noether does not need to intercept HTTP. The Pi-specific value is that Pi subscription mode already owns auth/routing, so Noether should hook Pi first and keep transparent `baseUrl` route-through as a fallback.
 
@@ -134,7 +136,7 @@ Can a Noether-managed runner use Pi while Pi owns providers/auth/routing? Yes. I
 
 SDK-path conclusion: strong if Noether is willing to become the process that runs Pi. It gives cleaner event ingestion than scraping session files, but it changes the user launch surface more than an extension loaded into ordinary Pi.
 
-## Option C: CLI wrapper path
+## Option C: CLI wrapper/debug path
 
 A `noet pi ...` wrapper can avoid touching global config by passing:
 
@@ -152,7 +154,7 @@ Enforcement strength:
 - Wrapper plus hard-deny extension: strong for runs launched through the wrapper, because per-provider-send authorization happens inside Pi before transport.
 - Wrapper plus session ingestion only: observation only.
 
-CLI-wrapper conclusion: best packaging/control mechanism for the extension path. It should not be treated as the enforcement mechanism unless it always injects the extension.
+CLI-wrapper conclusion: useful for repeatable local proof/debug runs, but not the recommended personal setup. Normal Pi extension installation is simpler and leaves enable/disable control with the user.
 
 ## Option D: Network proxy / env-var path
 
@@ -198,10 +200,10 @@ BaseUrl conclusion: keep as fallback for deterministic capture and route-through
 
 | Path | Pre-spend enforcement | Usage/trace observation | Pi keeps auth/routing/shaping/streaming | Bypass risk | Product fit |
 | --- | --- | --- | --- | --- | --- |
-| Pi extension hard-deny with `ctx.abort()` | Strong, proven before local provider request | Strong via events/session; headers/status via `after_provider_response`; usage via final messages | Yes | Medium unless wrapper/package is mandated | Best |
+| Pi extension hard-deny with `ctx.abort()` | Strong, proven before local provider request | Strong via events/session; headers/status via `after_provider_response`; usage via final messages | Yes | Medium; user controls extension enablement | Best |
 | SDK-managed Pi runner + extension/inline hook | Strong in managed runner | Strong via direct event subscriptions/session APIs | Yes | Low inside managed app, high if users can run normal Pi outside it | Strong but larger product surface |
 | CLI wrapper only | Weak/medium launch gate; no per-request gate by itself | Medium via session ingestion after exit | Yes | High if bypassed | Packaging layer, not core control |
-| CLI wrapper + extension | Strong for wrapped runs | Strong | Yes | Medium | Recommended delivery shape |
+| CLI wrapper + extension | Strong for wrapped runs | Strong | Yes | Medium | Debug/proof helper |
 | HTTP(S)_PROXY without MITM | Coarse host-level block only | Low; host/port/timing/bytes only for TLS | Mostly yes | Medium | Poor for policy |
 | `baseUrl` override to Noether | Strong if Noether forwards/blocks correctly | Strong in Noether | No; Noether must emulate/forward provider protocol | Medium | Fallback |
 | Session ingestion only | None | Medium/strong after completion | Yes | Low for observation, none for control | Complementary |
@@ -228,11 +230,11 @@ Unknown / needs validation:
 
 ## Recommendation
 
-Prioritize the Pi extension path, delivered by a `noet pi ...` wrapper or Pi package, for subscription-backed Pi usage.
+Prioritize the Pi extension path, delivered as a normal Pi extension package, for subscription-backed Pi usage.
 
 Use this shape:
 
-1. Wrapper starts/locates Noether and launches Pi with a Noether extension and isolated/session-specific paths where needed.
+1. User enables the Noether extension through Pi's normal extension mechanism.
 2. Extension calls Noether from `before_provider_request` with sanitized request/session/model metadata.
 3. If Noether denies, extension calls `ctx.abort()` before Pi sends the provider request.
 4. If Noether allows, extension returns nothing and Pi sends the request normally.
@@ -246,4 +248,4 @@ Keep transparent `baseUrl` override as a fallback and fixture/capture path. If n
 2. Test Codex `transport: "auto"` and forced WebSocket behavior to prove abort occurs before WebSocket connect.
 3. Build a sanitized extension prototype that sends only policy metadata by default, with body capture behind explicit opt-in.
 4. Validate session/event usage ingestion across successful response, provider error, rate limit, abort, and tool-call turns.
-5. Decide packaging: `noet pi` wrapper with explicit `--extension`, or a Pi package users install and enable.
+5. Package the extension for normal Pi installation, with npm distribution as a later option.

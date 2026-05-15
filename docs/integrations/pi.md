@@ -141,9 +141,11 @@ Conclusion: subscription-backed `openai-codex` traffic can be routed through Noe
 | Mode | Route through Noether | Pre-authorize before spend | Observe after the fact |
 | --- | --- | --- | --- |
 | Pi custom provider (`noether/noether-mock`) | Yes | Yes, inside `noet` before mock/upstream forwarding | Yes, via Noether fixtures |
-| Built-in subscription provider without override | No | No hard Noether gate | Yes, via Pi session files and extension hooks |
+| Built-in subscription provider without override and without Noether extension | No | No hard Noether gate | Yes, via Pi session files |
 | Built-in subscription provider with `baseUrl` override | Yes | Yes, inside `noet` before upstream forwarding | Yes, via Noether fixtures and Pi session files |
-| Pi extension only | No transport ownership | Partial; can inspect/rewrite payload, but this is not a proxy-level spend gate | Yes, via extension events and session files |
+| Pi extension enabled | No transport ownership | Yes for the validated hook path: deny calls `ctx.abort()` in `before_provider_request` before provider send | Yes, via extension events and session files |
+
+Later 2026-05-15 decision: the normal Pi extension path in [`pi-extension.md`](./pi-extension.md) is the primary subscription-backed integration. Transparent `baseUrl` route-through remains fallback/debug because it makes Noether responsible for provider forwarding compatibility.
 
 ## Documentation sources used
 
@@ -164,4 +166,3 @@ Relevant documented Pi behavior:
 - sessions are JSONL files under `~/.pi/agent/sessions/` or a configured `sessionDir`;
 - extensions can observe `before_provider_request` and `after_provider_response`;
 - the SDK can use Pi auth/model registry/session APIs directly.
-

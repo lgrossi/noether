@@ -4,33 +4,36 @@
 
 Use two tracks:
 
-1. **Pi extension plus `noet pi` wrapper for subscription-backed usage.** This is the primary path because Pi keeps auth/routing/request shaping/streaming, while Noether authorizes before provider send and ingests usage afterward.
+1. **Normal Pi extension for subscription-backed usage.** This is the primary path because Pi keeps auth/routing/request shaping/streaming, while Noether authorizes before provider send and ingests usage afterward. The user controls enabling/disabling the extension through Pi.
 2. **Custom/local provider route for deterministic capture and policy development.** Keep `examples/pi/models.noether.json` as the safe starter path.
 
-Transparent subscription route-through remains a fallback/capture path. Add more route-through only after Noether can either forward `/codex/responses` correctly or produce a protocol-compatible Codex Responses stream.
+Transparent subscription route-through and launcher wrappers are fallback/debug paths. Add more route-through only after Noether explicitly needs to sit on the HTTP path and can forward provider-specific streams correctly.
 
 ## Option matrix
 
 | Option | What it gives Noether | Enforcement strength | Implementation cost | Notes |
 | --- | --- | --- | --- | --- |
-| Pi extension + `noet pi` wrapper | Pre-send authorization and post-response/session usage without provider forwarding | Strong for wrapped runs; deny uses `ctx.abort()` | Medium | Primary path for subscription-backed Pi usage. See [`pi-extension-wrapper.md`](./pi-extension-wrapper.md). |
+| Normal Pi extension package | Pre-send authorization and post-response/session usage without provider forwarding | Strong when enabled; deny uses `ctx.abort()` | Medium | Primary path for subscription-backed Pi usage. See [`pi-extension.md`](./pi-extension.md). |
 | Custom provider to `noet` | Full local request/response capture for OpenAI-compatible traffic | Strong when `noet` is hot path | Low | Validated with `noether/noether-mock`. Does not use subscription credentials. |
-| Built-in provider `baseUrl` override | Subscription-backed traffic reaches `noet` first | Strong if Noether forwards or blocks | Medium | Fallback for capture/route-through; needs Codex Responses compatibility for end-to-end use. |
+| Built-in provider `baseUrl` override | Subscription-backed traffic reaches `noet` first | Strong if Noether forwards or blocks | Medium | Fallback for capture/route-through; needs provider stream compatibility for end-to-end use. |
 | Session-log ingestion | Provider/model/usage/cost/messages after completion | None | Low | Useful observability complement. Requires privacy controls. |
-| Pi extension hooks | Payload summaries, response metadata, system prompt/context visibility | Strong when paired with `ctx.abort()` | Medium | Hard deny has been locally proven for Pi 0.74.0. |
-| CLI wrapper only | Can select model, inject env/settings/session-dir, run preflight checks | Medium | Low/Medium | Useful packaging; not sufficient without the extension. |
+| CLI wrapper/debug launcher | Can select model, inject env/settings/session-dir, run preflight checks | Weak alone | Low/Medium | Optional debug helper only; not the recommended personal setup. |
 | Prompt prelude injection | Adds attribution/policy context to prompts | Weak | Low | Useful for metadata and nudges. Not a budget gate and may affect model behavior. |
 | SDK embedding | Direct access to Pi sessions, auth, model registry, and events | Strong in a controlled app | High | Good for a Noether-managed Pi runner; less suitable for transparent control of normal user Pi. |
 | Local transport only for custom providers | Full Noether ownership of supported protocols | Strong | Medium | Cleanest production control mode for API-key/local providers. Does not automatically cover subscription providers. |
 
 ## Option details
 
-### 1. Extension and wrapper
+### 1. Normal Pi extension package
 
-Use `noet pi` to inject the extension without editing global Pi config:
+Install or enable [`extensions/pi-noether`](../../extensions/pi-noether) through Pi's extension mechanism:
 
-```bash
-cargo run --bin noet -- pi --project noether --subject local-user -- --model openai-codex/gpt-5.5
+```json
+{
+  "packages": [
+    "/absolute/path/to/noether/extensions/pi-noether"
+  ]
+}
 ```
 
 Pros:
@@ -39,13 +42,14 @@ Pros:
 - Noether authorizes in `before_provider_request`;
 - `deny` calls `ctx.abort()` before provider send;
 - usage/status/session observations are reported after response parsing;
-- default authorization metadata is bodyless.
+- default authorization metadata is bodyless;
+- users retain normal Pi control over whether the extension is enabled.
 
 Cons:
 
-- only protects wrapped Pi runs;
+- only protects Pi runs where the extension is enabled;
 - `ctx.abort()` behavior is Pi-version-sensitive and needs regression proof;
-- wrapper does not yet start the Noether sidecar automatically.
+- requires a running local Noether server.
 
 ### 2. Custom provider
 
@@ -94,13 +98,13 @@ Pros:
 
 - uses the user's subscription-backed provider/model path;
 - lets Noether see the request before provider spend;
-- can become the strongest enforcement mode.
+- can become the strongest enforcement mode when Noether intentionally owns the HTTP path.
 
 Cons:
 
 - current Noether mock is not Codex Responses-compatible;
 - proxy forwarding must preserve provider-specific auth headers and streaming protocol;
-- risky to apply globally without a rollback path.
+- not the primary personal setup because it turns Noether into a provider forwarding component.
 
 ### 4. Session-log ingestion
 
@@ -124,49 +128,23 @@ Cons:
 - costs are whatever Pi recorded;
 - body privacy needs explicit policy.
 
-### 5. Pi extension hook
+### 5. CLI wrapper/debug launcher
 
-Pi extensions expose:
-
-- `before_provider_request` for provider-specific payload inspection/rewrite;
-- `after_provider_response` for status/header observation;
-- `before_agent_start` and `context` for system prompt/context changes;
-- session events for persistence and metadata.
-
-Pros:
-
-- good source of structured pre-request observations;
-- can attach Noether attribution without owning provider transport;
-- can support warnings and hard gates through `ctx.abort()`.
-
-Cons:
-
-- hard blocking relies on `ctx.abort()`, not throw/return;
-- extension code runs in Pi's process with user permissions;
-- captured payloads may include sensitive prompt data if body capture is explicitly enabled.
-
-### 6. CLI wrapper
-
-A wrapper can:
-
-- locate `noet`;
-- set `PI_CODING_AGENT_DIR` or `--session-dir`;
-- inject the Noether extension;
-- run preflight budget/health checks before launching Pi;
-- collect session logs after Pi exits.
+A launcher can still be useful for repeatable proof runs: set temporary environment variables, point Pi at an extension path for one invocation, or isolate sessions under `.noet/`. It should not be the primary adoption path.
 
 Pros:
 
 - easy to test;
-- avoids editing global Pi config;
+- avoids editing global Pi config during proof runs;
 - good for repeatable local validation.
 
 Cons:
 
-- bypassable if the user runs `pi` directly;
-- cannot enforce per-request budgets unless combined with the extension or proxy.
+- bypassable if the user runs normal `pi`;
+- cannot enforce per-request budgets unless the extension is enabled;
+- adds product surface that is unnecessary for the personal setup.
 
-### 7. Prompt prelude injection
+### 6. Prompt prelude injection
 
 This mirrors "rtk"-style prompt prelude patterns: inject a policy/attribution block into Pi prompts or system prompt.
 
@@ -181,7 +159,7 @@ Cons:
 - changes model-visible prompt surface;
 - cannot guarantee compliance.
 
-### 8. SDK-managed Pi runner
+### 7. SDK-managed Pi runner
 
 The Pi SDK can create sessions with explicit auth storage, model registry, settings, extensions, and event subscriptions.
 
@@ -199,10 +177,7 @@ Cons:
 
 ## Near-term next steps
 
-1. Keep the `noet pi` extension/wrapper proof running against Pi upgrades.
+1. Keep the extension deny proof running against Pi upgrades.
 2. Add a sanitized Pi session ingester for metadata-only usage.
 3. Add a Codex Responses fixture test from the captured `/codex/responses` shape.
-4. Implement either:
-   - upstream pass-through for `/codex/responses`, or
-   - a minimal Codex Responses-compatible mock stream.
-5. Re-test subscription route-through with the isolated `PI_CODING_AGENT_DIR` before proposing any additive global config.
+4. Keep transparent route-through as an explicit fallback/debug path, not the primary Pi integration.

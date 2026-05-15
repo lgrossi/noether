@@ -1,15 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const require = createRequire(import.meta.url);
-const extension = require("./noether-extension.js");
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, "../..");
-const proofDir = resolve(repoRoot, ".noet/proofs/pi-wrapper-deny");
+const repoRoot = resolve(__dirname, "../../..");
+const extension = await import(resolve(repoRoot, ".noet/build/pi-noether/index.js"));
+const proofDir = resolve(repoRoot, ".noet/proofs/pi-extension-deny");
 
 await mkdir(proofDir, { recursive: true });
 
@@ -63,7 +61,7 @@ try {
 	const handlers = new Map();
 	let aborted = false;
 
-	extension(
+	extension.default(
 		{
 			on(event, handler) {
 				handlers.set(event, handler);

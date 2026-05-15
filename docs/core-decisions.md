@@ -48,12 +48,12 @@ Rationale: buffering streamed agent responses breaks interactive agent UX and ch
 
 TODO: decide whether fixture schema v2 should separate full-body captures from streaming summaries more explicitly.
 
-## 2026-05-15: Pi subscription mode uses extension authorization before proxy route-through
+## 2026-05-15: Pi subscription mode uses a normal extension before proxy route-through
 
-Decision: for Pi subscription-backed runs, make the primary Noether path a Pi extension loaded by `noet pi`, not a transparent `baseUrl` override.
+Decision: for Pi subscription-backed runs, make the primary Noether path a normal Pi extension installed/enabled by the user through Pi's extension mechanism, not a `noet pi` launcher wrapper and not a transparent `baseUrl` override.
 
 Rationale: Pi already owns subscription auth, provider routing, request shaping, streaming, and session parsing. The extension can ask Noether for authorization in `before_provider_request`; on `deny` it calls `ctx.abort()` before provider send, while `allow` and `warn` let Pi continue normally. This keeps Noether as a harness-level control plane instead of a provider protocol translation layer.
 
-Fallback: keep transparent proxy route-through for deterministic capture and cases where Noether intentionally sits on the HTTP path.
+Fallback: keep transparent proxy route-through and launcher/debug helpers only for deterministic capture and cases where Noether intentionally sits on the HTTP path.
 
 TODO: keep a local deny regression proof for Pi upgrades because `ctx.abort()` is the practical hard-deny mechanism, not a formal provider-policy return value.
