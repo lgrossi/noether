@@ -249,14 +249,34 @@ function summarizeToolMetadata(event: unknown): Record<string, unknown> {
 
 function hookLogPath(
 	config: NoetherConfig,
-	hook: "session_start" | "before_provider_request" | "after_provider_response",
+	hook:
+		| "session_start"
+		| "before_provider_request"
+		| "after_provider_response"
+		| "message_update"
+		| "message_end"
+		| "turn_end"
+		| "agent_end",
 ): string | undefined {
-	return config.hookLogDir ? `${config.hookLogDir.replace(/\/+$/, "")}/${hook}.jsonl` : undefined;
+	if (!config.hookLogDir) {
+		return undefined;
+	}
+	if (hook === "message_update" || hook === "message_end" || hook === "turn_end" || hook === "agent_end") {
+		return `${config.hookLogDir.replace(/\/+$/, "")}/after_provider_response.jsonl`;
+	}
+	return `${config.hookLogDir.replace(/\/+$/, "")}/${hook}.jsonl`;
 }
 
 async function writeHookLog(
 	config: NoetherConfig,
-	hook: "session_start" | "before_provider_request" | "after_provider_response",
+	hook:
+		| "session_start"
+		| "before_provider_request"
+		| "after_provider_response"
+		| "message_update"
+		| "message_end"
+		| "turn_end"
+		| "agent_end",
 	payload: Record<string, unknown>,
 ): Promise<void> {
 	const path = hookLogPath(config, hook);
@@ -277,7 +297,14 @@ async function writeHookLog(
 
 async function safeWriteHookLog(
 	config: NoetherConfig,
-	hook: "session_start" | "before_provider_request" | "after_provider_response",
+	hook:
+		| "session_start"
+		| "before_provider_request"
+		| "after_provider_response"
+		| "message_update"
+		| "message_end"
+		| "turn_end"
+		| "agent_end",
 	payload: Record<string, unknown>,
 ): Promise<void> {
 	try {
@@ -557,7 +584,24 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		);
 	});
 
+	pi.on("message_update", async (event, ctx) => {
+		await safeWriteHookLog(config, "message_update", {
+			trace_id: activeRequest?.traceId,
+			request_id: activeRequest?.requestId,
+			event,
+			ctx,
+			active_request: activeRequest,
+		});
+	});
+
 	pi.on("message_end", async (event, ctx) => {
+		await safeWriteHookLog(config, "message_end", {
+			trace_id: activeRequest?.traceId,
+			request_id: activeRequest?.requestId,
+			event,
+			ctx,
+			active_request: activeRequest,
+		});
 		const usage = extractUsage(isRecord(event) ? event.message : undefined);
 		if (!usage) {
 			return;
@@ -578,6 +622,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
+		await safeWriteHookLog(config, "turn_end", {
+			trace_id: activeRequest?.traceId,
+			request_id: activeRequest?.requestId,
+			event,
+			ctx,
+			active_request: activeRequest,
+		});
 		await safePostEvent(
 			"pi.turn_end",
 			{
@@ -589,6 +640,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		await safeWriteHookLog(config, "agent_end", {
+			trace_id: activeRequest?.traceId,
+			request_id: activeRequest?.requestId,
+			event,
+			ctx,
+			active_request: activeRequest,
+		});
 		const messages = isRecord(event) && Array.isArray(event.messages) ? event.messages : [];
 		await safePostEvent("pi.agent_end", { message_count: messages.length }, ctx);
 	});
