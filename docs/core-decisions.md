@@ -23,3 +23,11 @@ Decision: capture fixtures keep request and response bodies, with recursive cred
 Rationale: fixture capture exists to learn provider and harness shapes. Dropping bodies now would reduce product-learning value. This remains a local capture-spike behavior, not a central retention default.
 
 TODO for human review: add configurable body retention before shared or central deployments.
+
+## 2026-05-15: Noether is a transparent control proxy first
+
+Decision: Noether's primary integration shape is a transparent or forward control proxy for existing harness/provider traffic, not a provider translation layer.
+
+Rationale: Pi and similar harnesses already know how to build provider-correct paths, headers, bodies, auth, account metadata, and streaming protocols. Noether should leverage that by sitting on the transport path, applying policy/budget/trace/redaction before forwarding, and returning upstream responses without changing provider semantics. Provider emulation remains useful for local mocks and deterministic tests, but it is not the default product direction.
+
+TODO for human review: define the wrapper configuration contract for mapping intercepted provider traffic to original upstream base URLs, including how provider identity is carried without leaking secrets into fixtures.
