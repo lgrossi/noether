@@ -101,6 +101,7 @@ try {
 	};
 
 	await handlers.get("before_provider_request")({ payload }, ctx);
+	await waitFor(() => events.some((event) => event.kind === "pi.authorize"), "pi.authorize event");
 
 	if (!aborted) {
 		await fetch(providerUrl, {
@@ -155,4 +156,14 @@ function readJson(req) {
 		});
 		req.on("error", reject);
 	});
+}
+
+async function waitFor(predicate, label) {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		if (predicate()) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.fail(`timed out waiting for ${label}`);
 }
