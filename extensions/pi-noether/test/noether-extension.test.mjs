@@ -187,4 +187,114 @@ function fakeContext(overrides = {}) {
 	}
 }
 
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_3",
+				outcome: "allow",
+				reservation: { id: "res_3" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_agent_start")(
+			{
+				prompt: "private user prompt",
+				systemPromptOptions: {
+					selectedTools: ["read", "bash"],
+					skills: [{ name: "diagnose" }],
+					contextFiles: [{ path: "AGENTS.md" }],
+					cwd: "/repo",
+				},
+			},
+			fakeContext(),
+		);
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext());
+
+		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
+		assert.deepEqual(authorizeCall.body.metadata.agent_context.selected_tools, ["read", "bash"]);
+		assert.deepEqual(authorizeCall.body.metadata.agent_context.skills, ["diagnose"]);
+		assert.deepEqual(authorizeCall.body.metadata.agent_context.context_files, ["AGENTS.md"]);
+		assert.equal(JSON.stringify(calls).includes("private user prompt"), false);
+		assert.equal(calls.some((call) => call.body.kind === "pi.agent_context"), true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("tool_call")(
+			{ toolName: "bash", toolCallId: "tool_1", input: { command: "secret command" } },
+			fakeContext(),
+		);
+		await handlers.get("tool_result")(
+			{
+				toolName: "bash",
+				toolCallId: "tool_1",
+				input: { command: "secret command" },
+				content: [{ type: "text", text: "secret output" }],
+				details: { exitCode: 0 },
+				isError: false,
+			},
+			fakeContext(),
+		);
+
+		const observed = calls.find((call) => call.body.kind === "tool.observed");
+		assert.equal(observed.body.payload.name, "bash");
+		assert.equal(observed.body.payload.success, true);
+		assert.equal(typeof observed.body.payload.duration_ms, "number");
+		assert.deepEqual(observed.body.payload.metadata.input_summary.command, { type: "string", length: 14 });
+		assert.equal(JSON.stringify(calls).includes("secret command"), false);
+		assert.equal(JSON.stringify(calls).includes("secret output"), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
 console.log("pi-noether extension tests ok");

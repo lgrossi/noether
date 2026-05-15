@@ -56,6 +56,10 @@ type Usage = {
 	stop_reason?: string;
 };
 
+type MutableAuthorizeRequest = ReturnType<typeof buildAuthorizeRequest> & {
+	metadata?: Record<string, unknown>;
+};
+
 export function extensionConfig(env: Record<string, string | undefined> = process.env): NoetherConfig {
 	return {
 		noetherUrl: stripTrailingSlash(env.NOET_URL || DEFAULT_NOETHER_URL),
@@ -147,6 +151,13 @@ function summarizeValue(value: unknown): unknown {
 	return { type: typeof value };
 }
 
+function summarizeObject(value: unknown): unknown {
+	if (!isRecord(value)) {
+		return summarizeValue(value);
+	}
+	return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, summarizeValue(nested)]));
+}
+
 function sanitizeForMetadata(value: unknown, depth: number): unknown {
 	if (depth <= 0) {
 		return summarizeValue(value);
@@ -190,6 +201,45 @@ function integerValue(value: unknown): number | undefined {
 
 function dropUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
 	return Object.fromEntries(Object.entries(value).filter(([, nested]) => nested !== undefined)) as Partial<T>;
+}
+
+function summarizeNames(value: unknown): unknown {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	return value.slice(0, 50).map((item) => {
+		if (typeof item === "string") {
+			return item;
+		}
+		if (isRecord(item)) {
+			return stringValue(item.name) || stringValue(item.id) || stringValue(item.path) || summarizeValue(item);
+		}
+		return summarizeValue(item);
+	});
+}
+
+function summarizeAgentContext(event: unknown): Record<string, unknown> {
+	const eventRecord = isRecord(event) ? event : {};
+	const options = isRecord(eventRecord.systemPromptOptions) ? eventRecord.systemPromptOptions : {};
+	return dropUndefined({
+		prompt: summarizeValue(eventRecord.prompt),
+		images: summarizeValue(eventRecord.images),
+		selected_tools: summarizeNames(options.selectedTools),
+		tool_snippets: summarizeObject(options.toolSnippets),
+		skills: summarizeNames(options.skills),
+		context_files: summarizeNames(options.contextFiles),
+		cwd: stringValue(options.cwd),
+	});
+}
+
+function summarizeToolMetadata(event: unknown): Record<string, unknown> {
+	const record = isRecord(event) ? event : {};
+	return dropUndefined({
+		tool_call_id: stringValue(record.toolCallId),
+		input_summary: summarizeObject(record.input),
+		content_summary: summarizeValue(record.content),
+		details_summary: summarizeObject(record.details),
+	});
 }
 
 async function authorize(noetherUrl: string, request: unknown, signal?: AbortSignal): Promise<AuthorizeDecision> {
@@ -280,7 +330,9 @@ function makeTraceId(): string {
 
 export default function registerNoetherExtension(pi: ExtensionAPI, config: NoetherConfig = extensionConfig()): void {
 	let activeRequest: ActiveRequest | undefined;
+	let pendingAgentContext: Record<string, unknown> | undefined;
 	const completedReservations = new Set<string>();
+	const toolStartedAt = new Map<string, number>();
 
 	async function safePostEvent(kind: string, payload: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
 		try {
@@ -290,10 +342,23 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		}
 	}
 
+	pi.on("before_agent_start", (event) => {
+		pendingAgentContext = summarizeAgentContext(event);
+	});
+
 	pi.on("before_provider_request", async (event, ctx) => {
 		const traceId = makeTraceId();
 		const requestId = makeTraceId();
-		const request = buildAuthorizeRequest(isRecord(event) ? event : {}, ctx, config, { traceId, requestId });
+		const request = buildAuthorizeRequest(isRecord(event) ? event : {}, ctx, config, {
+			traceId,
+			requestId,
+		}) as MutableAuthorizeRequest;
+		if (pendingAgentContext && Object.keys(pendingAgentContext).length > 0) {
+			request.metadata = {
+				...request.metadata,
+				agent_context: pendingAgentContext,
+			};
+		}
 		activeRequest = {
 			traceId,
 			requestId,
@@ -308,6 +373,9 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 			if (shouldAbortForDecision(decision)) {
 				ctx.abort?.();
 			}
+			if (pendingAgentContext && Object.keys(pendingAgentContext).length > 0) {
+				await safePostEvent("pi.agent_context", pendingAgentContext, ctx);
+			}
 			await safePostEvent("pi.authorize", { request, outcome: decision.outcome }, ctx);
 		} catch (error) {
 			if (config.failMode === "fail_closed") {
@@ -319,6 +387,43 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				ctx,
 			);
 		}
+		pendingAgentContext = undefined;
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		const eventRecord = isRecord(event) ? event : {};
+		const toolCallId = stringValue(eventRecord.toolCallId);
+		if (toolCallId) {
+			toolStartedAt.set(toolCallId, Date.now());
+		}
+		await safePostEvent(
+			"pi.tool_call",
+			{
+				tool_name: stringValue(eventRecord.toolName),
+				tool_call_id: toolCallId,
+				input_summary: summarizeObject(eventRecord.input),
+			},
+			ctx,
+		);
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		const eventRecord = isRecord(event) ? event : {};
+		const toolCallId = stringValue(eventRecord.toolCallId);
+		const startedAt = toolCallId ? toolStartedAt.get(toolCallId) : undefined;
+		if (toolCallId) {
+			toolStartedAt.delete(toolCallId);
+		}
+		await safePostEvent(
+			"tool.observed",
+			{
+				name: stringValue(eventRecord.toolName) || "unknown",
+				duration_ms: startedAt ? Date.now() - startedAt : undefined,
+				success: typeof eventRecord.isError === "boolean" ? !eventRecord.isError : undefined,
+				metadata: summarizeToolMetadata(event),
+			},
+			ctx,
+		);
 	});
 
 	pi.on("after_provider_response", async (event, ctx) => {
