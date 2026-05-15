@@ -122,6 +122,8 @@ enum ReportSubcommand {
     Observations {
         #[arg(long)]
         kind: Option<String>,
+        #[arg(long)]
+        trace: Option<String>,
     },
 }
 
@@ -210,17 +212,27 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("total_cost_usd\t{:.6}", report.total_cost_usd);
-                println!("project\tprovider\tmodel\tsubject\ttokens\tcost_usd\treservations");
+                println!(
+                    "project\tprovider\tmodel\tsubject\tinput_tokens\toutput_tokens\tcache_read_tokens\tcache_write_tokens\ttotal_tokens\tcost_usd\tcache_read_cost_usd\tcache_write_cost_usd\treservations\tactive\tfinalized"
+                );
                 for row in report.rows {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}",
                         row.project.as_deref().unwrap_or("-"),
                         row.provider.as_deref().unwrap_or("-"),
                         row.model.as_deref().unwrap_or("-"),
                         row.subject.as_deref().unwrap_or("-"),
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read_tokens,
+                        row.cache_write_tokens,
                         row.total_tokens,
                         row.total_cost_usd,
-                        row.reservations
+                        row.cache_read_cost_usd,
+                        row.cache_write_cost_usd,
+                        row.reservations,
+                        row.active_reservations,
+                        row.finalized_reservations
                     );
                 }
             }
@@ -244,14 +256,17 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
                 }
             }
         }
-        ReportSubcommand::Observations { kind } => {
+        ReportSubcommand::Observations { kind, trace } => {
             let prefix = match kind.as_deref() {
                 Some("tool") => Some("tool."),
                 Some("eval") => Some("eval."),
                 Some(value) => Some(value),
                 None => None,
             };
-            print_items(ledger.observations_report(prefix)?, command.json)?;
+            print_items(
+                ledger.observations_report(prefix, trace.as_deref())?,
+                command.json,
+            )?;
         }
     }
     Ok(())

@@ -4,6 +4,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::contract::{
@@ -47,9 +48,17 @@ pub struct UsageReportRow {
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
+    pub cache_read_cost_usd: f64,
+    pub cache_write_cost_usd: f64,
     pub total_cost_usd: f64,
     pub reservations: u64,
+    pub active_reservations: u64,
+    pub finalized_reservations: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,7 +197,16 @@ impl BudgetLedger {
         let mut stmt = conn.prepare(
             "
             SELECT d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
-                   COALESCE(SUM(u.total_tokens), 0), COALESCE(SUM(r.amount_usd), 0), COUNT(r.id)
+                   COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0),
+                   COALESCE(SUM(CAST(json_extract(u.metadata_json, '$.usage_details.cache_read_tokens') AS INTEGER)), 0),
+                   COALESCE(SUM(CAST(json_extract(u.metadata_json, '$.usage_details.cache_write_tokens') AS INTEGER)), 0),
+                   COALESCE(SUM(u.total_tokens), 0),
+                   COALESCE(SUM(CAST(json_extract(u.metadata_json, '$.usage_details.cache_read_cost_usd') AS REAL)), 0),
+                   COALESCE(SUM(CAST(json_extract(u.metadata_json, '$.usage_details.cache_write_cost_usd') AS REAL)), 0),
+                   COALESCE(SUM(r.amount_usd), 0),
+                   COUNT(r.id),
+                   COALESCE(SUM(CASE WHEN r.status = 'active' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN r.status = 'finalized' THEN 1 ELSE 0 END), 0)
             FROM reservations r
             JOIN decisions d ON d.decision_id = r.decision_id
             LEFT JOIN usage_observations u ON u.reservation_id = r.id
@@ -203,9 +221,17 @@ impl BudgetLedger {
                     project: row.get(1)?,
                     provider: row.get(2)?,
                     model: row.get(3)?,
-                    total_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                    total_cost_usd: row.get(5)?,
-                    reservations: row.get::<_, i64>(6)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                    cache_write_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                    total_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                    cache_read_cost_usd: row.get(9)?,
+                    cache_write_cost_usd: row.get(10)?,
+                    total_cost_usd: row.get(11)?,
+                    reservations: row.get::<_, i64>(12)?.max(0) as u64,
+                    active_reservations: row.get::<_, i64>(13)?.max(0) as u64,
+                    finalized_reservations: row.get::<_, i64>(14)?.max(0) as u64,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -221,7 +247,8 @@ impl BudgetLedger {
         };
         let mut stmt = conn.prepare(
             "
-            SELECT created_at, outcome, decision_id
+            SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
+                   estimated_tokens, estimated_cost_usd, metadata_json
             FROM decisions
             ORDER BY created_at DESC
             ",
@@ -229,10 +256,27 @@ impl BudgetLedger {
         stmt.query_map([], |row| {
             let outcome: String = row.get(1)?;
             let decision_id: String = row.get(2)?;
+            let trace_id: Option<String> = row.get(3)?;
+            let request_id: Option<String> = row.get(4)?;
+            let provider: Option<String> = row.get(5)?;
+            let model: Option<String> = row.get(6)?;
+            let estimated_tokens: Option<i64> = row.get(7)?;
+            let estimated_cost_usd: Option<f64> = row.get(8)?;
+            let metadata_json: String = row.get(9)?;
+            let decision_summary = DecisionSummary {
+                decision_id: &decision_id,
+                trace_id: trace_id.as_deref(),
+                request_id: request_id.as_deref(),
+                provider: provider.as_deref(),
+                model: model.as_deref(),
+                estimated_tokens,
+                estimated_cost_usd,
+                metadata_json: &metadata_json,
+            };
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 kind: format!("decision.{outcome}"),
-                summary: decision_id,
+                summary: summarize_decision(decision_summary),
             })
         })?
         .collect::<Result<_, _>>()
@@ -242,42 +286,49 @@ impl BudgetLedger {
     pub fn observations_report(
         &self,
         kind_prefix: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(Vec::new());
         };
-        let mut stmt = if kind_prefix.is_some() {
-            conn.prepare(
-                "
-                SELECT occurred_at, kind, payload_json
-                FROM events
-                WHERE kind LIKE ?1
-                ORDER BY occurred_at DESC
-                ",
-            )?
-        } else {
-            conn.prepare(
-                "
-                SELECT occurred_at, kind, payload_json
-                FROM events
-                ORDER BY occurred_at DESC
-                ",
-            )?
-        };
+        let mut sql = "SELECT occurred_at, kind, payload_json FROM events".to_owned();
+        let mut clauses = Vec::new();
+        if kind_prefix.is_some() {
+            clauses.push("kind LIKE ?");
+        }
+        if trace_id.is_some() {
+            clauses.push("trace_id = ?");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY occurred_at DESC");
+        let mut stmt = conn.prepare(&sql)?;
         let prefix = kind_prefix.map(|prefix| format!("{prefix}%"));
         let mapper = |row: &rusqlite::Row<'_>| {
+            let kind: String = row.get(1)?;
+            let payload_json: String = row.get(2)?;
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
-                kind: row.get(1)?,
-                summary: row.get(2)?,
+                summary: summarize_event_payload(&kind, &payload_json),
+                kind,
             })
         };
-        match prefix {
-            Some(prefix) => stmt
-                .query_map([prefix], mapper)?
+        match (prefix, trace_id) {
+            (Some(prefix), Some(trace_id)) => stmt
+                .query_map(params![prefix, trace_id], mapper)?
                 .collect::<Result<_, _>>()
                 .map_err(NoetError::from),
-            None => stmt
+            (Some(prefix), None) => stmt
+                .query_map(params![prefix], mapper)?
+                .collect::<Result<_, _>>()
+                .map_err(NoetError::from),
+            (None, Some(trace_id)) => stmt
+                .query_map(params![trace_id], mapper)?
+                .collect::<Result<_, _>>()
+                .map_err(NoetError::from),
+            (None, None) => stmt
                 .query_map([], mapper)?
                 .collect::<Result<_, _>>()
                 .map_err(NoetError::from),
@@ -295,7 +346,8 @@ impl BudgetLedger {
 
         let mut decisions = conn.prepare(
             "
-            SELECT created_at, outcome, decision_id
+            SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
+                   estimated_tokens, estimated_cost_usd, metadata_json
             FROM decisions
             WHERE trace_id = ?1
             ORDER BY created_at
@@ -304,10 +356,27 @@ impl BudgetLedger {
         for row in decisions.query_map([trace_id], |row| {
             let outcome: String = row.get(1)?;
             let decision_id: String = row.get(2)?;
+            let trace_id: Option<String> = row.get(3)?;
+            let request_id: Option<String> = row.get(4)?;
+            let provider: Option<String> = row.get(5)?;
+            let model: Option<String> = row.get(6)?;
+            let estimated_tokens: Option<i64> = row.get(7)?;
+            let estimated_cost_usd: Option<f64> = row.get(8)?;
+            let metadata_json: String = row.get(9)?;
+            let decision_summary = DecisionSummary {
+                decision_id: &decision_id,
+                trace_id: trace_id.as_deref(),
+                request_id: request_id.as_deref(),
+                provider: provider.as_deref(),
+                model: model.as_deref(),
+                estimated_tokens,
+                estimated_cost_usd,
+                metadata_json: &metadata_json,
+            };
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 kind: format!("decision.{outcome}"),
-                summary: decision_id,
+                summary: summarize_decision(decision_summary),
             })
         })? {
             items.push(row?);
@@ -315,7 +384,8 @@ impl BudgetLedger {
 
         let mut usage = conn.prepare(
             "
-            SELECT created_at, provider, model, total_tokens, cost_usd
+            SELECT created_at, provider, model, input_tokens, output_tokens, total_tokens, cost_usd,
+                   stop_reason, metadata_json
             FROM usage_observations
             WHERE trace_id = ?1
             ORDER BY created_at
@@ -324,18 +394,25 @@ impl BudgetLedger {
         for row in usage.query_map([trace_id], |row| {
             let provider: Option<String> = row.get(1)?;
             let model: Option<String> = row.get(2)?;
-            let tokens: Option<i64> = row.get(3)?;
-            let cost: Option<f64> = row.get(4)?;
+            let input_tokens: Option<i64> = row.get(3)?;
+            let output_tokens: Option<i64> = row.get(4)?;
+            let tokens: Option<i64> = row.get(5)?;
+            let cost: Option<f64> = row.get(6)?;
+            let stop_reason: Option<String> = row.get(7)?;
+            let metadata_json: String = row.get(8)?;
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 kind: "usage.finalized".to_owned(),
-                summary: format!(
-                    "{} {} tokens={} cost={:.6}",
-                    provider.unwrap_or_else(|| "unknown".to_owned()),
-                    model.unwrap_or_else(|| "unknown".to_owned()),
-                    tokens.unwrap_or_default(),
-                    cost.unwrap_or_default()
-                ),
+                summary: summarize_finalized_usage(FinalizedUsageSummary {
+                    provider: provider.as_deref(),
+                    model: model.as_deref(),
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: tokens,
+                    cost,
+                    stop_reason: stop_reason.as_deref(),
+                    metadata_json: &metadata_json,
+                }),
             })
         })? {
             items.push(row?);
@@ -350,10 +427,12 @@ impl BudgetLedger {
             ",
         )?;
         for row in events.query_map([trace_id], |row| {
+            let kind: String = row.get(1)?;
+            let payload_json: String = row.get(2)?;
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
-                kind: row.get(1)?,
-                summary: row.get(2)?,
+                summary: summarize_event_payload(&kind, &payload_json),
+                kind,
             })
         })? {
             items.push(row?);
@@ -864,6 +943,320 @@ fn parse_time(value: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+struct DecisionSummary<'a> {
+    decision_id: &'a str,
+    trace_id: Option<&'a str>,
+    request_id: Option<&'a str>,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+    estimated_tokens: Option<i64>,
+    estimated_cost_usd: Option<f64>,
+    metadata_json: &'a str,
+}
+
+fn summarize_decision(decision: DecisionSummary<'_>) -> String {
+    let metadata = serde_json::from_str::<Value>(decision.metadata_json).unwrap_or(Value::Null);
+    let mut parts = vec![format!("decision_id={}", decision.decision_id)];
+    push_opt(&mut parts, "trace", decision.trace_id);
+    push_opt(&mut parts, "request", decision.request_id);
+    let model_ref = match (decision.provider, decision.model) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (None, Some(model)) => Some(model.to_owned()),
+        (Some(provider), None) => Some(provider.to_owned()),
+        (None, None) => None,
+    };
+    if let Some(model_ref) = model_ref {
+        parts.push(format!("model={model_ref}"));
+    }
+    if let Some(tokens) = decision.estimated_tokens {
+        parts.push(format!("estimated_tokens={}", tokens.max(0)));
+    }
+    if let Some(cost) = decision.estimated_cost_usd {
+        parts.push(format!("estimated_cost={cost:.6}"));
+    }
+    let shape = summarize_request_shape(&metadata);
+    if !shape.is_empty() {
+        parts.push(format!("shape={}", shape.join(",")));
+    }
+    parts.join(" ")
+}
+
+fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
+    let payload = serde_json::from_str::<Value>(payload_json).unwrap_or(Value::Null);
+    match kind {
+        "pi.provider_call.started" => summarize_provider_call_payload(&payload),
+        "pi.stream_summary" => summarize_stream_payload(&payload),
+        "tool.observed" => summarize_tool_payload(&payload),
+        "eval.annotation" => summarize_eval_payload(&payload),
+        "pi.message_end" => summarize_usage_payload(&payload),
+        "pi.turn_end" => summarize_turn_payload(&payload),
+        "pi.agent_end" => summarize_agent_payload(&payload),
+        _ => summarize_generic_payload(&payload),
+    }
+}
+
+struct FinalizedUsageSummary<'a> {
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    cost: Option<f64>,
+    stop_reason: Option<&'a str>,
+    metadata_json: &'a str,
+}
+
+fn summarize_finalized_usage(usage: FinalizedUsageSummary<'_>) -> String {
+    let metadata = serde_json::from_str::<Value>(usage.metadata_json).unwrap_or(Value::Null);
+    let details = metadata.get("usage_details").unwrap_or(&Value::Null);
+    let mut parts = Vec::new();
+    if let Some(provider) = usage.provider {
+        parts.push(format!("provider={provider}"));
+    }
+    if let Some(model) = usage.model {
+        parts.push(format!("model={model}"));
+    }
+    if let Some(tokens) = usage.input_tokens {
+        parts.push(format!("input_tokens={}", tokens.max(0)));
+    }
+    if let Some(tokens) = usage.output_tokens {
+        parts.push(format!("output_tokens={}", tokens.max(0)));
+    }
+    if let Some(tokens) = usage.total_tokens {
+        parts.push(format!("total_tokens={}", tokens.max(0)));
+    }
+    push_value_u64(
+        &mut parts,
+        "cache_read_tokens",
+        details.get("cache_read_tokens"),
+    );
+    push_value_u64(
+        &mut parts,
+        "cache_write_tokens",
+        details.get("cache_write_tokens"),
+    );
+    if let Some(cost) = usage.cost {
+        parts.push(format!("cost={cost:.6}"));
+    }
+    push_value_f64(
+        &mut parts,
+        "cache_read_cost",
+        details.get("cache_read_cost_usd"),
+    );
+    push_value_f64(
+        &mut parts,
+        "cache_write_cost",
+        details.get("cache_write_cost_usd"),
+    );
+    if let Some(stop_reason) = usage.stop_reason {
+        parts.push(format!("stop={stop_reason}"));
+    }
+    summarize_parts_or_kind(parts, "usage")
+}
+
+fn summarize_provider_call_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "provider", payload.get("provider"));
+    push_value_str(&mut parts, "model", payload.get("model"));
+    push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    if let Some(summary) = payload.get("payload_summary") {
+        let shape = summarize_request_shape(&serde_json::json!({ "payload_summary": summary }));
+        if !shape.is_empty() {
+            parts.push(format!("shape={}", shape.join(",")));
+        }
+    }
+    summarize_attribution(&mut parts, payload);
+    summarize_parts_or_kind(parts, "provider call")
+}
+
+fn summarize_stream_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(counts) = payload.get("counts").and_then(Value::as_object) {
+        let mut pairs: Vec<String> = counts
+            .iter()
+            .filter_map(|(key, value)| value.as_u64().map(|count| format!("{key}={count}")))
+            .collect();
+        pairs.sort();
+        if !pairs.is_empty() {
+            parts.push(format!("deltas={}", pairs.join(",")));
+        }
+    }
+    if let Some(tool_count) = payload
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|values| values.len())
+    {
+        parts.push(format!("tool_calls={tool_count}"));
+    }
+    summarize_attribution(&mut parts, payload);
+    summarize_parts_or_kind(parts, "stream")
+}
+
+fn summarize_tool_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "name", payload.get("name"));
+    push_value_bool(&mut parts, "success", payload.get("success"));
+    push_value_u64(&mut parts, "duration_ms", payload.get("duration_ms"));
+    push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    summarize_attribution(&mut parts, payload);
+    if let Some(tool_call_id) = payload
+        .get("metadata")
+        .and_then(|metadata| metadata.get("tool_call_id"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("tool_call_id={tool_call_id}"));
+    }
+    summarize_parts_or_kind(parts, "tool observation")
+}
+
+fn summarize_eval_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "label", payload.get("label"));
+    push_value_f64(&mut parts, "score", payload.get("score"));
+    push_value_str(&mut parts, "annotator", payload.get("annotator"));
+    summarize_parts_or_kind(parts, "eval annotation")
+}
+
+fn summarize_usage_payload(payload: &Value) -> String {
+    let usage = payload.get("usage").unwrap_or(payload);
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "provider", usage.get("provider"));
+    push_value_str(&mut parts, "model", usage.get("model"));
+    push_value_u64(&mut parts, "tokens", usage.get("total_tokens"));
+    push_value_u64(
+        &mut parts,
+        "cache_read_tokens",
+        usage.get("cache_read_tokens"),
+    );
+    push_value_u64(
+        &mut parts,
+        "cache_write_tokens",
+        usage.get("cache_write_tokens"),
+    );
+    push_value_f64(&mut parts, "cost", usage.get("cost_usd"));
+    push_value_str(&mut parts, "stop", usage.get("stop_reason"));
+    push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    summarize_attribution(&mut parts, payload);
+    summarize_parts_or_kind(parts, "usage")
+}
+
+fn summarize_turn_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_u64(&mut parts, "turn", payload.get("turn_index"));
+    if let Some(usage) = payload.get("usage") {
+        let usage_summary = summarize_usage_payload(usage);
+        if usage_summary != "usage" {
+            parts.push(format!("usage=({usage_summary})"));
+        }
+    }
+    summarize_parts_or_kind(parts, "turn")
+}
+
+fn summarize_agent_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_u64(&mut parts, "messages", payload.get("message_count"));
+    summarize_parts_or_kind(parts, "agent")
+}
+
+fn summarize_generic_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "source", payload.get("source"));
+    push_value_str(&mut parts, "decision", payload.get("decision_id"));
+    push_value_str(&mut parts, "reservation", payload.get("reservation_id"));
+    push_value_str(&mut parts, "request", payload.get("request_id"));
+    push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    summarize_attribution(&mut parts, payload);
+    if let Some(object) = payload.as_object() {
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        if !keys.is_empty() {
+            parts.push(format!("keys={}", keys.join(",")));
+        }
+    }
+    summarize_parts_or_kind(parts, "event")
+}
+
+fn summarize_attribution(parts: &mut Vec<String>, payload: &Value) {
+    if let Some(status) = payload.get("attribution_status").and_then(Value::as_str)
+        && status != "exact"
+    {
+        parts.push(format!("attribution={status}"));
+    }
+}
+
+fn summarize_request_shape(metadata: &Value) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(summary) = metadata.get("payload_summary") {
+        if let Some(input_len) = summary
+            .get("input")
+            .and_then(|input| input.get("length"))
+            .and_then(Value::as_u64)
+        {
+            parts.push(format!("input_count={input_len}"));
+        }
+        if let Some(tools_len) = summary
+            .get("tools")
+            .and_then(|tools| tools.get("length"))
+            .and_then(Value::as_u64)
+        {
+            parts.push(format!("tools_count={tools_len}"));
+        }
+        if let Some(effort) = summary
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str)
+        {
+            parts.push(format!("reasoning_effort={effort}"));
+        }
+        if let Some(verbosity) = summary
+            .get("text")
+            .and_then(|text| text.get("verbosity"))
+            .and_then(Value::as_str)
+        {
+            parts.push(format!("text_verbosity={verbosity}"));
+        }
+    }
+    parts
+}
+
+fn push_opt(parts: &mut Vec<String>, label: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        parts.push(format!("{label}={value}"));
+    }
+}
+
+fn push_value_str(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_str) {
+        parts.push(format!("{label}={value}"));
+    }
+}
+
+fn push_value_bool(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_bool) {
+        parts.push(format!("{label}={value}"));
+    }
+}
+
+fn push_value_u64(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_u64) {
+        parts.push(format!("{label}={value}"));
+    }
+}
+
+fn push_value_f64(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_f64) {
+        parts.push(format!("{label}={value:.6}"));
+    }
+}
+
+fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
+    if parts.is_empty() {
+        fallback.to_owned()
+    } else {
+        parts.join(" ")
+    }
 }
 
 #[cfg(test)]
