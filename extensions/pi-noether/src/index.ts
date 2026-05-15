@@ -31,6 +31,7 @@ type NoetherConfig = {
 
 type ActiveRequest = {
 	traceId: string;
+	requestId: string;
 	startedAt: number;
 	decisionId?: string;
 	reservationId?: string;
@@ -78,6 +79,7 @@ export function buildAuthorizeRequest(
 	event: { payload?: unknown },
 	ctx: ExtensionContext,
 	config: NoetherConfig = extensionConfig(),
+	correlation: { traceId?: string; requestId?: string } = {},
 ) {
 	const model = isRecord(ctx.model) ? ctx.model : {};
 	const payload = isRecord(event.payload) ? event.payload : {};
@@ -88,6 +90,8 @@ export function buildAuthorizeRequest(
 		harness: "pi",
 		extension: EXTENSION_NAME,
 		extension_version: config.version,
+		trace_id: correlation.traceId,
+		request_id: correlation.requestId,
 		cwd: ctx.cwd,
 		model_api: stringValue(model.api),
 		payload_kind: Array.isArray(event.payload) ? "array" : typeof event.payload,
@@ -231,6 +235,7 @@ async function finalizeReservation(
 	noetherUrl: string,
 	reservationId: string,
 	usage: Usage,
+	activeRequest: ActiveRequest,
 	signal?: AbortSignal,
 ): Promise<void> {
 	await fetch(`${noetherUrl}/v1/reservations/${encodeURIComponent(reservationId)}/finalize`, {
@@ -240,6 +245,11 @@ async function finalizeReservation(
 			reservation_id: reservationId,
 			usage,
 			actual_cost_usd: usage.cost_usd,
+			metadata: {
+				trace_id: activeRequest.traceId,
+				request_id: activeRequest.requestId,
+				source: EXTENSION_NAME,
+			},
 		}),
 		signal,
 	});
@@ -281,10 +291,12 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	}
 
 	pi.on("before_provider_request", async (event, ctx) => {
-		const request = buildAuthorizeRequest(isRecord(event) ? event : {}, ctx, config);
 		const traceId = makeTraceId();
+		const requestId = makeTraceId();
+		const request = buildAuthorizeRequest(isRecord(event) ? event : {}, ctx, config, { traceId, requestId });
 		activeRequest = {
 			traceId,
+			requestId,
 			startedAt: Date.now(),
 		};
 
@@ -334,7 +346,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 			return;
 		}
 		try {
-			await finalizeReservation(config.noetherUrl, activeRequest.reservationId, usage, ctx.signal);
+			await finalizeReservation(config.noetherUrl, activeRequest.reservationId, usage, activeRequest, ctx.signal);
 			completedReservations.add(activeRequest.reservationId);
 		} catch {
 			await safePostEvent("pi.reservation_finalize_error", { usage }, ctx);

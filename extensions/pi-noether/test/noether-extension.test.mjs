@@ -51,6 +51,7 @@ function fakeContext(overrides = {}) {
 	assert.equal(request.provider, "openai-codex");
 	assert.equal(request.model, "gpt-5.5");
 	assert.equal(request.estimated_tokens, 1234);
+	assert.equal(request.metadata.trace_id, undefined);
 	assert.deepEqual(request.metadata.payload_summary.input, { type: "array", length: 1 });
 	assert.deepEqual(request.metadata.payload_summary.instructions, { type: "string", length: 21 });
 	assert.equal(JSON.stringify(request).includes("secret prompt"), false);
@@ -122,7 +123,65 @@ function fakeContext(overrides = {}) {
 
 		assert.equal(aborted, true);
 		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
+		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
+		assert.equal(typeof authorizeCall.body.metadata.trace_id, "string");
+		assert.equal(typeof authorizeCall.body.metadata.request_id, "string");
 		assert.equal(JSON.stringify(calls).includes("do not send"), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_2",
+				outcome: "allow",
+				reservation: { id: "res_2" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext());
+		await handlers.get("message_end")(
+			{
+				message: {
+					role: "assistant",
+					provider: "openai",
+					model: "local",
+					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0.0001 } },
+				},
+			},
+			fakeContext(),
+		);
+
+		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
+		const finalizeCall = calls.find((call) => call.url.includes("/v1/reservations/res_2/finalize"));
+		assert.equal(finalizeCall.body.metadata.trace_id, authorizeCall.body.metadata.trace_id);
+		assert.equal(finalizeCall.body.metadata.request_id, authorizeCall.body.metadata.request_id);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
