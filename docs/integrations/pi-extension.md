@@ -393,6 +393,26 @@ Configure the extension with environment variables:
 | `NOET_PI_FAIL_MODE` | `fail_open` | Use `fail_closed` to abort provider sends when Noether is unavailable. |
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |
+| `NOET_PI_HOOK_LOG_DIR` | unset | Optional debug-only directory for raw `before_provider_request` and `after_provider_response` JSONL hook dumps. |
+
+## Raw hook dump mode
+
+For live Pi inspection, set `NOET_PI_HOOK_LOG_DIR` before starting Pi:
+
+```bash
+export NOET_PI_HOOK_LOG_DIR="$PWD/.noet/pi-hook-logs"
+tail -f .noet/pi-hook-logs/before_provider_request.jsonl
+tail -f .noet/pi-hook-logs/after_provider_response.jsonl
+```
+
+When enabled, the extension appends one JSON object per hook call:
+
+- `before_provider_request.jsonl`: raw Pi hook `event`, raw hook `ctx` after JSON-safe serialization, generated `trace_id` / `request_id`, and the Noether authorization request built from that hook.
+- `after_provider_response.jsonl`: raw Pi hook `event`, raw hook `ctx`, active Noether request correlation, and response status/header data as exposed by Pi.
+
+This mode is intentionally separate from normal Noether event ingestion. It is for discovering what
+Pi actually exposes during a real conversation. It may include prompt/provider payload data and should
+only be used locally with logs you are willing to inspect and delete.
 
 ## Privacy posture
 
