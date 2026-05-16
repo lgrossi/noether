@@ -21,6 +21,7 @@ use crate::policy::{
 #[derive(Debug, Default)]
 pub struct BudgetLedger {
     windows: HashMap<String, WindowState>,
+    allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     reservations: HashMap<String, StoredReservation>,
     events: Vec<TraceEvent>,
     conn: Option<Connection>,
@@ -30,6 +31,12 @@ pub struct BudgetLedger {
 struct WindowState {
     started_at: DateTime<Utc>,
     used_usd: f64,
+}
+
+#[derive(Clone, Debug)]
+struct AllocationBucketState {
+    current_grant_usd: f64,
+    carryover_usd: f64,
 }
 
 #[derive(Debug)]
@@ -129,6 +136,7 @@ impl BudgetLedger {
             ..Self::default()
         };
         ledger.load_windows()?;
+        ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
         Ok(ledger)
     }
@@ -180,6 +188,7 @@ impl BudgetLedger {
         } else {
             Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
         };
+        self.ensure_allocation_buckets(policy, request, reservation.as_ref())?;
 
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
@@ -993,6 +1002,31 @@ impl BudgetLedger {
         Ok(())
     }
 
+    fn persist_allocation_buckets(&self) -> Result<(), NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
+            conn.execute(
+                "
+                INSERT INTO budget_allocation_buckets (
+                    rule_id, entity_key, current_grant_usd, carryover_usd
+                ) VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(rule_id, entity_key) DO UPDATE SET
+                    current_grant_usd = excluded.current_grant_usd,
+                    carryover_usd = excluded.carryover_usd
+                ",
+                params![
+                    rule_id,
+                    entity_key,
+                    bucket.current_grant_usd,
+                    bucket.carryover_usd
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn load_windows(&mut self) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
@@ -1010,6 +1044,33 @@ impl BudgetLedger {
             })?
             .collect::<Result<_, _>>()?;
         self.windows = windows.into_iter().collect();
+        Ok(())
+    }
+
+    fn load_allocation_buckets(&mut self) -> Result<(), NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT rule_id, entity_key, current_grant_usd, carryover_usd
+            FROM budget_allocation_buckets
+            ",
+        )?;
+        let buckets: Vec<((String, String), AllocationBucketState)> = stmt
+            .query_map([], |row| {
+                let rule_id: String = row.get(0)?;
+                let entity_key: String = row.get(1)?;
+                Ok((
+                    (rule_id, entity_key),
+                    AllocationBucketState {
+                        current_grant_usd: row.get(2)?,
+                        carryover_usd: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        self.allocation_buckets = buckets.into_iter().collect();
         Ok(())
     }
 
@@ -1049,6 +1110,54 @@ impl BudgetLedger {
             })?
             .collect::<Result<_, _>>()?;
         self.reservations = reservations.into_iter().collect();
+        Ok(())
+    }
+
+    fn ensure_allocation_buckets(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        reservation: Option<&Reservation>,
+    ) -> Result<(), NoetError> {
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let Some(stored) = self.reservations.get(&reservation.id) else {
+            return Ok(());
+        };
+
+        let mut created = false;
+        for rule_id in &stored.budget_rule_ids {
+            let Some(rule) = policy.budgets.iter().find(|rule| rule.id == *rule_id) else {
+                continue;
+            };
+            let Some(entity_key) = allocation_bucket_entity_key(rule, request) else {
+                continue;
+            };
+            let Some(protected_amount_usd) = rule
+                .allocation
+                .as_ref()
+                .and_then(|allocation| allocation.protected_amount_usd)
+            else {
+                continue;
+            };
+            let key = (rule.id.clone(), entity_key);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.allocation_buckets.entry(key)
+            {
+                entry.insert(AllocationBucketState {
+                    current_grant_usd: protected_amount_usd,
+                    carryover_usd: 0.0,
+                });
+                created = true;
+            }
+        }
+        if created {
+            self.persist_allocation_buckets()?;
+        }
         Ok(())
     }
 }
@@ -1146,6 +1255,14 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             rule_id TEXT PRIMARY KEY,
             started_at TEXT NOT NULL,
             used_usd REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS budget_allocation_buckets (
+            rule_id TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            current_grant_usd REAL NOT NULL,
+            carryover_usd REAL NOT NULL,
+            PRIMARY KEY (rule_id, entity_key)
         );
         ",
     )?;
@@ -1408,6 +1525,35 @@ fn push_guard_explanation(
         severity,
     });
     denied
+}
+
+fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -> Option<String> {
+    let allocation = rule.allocation.as_ref()?;
+    if allocation.standard != "protected_adoption_pool" {
+        return None;
+    }
+    match allocation.by.as_deref() {
+        Some("user") => request
+            .entities
+            .iter()
+            .find(|entity| entity.starts_with("user:"))
+            .cloned()
+            .or_else(|| {
+                request.subject.as_deref().map(|subject| {
+                    if subject.contains(':') {
+                        subject.to_owned()
+                    } else {
+                        format!("user:{subject}")
+                    }
+                })
+            }),
+        Some("team") => request
+            .entities
+            .iter()
+            .find(|entity| entity.starts_with("team:"))
+            .cloned(),
+        _ => None,
+    }
 }
 
 fn matched_entity_and_rank(
@@ -2264,6 +2410,143 @@ mod tests {
             trace_routing.selected_budget_id.as_deref(),
             Some("project-budget")
         );
+    }
+
+    #[test]
+    fn sqlite_persists_protected_adoption_buckets_across_reopen() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("protected-adoption.sqlite");
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "ai-adoption".to_owned(),
+                limit_usd: 2000.0,
+                priority: 0,
+                warn_at_fraction: 1.0,
+                window_seconds: 60,
+                eligible: BudgetEligibility {
+                    entities: vec!["org:example".to_owned()],
+                },
+                models: BudgetModelPolicy::default(),
+                guards: BudgetGuardPolicy::default(),
+                allocation: Some(crate::contract::BudgetAllocationPolicy {
+                    standard: "protected_adoption_pool".to_owned(),
+                    by: Some("user".to_owned()),
+                    protected_amount_usd: Some(25.0),
+                    window: Some("monthly".to_owned()),
+                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
+                        percent: Some(10.0),
+                        cap_usd: Some(50.0),
+                    }),
+                }),
+                rule_match: RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        };
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let mut request = request(0.25);
+        request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+
+        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let row = conn
+            .query_row(
+                "
+                SELECT rule_id, entity_key, current_grant_usd, carryover_usd
+                FROM budget_allocation_buckets
+                WHERE rule_id = ?1 AND entity_key = ?2
+                ",
+                ["ai-adoption", "user:alice"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                },
+            )
+            .expect("protected adoption bucket row");
+        assert_eq!(row.0, "ai-adoption");
+        assert_eq!(row.1, "user:alice");
+        assert_eq!(row.2, 25.0);
+        assert_eq!(row.3, 0.0);
+
+        drop(ledger);
+
+        let reopened = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
+        let conn = reopened.conn.as_ref().expect("reopened sqlite conn");
+        let persisted = conn
+            .query_row(
+                "
+                SELECT current_grant_usd, carryover_usd
+                FROM budget_allocation_buckets
+                WHERE rule_id = ?1 AND entity_key = ?2
+                ",
+                ["ai-adoption", "user:alice"],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
+            )
+            .expect("reloaded protected adoption bucket");
+        assert_eq!(persisted.0, 25.0);
+        assert_eq!(persisted.1, 0.0);
+    }
+
+    #[test]
+    fn protected_adoption_buckets_are_tracked_per_entity() {
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "ai-adoption".to_owned(),
+                limit_usd: 2000.0,
+                priority: 0,
+                warn_at_fraction: 1.0,
+                window_seconds: 60,
+                eligible: BudgetEligibility {
+                    entities: vec!["org:example".to_owned()],
+                },
+                models: BudgetModelPolicy::default(),
+                guards: BudgetGuardPolicy::default(),
+                allocation: Some(crate::contract::BudgetAllocationPolicy {
+                    standard: "protected_adoption_pool".to_owned(),
+                    by: Some("user".to_owned()),
+                    protected_amount_usd: Some(25.0),
+                    window: Some("monthly".to_owned()),
+                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
+                        percent: Some(10.0),
+                        cap_usd: Some(50.0),
+                    }),
+                }),
+                rule_match: RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        };
+        let mut ledger = BudgetLedger::default();
+        let mut alice_request = request(0.25);
+        alice_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+        let mut bob_request = request(0.25);
+        bob_request.entities = vec!["org:example".to_owned(), "user:bob".to_owned()];
+
+        let alice = ledger.authorize(Some(&policy), &alice_request);
+        let bob = ledger.authorize(Some(&policy), &bob_request);
+
+        assert_eq!(alice.outcome, DecisionOutcome::Allow);
+        assert_eq!(bob.outcome, DecisionOutcome::Allow);
+        let alice_bucket = ledger
+            .allocation_buckets
+            .get(&("ai-adoption".to_owned(), "user:alice".to_owned()))
+            .expect("alice bucket");
+        let bob_bucket = ledger
+            .allocation_buckets
+            .get(&("ai-adoption".to_owned(), "user:bob".to_owned()))
+            .expect("bob bucket");
+        assert_eq!(alice_bucket.current_grant_usd, 25.0);
+        assert_eq!(alice_bucket.carryover_usd, 0.0);
+        assert_eq!(bob_bucket.current_grant_usd, 25.0);
+        assert_eq!(bob_bucket.carryover_usd, 0.0);
     }
 
     #[test]
