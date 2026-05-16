@@ -8,4 +8,5 @@ pub mod mock;
 pub mod policy;
 pub mod proxy;
 pub mod redaction;
+pub mod scenario;
 pub mod server;
