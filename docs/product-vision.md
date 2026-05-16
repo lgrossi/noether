@@ -1,28 +1,34 @@
 # Product vision
 
-## One-line thesis
+## Thesis
 
-Noether keeps the invariants of LLM usage: budget, policy, evaluation, and observability across harnesses, proxies, and providers.
+Noether is the local-first control plane for AI work: it observes agent usage, attributes it to the
+right work, controls risky spend/model behavior, and helps teams grow AI adoption safely.
 
 ## Problem
 
-LLM usage is spreading across coding harnesses, internal apps, gateway proxies, direct SDK calls, and managed model aggregators. Existing tools tend to cluster around one of two poles:
+AI usage is spreading across coding agents, harnesses, internal apps, SDKs, gateway proxies, and
+managed model platforms. Existing tools tend to cluster around two poles:
 
-- **Routers/proxies**: good at central enforcement, but often become bloated protocol translators.
-- **Harnesses/cockpits**: good at workflow visibility, but local to a tool or operator.
+- **Routers/proxies**: good at central enforcement, but often become protocol translators and model
+  gateways.
+- **Harnesses/cockpits**: good at workflow visibility, but usually local to one tool or operator.
 
-The unsolved gap is a small, auditable control layer that can answer:
+The missing layer is a small, auditable control plane that can answer:
 
 - Who or what made this model request?
-- Which project, task, or session should it count against?
-- Was it allowed by policy before it ran?
-- Which budget was reserved, spent, or exhausted?
-- What did it cost, how long did it take, and what happened afterward?
-- Which traces, tool calls, eval labels, and outcomes explain the usage?
+- Which project, task, session, or entity should it count against?
+- Was it allowed by policy before spend happened?
+- Which budget was selected, reserved, finalized, denied, or exhausted?
+- Which model, context size, tools, retries, and agent steps explain the usage?
+- Did this run look productive, risky, runaway, or under-attributed?
+- Are teams adopting AI well, or leaving useful budget/opportunity unused?
 
 ## Product idea
 
-Noether is a vendor-neutral LLM control sidecar. It can run locally for an individual developer or centrally for a team. It is not primarily an LLM router. It is the policy, budget, trace, and evaluation companion that a harness, app, SDK, or gateway can call into.
+Noether runs locally for an individual or centrally for a team. It is not primarily an LLM router.
+It is the policy, budget, trace, and adoption companion that a harness, app, SDK, or gateway can
+call into.
 
 ```text
 Harness / app / proxy / SDK
@@ -32,53 +38,83 @@ Harness / app / proxy / SDK
 Hot-path decision     Trace/usage ingest
         \              /
          \            /
-          Policy + budget ledger + reports
+          Policy + budget ledger + dashboard
 ```
 
-## Target users
+## Adoption thesis
 
-### Individual operator
+Noether should be useful on day one without enforcement.
 
-Someone running multiple AI coding sessions through tools such as Pi, Claude Code, Codex, OpenCode, or local models.
+The adoption path is:
 
-They need:
+```text
+observe -> attribute -> warn -> enforce -> improve
+```
 
-- per-project usage visibility;
-- soft or hard local budgets;
-- traceability across sessions;
-- awareness of expensive or runaway work;
-- a path to use subscription-backed harnesses for dogfooding without productizing subscription tunneling.
+Users should be able to keep their existing AI tools, add Noether, and immediately get useful
+visibility. Enforcement should be progressive and explicit.
 
-### Platform or AI enablement team
+## Product pillars
 
-A team responsible for company-wide LLM usage, budget discipline, security posture, and auditability.
+### Observe
 
-They need:
+Make AI work visible:
 
-- centralized policy decisions;
-- hard budget reservations and reconciliation;
-- team/project/user attribution;
-- low-friction integration with existing proxies and apps;
-- audit and observability without adopting yet another full LLM platform.
+- provider/model usage;
+- token/cost accounting;
+- trace timelines;
+- tool and agent activity;
+- eval and annotation events;
+- local ledger and dashboard.
 
-## Value proposition
+### Attribute
 
-Noether should be useful even when it does not own the model call:
+Make AI work belong somewhere:
 
-- **With proxy/SDK integration**: it can hard-block requests before spend happens.
-- **With harness integration**: it can enforce local policy and capture workflow traces.
-- **With async-only ingestion**: it can still produce observability and insight, but not hard enforcement.
+- normalized entities such as user, project, team, org, and purpose;
+- explicit or inferred budget routing;
+- project derivation helpers over time;
+- missing attribution warnings;
+- selected-budget explanations.
 
-The product must make this enforcement level explicit.
+### Control
 
-## Scenario emulator
+Apply lightweight governance:
 
-Noether should include a comprehensive scenario emulator. Because Noether is self-contained and its
-contract is explicit, it should be able to simulate realistic companies, users, projects, budgets,
-models, agent runs, tool calls, denials, fallbacks, and adoption patterns without requiring live
-provider traffic.
+- allow/warn/deny decisions;
+- model allowlists;
+- budget selection and reservation;
+- spend windows;
+- request-cost and context-size limits;
+- future tool-call, retry, and agent-step guards;
+- fail-open and fail-closed modes.
 
-The emulator is a product feature, not only a test harness. It should let maintainers and adopters
+### Improve
+
+Help teams use AI better:
+
+- low-adoption detection;
+- protected adoption pools;
+- bounded carryover;
+- underuse as opportunity signal;
+- context-heavy and tool-heavy run detection;
+- model-denial and fallback reporting.
+
+### Simulate
+
+Make product claims executable.
+
+Noether should include:
+
+1. **Native end-to-end scenarios**
+   - 5-6 curated examples that demonstrate realistic use cases from authorization through reports
+     and dashboard.
+
+2. **Strategy simulations**
+   - synthetic companies with many users, teams, projects, usage profiles, and allocation/control
+     strategies so users can compare likely outcomes before adopting a policy.
+
+Scenario emulation is a product feature, not only a test harness. It lets maintainers and adopters
 validate claims such as:
 
 - budget routing chooses the expected budget;
@@ -87,15 +123,64 @@ validate claims such as:
 - protected adoption pools carry over correctly;
 - reports and dashboards explain the scenario in human terms.
 
-This keeps Noether honest: every public governance claim should eventually have an executable
-scenario that demonstrates it end to end.
+## Target users
+
+### Individual operator
+
+Someone running multiple AI coding sessions through tools such as Pi, Claude Code, Codex, OpenCode,
+or local models.
+
+They need:
+
+- per-project usage visibility;
+- local soft or hard budgets;
+- traceability across sessions;
+- awareness of expensive or runaway work;
+- privacy-preserving local storage.
+
+### Small engineering team
+
+A team adopting AI agents but not ready for enterprise AI infrastructure.
+
+They need:
+
+- shared visibility;
+- model and budget guardrails;
+- project/team attribution;
+- understandable reports;
+- observe/warn modes before enforcement.
+
+### Platform or AI enablement team
+
+A team responsible for AI governance, enablement, budget discipline, and auditability.
+
+They need:
+
+- centralized policy decisions;
+- hard budget reservations and reconciliation;
+- team/project/user attribution;
+- low-friction integration with existing tools;
+- showback before chargeback;
+- adoption and underuse visibility.
+
+## Value proposition
+
+Noether should be useful even when it does not own the model call:
+
+- **With proxy/SDK integration**: it can hard-block requests before spend happens.
+- **With harness integration**: it can enforce local policy and capture workflow traces.
+- **With async-only ingestion**: it can still produce observability and insight, but not hard
+  enforcement.
+
+The product must make this enforcement level explicit.
 
 ## Non-goals
 
 - Rebuild LiteLLM in Rust.
 - Own full provider protocol correctness as the core product.
 - Productize consumer-subscription tunneling or browser automation.
-- Build a large dashboard before the ledger, decision API, and event schema are proven.
+- Store prompts by default.
+- Build a broad enterprise policy DSL.
 - Pretend model traffic alone fully explains agent/tool/MCP behavior.
 - Encode one company's quota policy as the product model.
 
@@ -105,4 +190,6 @@ scenario that demonstrates it end to end.
 - **Euler**: possible future harness/execution engine.
 - **Noether**: invariant layer for budgets, policy, traces, evals, and audit.
 
-Noether should be usable without Majin, but Majin should be able to consume Noether data for cockpit views such as budget pressure, policy denials, expensive lanes, and trace summaries.
+Noether should be usable without Majin, but Majin should be able to consume Noether data for cockpit
+views such as budget pressure, policy denials, expensive lanes, trace summaries, and adoption
+signals.

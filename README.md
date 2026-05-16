@@ -1,53 +1,126 @@
 # Noether
 
-Noether keeps the invariants of LLM usage: budget, policy, evaluation, and observability across harnesses, proxies, and providers.
+**Local-first observability and control for AI agent usage.**
 
-The command-line tool is `noet`.
+Noether helps teams understand, govern, and improve AI-assisted work without replacing the tools
+they already use. It sits beside AI coding agents, harnesses, apps, SDKs, or gateways; receives
+hot-path authorization requests before model spend; ingests usage and lifecycle events afterward;
+and turns the result into an explainable ledger, reports, and dashboard.
 
-## North-star docs
+Noether is not a provider router, prompt warehouse, identity system, or generic FinOps clone. It is
+an AI work control plane.
 
-- [Product vision](./docs/product-vision.md)
-- [High-level solution design](./docs/solution-design.md)
-- [Roadmap](./docs/roadmap.md)
+```text
+AI agent / app / gateway
+        |              \
+        | authorize     \ events + usage
+        v                v
+   allow / warn / deny   trace ingest
+          \             /
+           \           /
+      budget + policy + ledger + dashboard
+```
 
-## Current build
+## Why Noether exists
 
-This repository currently contains a local sidecar and CLI tracer bullet:
+AI budgets are not ordinary cloud budgets.
 
-- accepts OpenAI-compatible `/v1/chat/completions`;
-- accepts Anthropic-compatible `/v1/messages`;
-- accepts OpenAI Responses-style `/v1/responses`;
-- redacts sensitive headers and credential-like JSON body keys;
-- writes capture fixtures to `.noet/fixtures`;
-- returns mock responses when no upstream is configured;
-- forwards to an upstream base URL when configured.
-- supports transparent provider-wrapper routes that strip a local wrapper prefix and forward to the original upstream without provider translation;
-- includes a normal Pi extension package that authorizes provider requests through local Noether before Pi sends them;
-- validates `policy.noet.yaml`;
-- evaluates a minimal fixed-window budget;
-- exposes `POST /v1/authorize`, `POST /v1/reservations/{id}/finalize`, and `POST /v1/events`.
-- persists local decisions, reservations, usage, and events to SQLite;
-- reports usage, decisions, trace stories, and observations from the local ledger.
+- They are directly tied to productivity.
+- They can burn very quickly through model choice, context size, retries, tool storms, and agent
+  loops.
+- Companies often want to increase adoption, not only cut spend.
+- Underuse can be a missed opportunity, while overuse can be a runaway cost or safety problem.
+- Provider billing pages cannot explain which project, agent run, tool call, or policy decision
+  caused the spend.
 
-It is not a production router yet. The goal is to collect real harness traffic and shape Noether's control contract without taking ownership of provider protocol correctness.
+Noether's goal is to make AI work legible and governable:
 
-## Current control flow
+- What ran?
+- Who or what did it belong to?
+- Which model and tools were used?
+- Which budget should pay?
+- Was it allowed, warned, denied, or routed to a fallback?
+- Did usage look healthy, wasteful, risky, or under-adopted?
 
-Noether is a sidecar control plane. A harness, app, or proxy asks before model spend and reports what
-happened afterward:
+## Product pillars
 
-1. Client calls `POST /v1/authorize` with subject/project/provider/model estimates and correlation metadata.
-2. Noether evaluates policy and budget, then returns `allow`, `warn`, or `deny`.
-3. `allow`/`warn` creates a reservation. `deny` has no reservation and the integration should not call the provider.
-4. The integration sends the provider request normally when allowed.
-5. After the response, the integration calls `POST /v1/reservations/{id}/finalize` with actual usage/cost.
-6. The integration can also send `POST /v1/events` for timeline, tool, usage, and eval observations.
-7. `noet report ...` reads the SQLite ledger and shows usage totals, decisions, trace stories, and observations.
+### Observe
 
-For Pi, the primary integration is `extensions/pi-noether`: the extension runs this flow from Pi hooks,
-keeps prompts/body content private by default, and propagates `trace_id` / `request_id` for reporting.
+Make AI work visible before controlling it.
 
-## Vertical MVP demo
+- request decisions
+- provider/model usage
+- cost and token accounting
+- trace timelines
+- tool and agent activity
+- eval/annotation events
+- local SQLite ledger
+- static HTML dashboard
+
+### Attribute
+
+Make usage belong somewhere.
+
+- user/project/team/org/purpose entities
+- explicit or inferred budget routing
+- project derivation helpers over time
+- missing-attribution warnings
+- selected-budget explanations
+
+### Control
+
+Apply lightweight, explainable governance.
+
+- allow / warn / deny
+- model allowlists
+- budget selection and reservation
+- spend windows such as 5h / 7d
+- request-cost and context-size limits
+- future tool-call, retry, and agent-step guards
+- fail-open or fail-closed deployment modes
+
+### Improve
+
+Help teams use AI better, not just cheaper.
+
+- low-adoption visibility
+- protected adoption pools
+- bounded carryover
+- underused budget as opportunity signal
+- context-heavy or tool-heavy run detection
+- model-denial and fallback reporting
+
+### Simulate
+
+Prove product claims with executable scenarios.
+
+- native end-to-end examples for common use cases
+- synthetic company simulations with user profiles and strategy comparisons
+- report/dashboard assertions for CI
+- reproducible examples that require no live provider credentials
+
+## Current status
+
+Noether is early but functional.
+
+Today it includes:
+
+- local `noet` sidecar;
+- `POST /v1/authorize`;
+- reservation finalization;
+- `POST /v1/events`;
+- SQLite-backed decision/usage/event ledger;
+- story-shaped CLI reports;
+- static HTML dashboard;
+- Pi extension integration;
+- bodyless authorization metadata by default;
+- opt-in raw hook debug logs;
+- vertical MVP demo with no provider credentials.
+
+The policy model is still v0. The next product phase is the entity-based AI budget model described
+in [`docs/design/ai-budget-allocation-standards.md`](./docs/design/ai-budget-allocation-standards.md).
+
+## Quick demo
 
 Run a safe local demo with no provider credentials:
 
@@ -55,101 +128,103 @@ Run a safe local demo with no provider credentials:
 ./examples/vertical-mvp-demo.sh
 ```
 
-The demo starts `noet serve`, authorizes one bodyless Pi-shaped request, finalizes usage, ingests
-request/tool/eval events, and prints:
+Then generate a visual dashboard:
 
 ```bash
-noet report usage
-noet report decisions
-noet report trace <trace_id>
-noet report observations
+cargo run --bin noet -- report \
+  --db-path .noet/demo/vertical-mvp.sqlite \
+  dashboard \
+  --out .noet/noether-dashboard.html
 ```
 
-It writes its disposable SQLite ledger under `.noet/demo/vertical-mvp.sqlite`.
-
-## Run
+Open the generated file in a browser:
 
 ```bash
-cargo run --bin noet -- serve
+xdg-open .noet/noether-dashboard.html
 ```
 
-With an upstream:
+## Use with Pi
+
+Start Noether:
 
 ```bash
-cargo run --bin noet -- serve --upstream http://127.0.0.1:11434/
+cargo run --bin noet -- serve \
+  --policy examples/policy.noet.yaml \
+  --decision-mode enforce
 ```
 
-Transparent provider-wrapper routes:
-
-```yaml
-# noet.routes.yaml
-routes:
-  - id: openai
-    path_prefix: /providers/openai
-    upstream_base_url: https://api.openai.com/
-```
+Run Pi with the extension:
 
 ```bash
-cargo run --bin noet -- serve --routes noet.routes.yaml
+NOET_URL=http://127.0.0.1:4040 \
+NOET_PI_PROJECT=noether \
+NOET_PI_SUBJECT=user:local \
+NOET_PI_FAIL_MODE=fail_open \
+pi --extension "$PWD/extensions/pi-noether"
 ```
 
-Requests to `/providers/openai/v1/responses` are forwarded to `/v1/responses` at the configured upstream. Noether preserves method, query, body, auth/account/provider headers, and response status/headers/body except hop-by-hop headers.
-
-Custom fixture directory:
+Inspect results:
 
 ```bash
-cargo run --bin noet -- serve --fixture-dir .noet/fixtures
+cargo run --bin noet -- report decisions
+cargo run --bin noet -- report usage
+cargo run --bin noet -- report trace <trace_id>
+cargo run --bin noet -- report observations --kind tool --trace <trace_id>
+cargo run --bin noet -- report dashboard --out .noet/noether-dashboard.html
 ```
 
-Validate a policy:
+## Privacy posture
 
-```bash
-cargo run --bin noet -- policy check examples/policy.noet.yaml
-```
+Noether is local-first.
 
-Run capture with policy decisions recorded but not enforced:
+- SQLite by default.
+- No cloud service required.
+- Normal Pi extension authorization is bodyless by default.
+- Prompt-like fields are summarized, not retained.
+- Raw hook logging is explicit debug mode only.
+- Capture/proxy modes are for controlled local inspection and redact credential-like fields.
 
-```bash
-cargo run --bin noet -- serve --policy examples/policy.noet.yaml --decision-mode dry-run
-```
+## Scenario emulator vision
 
-Run capture with deny decisions blocking before mock/upstream:
+Noether should ship with two kinds of executable examples:
 
-```bash
-cargo run --bin noet -- serve --policy examples/policy.noet.yaml --decision-mode enforce
-```
+1. **Native end-to-end scenarios**
+   - individual local developer
+   - team pooled budget
+   - project budget fallback
+   - model-denial/fallback
+   - runaway agent guard
+   - protected adoption pool
 
-Health check:
+2. **Strategy simulations**
+   - synthetic company of hundreds or thousands of users
+   - different usage profiles such as power users, steady users, low adopters, and loop-risk agents
+   - strategy comparison across pooled caps, protected adoption pools, reserved/shared budgets, and
+     other future standards
 
-```bash
-curl http://127.0.0.1:4040/health
-```
+The point is not only testing. It is evidence: every major public claim Noether makes should have a
+scenario that demonstrates it.
 
-Mock OpenAI-compatible request:
+## Documentation
 
-```bash
-curl http://127.0.0.1:4040/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'authorization: Bearer secret' \
-  -d '{"model":"noether-mock","messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Fixture shape
-
-Fixtures use schema `noether.capture.v1` and include:
-
-- trace id;
-- captured timestamp;
-- redacted request method/path/headers/body;
-- response source, status, redacted headers, body, and chunks.
-- optional decision metadata when `--policy` is configured.
-
-Prompt and response bodies are captured during this spike. Retention and redaction policy will become explicit before any central or shared deployment.
-
-See:
-
+- [Product vision](./docs/product-vision.md)
+- [Roadmap](./docs/roadmap.md)
+- [AI budget allocation standards](./docs/design/ai-budget-allocation-standards.md)
+- [Control contract v0](./docs/control-contract-v0.md)
+- [Policy v0](./docs/policy-v0.md)
 - [Pi extension integration](./docs/integrations/pi-extension.md)
 - [Capture fixture schema v1](./docs/capture-fixtures.md)
 - [Transparent proxy mode](./docs/transparent-proxy.md)
-- [Control contract v0](./docs/control-contract-v0.md)
-- [Policy v0](./docs/policy-v0.md)
+
+## Non-goals
+
+- Rebuild LiteLLM.
+- Own provider protocol correctness as the product.
+- Store prompts by default.
+- Become a generic enterprise policy DSL.
+- Productize consumer-subscription tunneling.
+- Encode one company's quota policy as the product model.
+
+## License
+
+License is not finalized yet.

@@ -1,11 +1,10 @@
-# Roadmap
+# GitHub issue backlog
 
-This roadmap is a sequence of product validation slices. It is intentionally not a complete
-backlog. Each slice should prove a public-facing Noether claim.
+These issues mirror the public roadmap slices.
 
-## Slice 1: local visibility
+## 1. Local visibility
 
-Goal: make one local AI workflow understandable without central infrastructure.
+Make one local AI workflow understandable without central infrastructure.
 
 Acceptance:
 
@@ -17,9 +16,9 @@ Acceptance:
   timeline.
 - Normal mode does not store prompt/body content by default.
 
-## Slice 2: first excellent integration
+## 2. First excellent integration
 
-Goal: make one existing AI workflow feel native with Noether.
+Make one existing AI workflow feel native with Noether.
 
 Acceptance:
 
@@ -30,9 +29,9 @@ Acceptance:
 - Real-hook findings are represented in tests.
 - Reports and dashboard explain a Pi run without raw hook logs.
 
-## Slice 3: attribution and model control
+## 3. Attribution and model control
 
-Goal: make AI work belong to a budget and constrain model access.
+Make AI work belong to a budget and constrain model access.
 
 Acceptance:
 
@@ -45,9 +44,9 @@ Acceptance:
 - Decisions explain selected budget, rejected requested budget, matched entity, model check, and
   remaining budget.
 
-## Slice 4: AI-native guardrails
+## 4. AI-native guardrails
 
-Goal: prevent unhealthy AI usage patterns without relying only on money caps.
+Prevent unhealthy AI usage patterns without relying only on money caps.
 
 Acceptance:
 
@@ -57,9 +56,9 @@ Acceptance:
 - Tool-call, retry, and agent-step guards are represented once lifecycle data supports them.
 - Dashboard/reporting highlights guard hits and risky runs.
 
-## Slice 5: adoption governance
+## 5. Adoption governance
 
-Goal: support safe AI adoption instead of only spend reduction.
+Support safe AI adoption instead of only spend reduction.
 
 Acceptance:
 
@@ -70,9 +69,9 @@ Acceptance:
 - Low adopters and unused protected opportunity are visible.
 - Reports distinguish savings, unused opportunity, and protected carryover liability.
 
-## Slice 6: native scenario examples
+## 6. Native scenario examples
 
-Goal: give users concrete, runnable examples of Noether behavior.
+Give users concrete, runnable examples of Noether behavior.
 
 Acceptance:
 
@@ -80,18 +79,13 @@ Acceptance:
   denials, fallbacks, and finalization.
 - `noet scenario run <file>` replays the scenario through public contract surfaces.
 - Generated reports/dashboard show the expected story without live provider traffic.
-- Initial scenarios cover:
-  - individual local developer;
-  - team pooled budget;
-  - project budget fallback;
-  - model-denial/fallback;
-  - runaway agent guard;
-  - protected adoption pool.
+- Initial scenarios cover individual local developer, team pooled budget, project budget fallback,
+  model-denial/fallback, runaway agent guard, and protected adoption pool.
 - Scenario assertions can fail CI when behavior or report output drifts.
 
-## Slice 7: strategy simulation lab
+## 7. Strategy simulation lab
 
-Goal: compare Noether strategies against realistic synthetic organizations.
+Compare Noether strategies against realistic synthetic organizations.
 
 Acceptance:
 
@@ -105,9 +99,9 @@ Acceptance:
   prevented, adoption coverage, fairness, model mix, carryover liability, and exhaustion timing.
 - Simulation output can generate a dashboard/report for human review.
 
-## Slice 8: team deployment
+## 8. Team deployment
 
-Goal: make Noether usable beyond one laptop.
+Make Noether usable beyond one laptop.
 
 Acceptance:
 
@@ -116,13 +110,3 @@ Acceptance:
 - Auth/trusted-upstream story is explicit.
 - Export/reporting API exists for dashboards and external analysis.
 - Existing local-first behavior remains available.
-
-## Later
-
-- Postgres storage.
-- OpenTelemetry export.
-- Central service auth.
-- Admin/reporting API.
-- Majin cockpit integration.
-- Evaluation labels and outcome comparison.
-- Gateway hooks for existing proxies.
