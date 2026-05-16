@@ -216,6 +216,7 @@ mod tests {
                 eligible: Default::default(),
                 models: Default::default(),
                 guards: Default::default(),
+                allocation: None,
                 rule_match: RuleMatch::default(),
             }],
             policies: Vec::new(),

@@ -1877,6 +1877,7 @@ mod tests {
                 eligible: Default::default(),
                 models: Default::default(),
                 guards: Default::default(),
+                allocation: None,
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
                     ..RuleMatch::default()
@@ -2315,6 +2316,7 @@ mod tests {
             },
             models: BudgetModelPolicy::default(),
             guards: BudgetGuardPolicy::default(),
+            allocation: None,
             rule_match: RuleMatch::default(),
         }
     }

@@ -179,6 +179,8 @@ pub struct BudgetRule {
     pub models: BudgetModelPolicy,
     #[serde(default)]
     pub guards: BudgetGuardPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<BudgetAllocationPolicy>,
     #[serde(default, rename = "match")]
     pub rule_match: RuleMatch,
 }
@@ -215,6 +217,27 @@ pub struct MaxContextTokensGuard {
     pub max_tokens: u64,
     #[serde(default = "default_guard_effect")]
     pub effect: PolicyEffect,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BudgetAllocationPolicy {
+    pub standard: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_amount_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carryover: Option<ProtectedCarryoverPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProtectedCarryoverPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

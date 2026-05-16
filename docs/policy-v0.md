@@ -46,6 +46,14 @@ budgets:
       max_context_tokens:
         max_tokens: 120000
         effect: deny
+    allocation:
+      standard: protected_adoption_pool
+      by: user
+      protected_amount_usd: 25
+      window: monthly
+      carryover:
+        percent: 10
+        cap_usd: 50
     match:
       project: noether
 policies:
@@ -75,6 +83,9 @@ The v0 evaluator is an in-memory fixed-window budget:
   exceed a configured per-budget threshold;
 - if a request does not include `estimated_tokens`, `max_context_tokens` does not fire and the
   request continues under the rest of policy evaluation;
+- `allocation.standard: protected_adoption_pool` parses policy-only adoption-governance inputs:
+  `by` (`user` or `team`), `protected_amount_usd`, `window` (`monthly`), and
+  `carryover.{percent,cap_usd}`;
 - omitted `models.allow` means all provider/model pairs are allowed;
 - when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
   `provider`, and `model`;

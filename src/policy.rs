@@ -119,6 +119,56 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
+        if let Some(allocation) = &budget.allocation
+            && allocation.standard == "protected_adoption_pool"
+        {
+            if !matches!(allocation.by.as_deref(), Some("user" | "team")) {
+                errors.push(format!(
+                    "budget {} allocation.by must be user or team for protected_adoption_pool",
+                    budget.id
+                ));
+            }
+            if allocation
+                .protected_amount_usd
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            {
+                errors.push(format!(
+                    "budget {} allocation.protected_amount_usd must be positive for protected_adoption_pool",
+                    budget.id
+                ));
+            }
+            if !matches!(allocation.window.as_deref(), Some("monthly")) {
+                errors.push(format!(
+                    "budget {} allocation.window must be monthly for protected_adoption_pool",
+                    budget.id
+                ));
+            }
+            let Some(carryover) = allocation.carryover.as_ref() else {
+                errors.push(format!(
+                    "budget {} allocation.carryover is required for protected_adoption_pool",
+                    budget.id
+                ));
+                continue;
+            };
+            if carryover
+                .percent
+                .is_none_or(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+            {
+                errors.push(format!(
+                    "budget {} allocation.carryover.percent must be between 0 and 100 for protected_adoption_pool",
+                    budget.id
+                ));
+            }
+            if carryover
+                .cap_usd
+                .is_none_or(|value| !value.is_finite() || value < 0.0)
+            {
+                errors.push(format!(
+                    "budget {} allocation.carryover.cap_usd must be zero or positive for protected_adoption_pool",
+                    budget.id
+                ));
+            }
+        }
     }
 
     for policy_rule in &policy.policies {
@@ -358,6 +408,74 @@ budgets:
         assert!(message.contains("max_usd must be positive"));
         assert!(message.contains("effect must be warn or deny"));
         assert!(message.contains("max_tokens must be positive"));
+    }
+
+    #[test]
+    fn parses_and_validates_protected_adoption_pool_allocation() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: ai-adoption
+    limit_usd: 2000
+    eligible:
+      entities: [org:example]
+    allocation:
+      standard: protected_adoption_pool
+      by: user
+      protected_amount_usd: 25
+      window: monthly
+      carryover:
+        percent: 10
+        cap_usd: 50
+"#,
+        )
+        .expect("policy parses");
+
+        validate_policy(&policy).expect("policy is valid");
+        let allocation = policy.budgets[0]
+            .allocation
+            .as_ref()
+            .expect("allocation should parse");
+        assert_eq!(allocation.standard, "protected_adoption_pool");
+        assert_eq!(allocation.by.as_deref(), Some("user"));
+        assert_eq!(allocation.protected_amount_usd, Some(25.0));
+        assert_eq!(allocation.window.as_deref(), Some("monthly"));
+        let carryover = allocation
+            .carryover
+            .as_ref()
+            .expect("carryover should parse");
+        assert_eq!(carryover.percent, Some(10.0));
+        assert_eq!(carryover.cap_usd, Some(50.0));
+    }
+
+    #[test]
+    fn rejects_invalid_protected_adoption_pool_allocation() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: ai-adoption
+    limit_usd: 2000
+    allocation:
+      standard: protected_adoption_pool
+      by: org
+      protected_amount_usd: 0
+      window: weekly
+      carryover:
+        percent: 120
+        cap_usd: -1
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("policy should be invalid");
+        let message = error.to_string();
+        assert!(message.contains("allocation.by must be user or team"));
+        assert!(message.contains("allocation.protected_amount_usd must be positive"));
+        assert!(message.contains("allocation.window must be monthly"));
+        assert!(message.contains("allocation.carryover.percent must be between 0 and 100"));
+        assert!(message.contains("allocation.carryover.cap_usd must be zero or positive"));
     }
 
     #[test]
