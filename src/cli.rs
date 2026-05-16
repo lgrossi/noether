@@ -986,6 +986,7 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::ledger::UsageReportRow;
     use chrono::Utc;
 
     use super::*;
@@ -1160,6 +1161,68 @@ mod tests {
         assert_eq!(lines[0], "trace\ttrace-1");
         assert_eq!(lines[1], "occurred_at\tkind\tsummary");
         assert!(lines[2].contains("\tdecision.allow\tdecision_id=dec_1"));
+    }
+
+    #[test]
+    fn dashboard_baseline_acceptance_sections_are_present() {
+        let usage = UsageReport {
+            total_cost_usd: 1.25,
+            rows: vec![UsageReportRow {
+                subject: Some("user:local".to_owned()),
+                project: Some("noether".to_owned()),
+                provider: Some("openai".to_owned()),
+                model: Some("gpt-4.1".to_owned()),
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 150,
+                cache_read_cost_usd: 0.0,
+                cache_write_cost_usd: 0.0,
+                total_cost_usd: 1.25,
+                reservations: 1,
+                active_reservations: 0,
+                finalized_reservations: 1,
+            }],
+            protected_adoption: None,
+        };
+        let decisions = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.allow".to_owned(),
+            summary: "decision_id=dec_1".to_owned(),
+            routing: None,
+            guard_hits: None,
+        }];
+        let trace = TraceReport {
+            trace_id: "trace-1".to_owned(),
+            items: vec![TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "tool.observed".to_owned(),
+                summary: "name=bash success=true".to_owned(),
+                routing: None,
+                guard_hits: None,
+            }],
+        };
+        let observations = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "pi.turn_end".to_owned(),
+            summary: "turn=1".to_owned(),
+            routing: None,
+            guard_hits: None,
+        }];
+
+        let html = render_dashboard(&usage, &decisions, Some(&trace), &observations);
+
+        for marker in [
+            "Spend",
+            "Tokens",
+            "Recent decisions",
+            "Tool usage",
+            "Agent activity",
+            "Run timeline",
+        ] {
+            assert!(html.contains(marker), "missing dashboard marker: {marker}");
+        }
     }
 
     #[test]
