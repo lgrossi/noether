@@ -199,11 +199,20 @@ pub struct BudgetModelPolicy {
 pub struct BudgetGuardPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_estimated_request_cost_usd: Option<MaxEstimatedRequestCostGuard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<MaxContextTokensGuard>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MaxEstimatedRequestCostGuard {
     pub max_usd: f64,
+    #[serde(default = "default_guard_effect")]
+    pub effect: PolicyEffect,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MaxContextTokensGuard {
+    pub max_tokens: u64,
     #[serde(default = "default_guard_effect")]
     pub effect: PolicyEffect,
 }

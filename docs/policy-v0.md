@@ -43,6 +43,9 @@ budgets:
       max_estimated_request_cost_usd:
         max_usd: 0.50
         effect: warn
+      max_context_tokens:
+        max_tokens: 120000
+        effect: deny
     match:
       project: noether
 policies:
@@ -68,6 +71,10 @@ The v0 evaluator is an in-memory fixed-window budget:
   `openai:gpt-4.1` or wildcard suffixes such as `anthropic:claude-sonnet-*`;
 - `guards.max_estimated_request_cost_usd` can warn or deny when one request's estimated cost
   exceeds a configured per-budget threshold;
+- `guards.max_context_tokens` can warn or deny when authorize-time context/input token estimates
+  exceed a configured per-budget threshold;
+- if a request does not include `estimated_tokens`, `max_context_tokens` does not fire and the
+  request continues under the rest of policy evaluation;
 - omitted `models.allow` means all provider/model pairs are allowed;
 - when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
   `provider`, and `model`;

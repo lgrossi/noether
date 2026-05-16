@@ -518,40 +518,8 @@ impl BudgetLedger {
         let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
             return None;
         };
-        if let Some(guard) = &rule.guards.max_estimated_request_cost_usd
-            && estimated_cost > guard.max_usd
-        {
-            let (severity, reason) = match guard.effect {
-                PolicyEffect::Warn => (
-                    DecisionSeverity::Warn,
-                    format!(
-                        "estimated request cost ${estimated_cost:.6} exceeds guard max ${:.6}",
-                        guard.max_usd
-                    ),
-                ),
-                PolicyEffect::Deny => {
-                    *outcome = DecisionOutcome::Deny;
-                    (
-                        DecisionSeverity::Deny,
-                        format!(
-                            "estimated request cost ${estimated_cost:.6} exceeds enforced guard max ${:.6}",
-                            guard.max_usd
-                        ),
-                    )
-                }
-                PolicyEffect::Allow => unreachable!("guard validation forbids allow effects"),
-            };
-            if *outcome != DecisionOutcome::Deny {
-                *outcome = DecisionOutcome::Warn;
-            }
-            explanations.push(DecisionExplanation {
-                rule_id: format!("{}.max_estimated_request_cost_usd", rule.id),
-                reason,
-                severity,
-            });
-            if matches!(guard.effect, PolicyEffect::Deny) {
-                return Some(rule.id.clone());
-            }
+        if apply_budget_guards(rule, request, estimated_cost, outcome, explanations) {
+            return Some(rule.id.clone());
         }
         let projected = self.window_used_usd(rule, now) + estimated_cost;
         if projected >= rule.limit_usd * rule.warn_at_fraction {
@@ -1365,6 +1333,83 @@ fn decision_routing_report(
     })
 }
 
+fn apply_budget_guards(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+    estimated_cost: f64,
+    outcome: &mut DecisionOutcome,
+    explanations: &mut Vec<DecisionExplanation>,
+) -> bool {
+    if let Some(guard) = &rule.guards.max_estimated_request_cost_usd
+        && estimated_cost > guard.max_usd
+        && push_guard_explanation(
+            format!("{}.max_estimated_request_cost_usd", rule.id),
+            format!(
+                "estimated request cost ${estimated_cost:.6} exceeds guard max ${:.6}",
+                guard.max_usd
+            ),
+            format!(
+                "estimated request cost ${estimated_cost:.6} exceeds enforced guard max ${:.6}",
+                guard.max_usd
+            ),
+            guard.effect,
+            outcome,
+            explanations,
+        )
+    {
+        return true;
+    }
+
+    if let Some(guard) = &rule.guards.max_context_tokens
+        && let Some(estimated_tokens) = request.estimated_tokens
+        && estimated_tokens > guard.max_tokens
+        && push_guard_explanation(
+            format!("{}.max_context_tokens", rule.id),
+            format!(
+                "estimated context tokens {estimated_tokens} exceed guard max {}",
+                guard.max_tokens
+            ),
+            format!(
+                "estimated context tokens {estimated_tokens} exceed enforced guard max {}",
+                guard.max_tokens
+            ),
+            guard.effect,
+            outcome,
+            explanations,
+        )
+    {
+        return true;
+    }
+
+    false
+}
+
+fn push_guard_explanation(
+    rule_id: String,
+    warn_reason: String,
+    deny_reason: String,
+    effect: PolicyEffect,
+    outcome: &mut DecisionOutcome,
+    explanations: &mut Vec<DecisionExplanation>,
+) -> bool {
+    let (severity, reason, denied) = match effect {
+        PolicyEffect::Warn => (DecisionSeverity::Warn, warn_reason, false),
+        PolicyEffect::Deny => (DecisionSeverity::Deny, deny_reason, true),
+        PolicyEffect::Allow => unreachable!("guard validation forbids allow effects"),
+    };
+    if denied {
+        *outcome = DecisionOutcome::Deny;
+    } else if *outcome != DecisionOutcome::Deny {
+        *outcome = DecisionOutcome::Warn;
+    }
+    explanations.push(DecisionExplanation {
+        rule_id,
+        reason,
+        severity,
+    });
+    denied
+}
+
 fn matched_entity_and_rank(
     rule: &BudgetRule,
     request: &AuthorizeRequest,
@@ -1813,7 +1858,7 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::contract::{
-        BudgetEligibility, BudgetGuardPolicy, BudgetModelPolicy, BudgetRule,
+        BudgetEligibility, BudgetGuardPolicy, BudgetModelPolicy, BudgetRule, MaxContextTokensGuard,
         MaxEstimatedRequestCostGuard, RuleMatch,
     };
 
@@ -1920,6 +1965,7 @@ mod tests {
                 max_usd: 0.20,
                 effect: PolicyEffect::Warn,
             }),
+            max_context_tokens: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -1943,6 +1989,7 @@ mod tests {
                 max_usd: 0.20,
                 effect: PolicyEffect::Deny,
             }),
+            max_context_tokens: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -1956,6 +2003,81 @@ mod tests {
                     == "estimated request cost $0.250000 exceeds enforced guard max $0.200000"
                 && explanation.severity == DecisionSeverity::Deny
         }));
+    }
+
+    #[test]
+    fn budget_guard_warns_on_large_context_estimate() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: Some(MaxContextTokensGuard {
+                max_tokens: 1_000,
+                effect: PolicyEffect::Warn,
+            }),
+        };
+        let mut request = request(0.25);
+        request.estimated_tokens = Some(1_200);
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(decision.reservation.is_some());
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.max_context_tokens"
+                && explanation.reason == "estimated context tokens 1200 exceed guard max 1000"
+                && explanation.severity == DecisionSeverity::Warn
+        }));
+    }
+
+    #[test]
+    fn budget_guard_denies_large_context_estimate_when_enforced() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: Some(MaxContextTokensGuard {
+                max_tokens: 1_000,
+                effect: PolicyEffect::Deny,
+            }),
+        };
+        let mut request = request(0.25);
+        request.estimated_tokens = Some(1_200);
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.reservation.is_none());
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.max_context_tokens"
+                && explanation.reason
+                    == "estimated context tokens 1200 exceed enforced guard max 1000"
+                && explanation.severity == DecisionSeverity::Deny
+        }));
+    }
+
+    #[test]
+    fn budget_guard_allows_missing_context_estimate() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: Some(MaxContextTokensGuard {
+                max_tokens: 1_000,
+                effect: PolicyEffect::Deny,
+            }),
+        };
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request(0.25));
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(decision.reservation.is_some());
+        assert!(
+            !decision
+                .explanations
+                .iter()
+                .any(|explanation| { explanation.rule_id == "dev-budget.max_context_tokens" })
+        );
     }
 
     #[test]

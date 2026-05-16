@@ -98,9 +98,23 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                     budget.id
                 ));
             }
-            if !matches!(guard.effect, PolicyEffect::Warn | PolicyEffect::Deny) {
+            if !guard_effect_is_supported(guard.effect) {
                 errors.push(format!(
                     "budget {} guards.max_estimated_request_cost_usd.effect must be warn or deny",
+                    budget.id
+                ));
+            }
+        }
+        if let Some(guard) = &budget.guards.max_context_tokens {
+            if guard.max_tokens == 0 {
+                errors.push(format!(
+                    "budget {} guards.max_context_tokens.max_tokens must be positive",
+                    budget.id
+                ));
+            }
+            if !guard_effect_is_supported(guard.effect) {
+                errors.push(format!(
+                    "budget {} guards.max_context_tokens.effect must be warn or deny",
                     budget.id
                 ));
             }
@@ -278,6 +292,10 @@ fn default_specificity() -> Vec<String> {
         .collect()
 }
 
+fn guard_effect_is_supported(effect: PolicyEffect) -> bool {
+    matches!(effect, PolicyEffect::Warn | PolicyEffect::Deny)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +314,9 @@ budgets:
       max_estimated_request_cost_usd:
         max_usd: 0.25
         effect: warn
+      max_context_tokens:
+        max_tokens: 120000
+        effect: deny
     match:
       project: noether
 policies:
@@ -325,6 +346,9 @@ budgets:
       max_estimated_request_cost_usd:
         max_usd: 0
         effect: allow
+      max_context_tokens:
+        max_tokens: 0
+        effect: allow
 "#,
         )
         .expect("policy parses");
@@ -333,6 +357,7 @@ budgets:
         let message = error.to_string();
         assert!(message.contains("max_usd must be positive"));
         assert!(message.contains("effect must be warn or deny"));
+        assert!(message.contains("max_tokens must be positive"));
     }
 
     #[test]
