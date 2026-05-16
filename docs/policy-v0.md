@@ -31,6 +31,10 @@ budgets:
     window_seconds: 86400
     eligible:
       entities: [project:noether]
+    models:
+      allow:
+        - openai:gpt-4.1
+        - anthropic:claude-sonnet-*
     match:
       project: noether
 policies:
@@ -47,6 +51,9 @@ The v0 evaluator is an in-memory fixed-window budget:
 
 - `eligible.entities` can match trusted request entities such as `project:noether`,
   `user:alice`, `team:core`, `org:example`, or `global`;
+- `models.allow` constrains a matching budget to provider/model patterns such as
+  `openai:gpt-4.1` or wildcard suffixes such as `anthropic:claude-sonnet-*`;
+- omitted `models.allow` means all provider/model pairs are allowed;
 - when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
   `provider`, and `model`;
 - `project` and `subject` fields are also treated as legacy entity sources for compatibility;

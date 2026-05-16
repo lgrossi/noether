@@ -13,7 +13,10 @@ use crate::contract::{
     ReservationStatus, ToolEvent, TraceEvent, UsageObservation,
 };
 use crate::error::NoetError;
-use crate::policy::{PolicyFile, budget_rule_matches, matching_policy_explanations};
+use crate::policy::{
+    PolicyFile, budget_model_allowed, budget_rule_matches, budget_scope_matches,
+    matching_policy_explanations,
+};
 
 #[derive(Debug, Default)]
 pub struct BudgetLedger {
@@ -461,6 +464,23 @@ impl BudgetLedger {
             .collect();
 
         if matching_rules.is_empty() {
+            let model_denied_rules: Vec<&BudgetRule> = policy
+                .budgets
+                .iter()
+                .filter(|rule| budget_scope_matches(rule, request))
+                .filter(|rule| !budget_model_allowed(rule, request))
+                .collect();
+            if !model_denied_rules.is_empty() {
+                *outcome = DecisionOutcome::Deny;
+                for rule in model_denied_rules {
+                    explanations.push(DecisionExplanation {
+                        rule_id: rule.id.clone(),
+                        reason: "requested provider/model is not allowed by budget".to_owned(),
+                        severity: DecisionSeverity::Deny,
+                    });
+                }
+                return;
+            }
             explanations.push(DecisionExplanation {
                 rule_id: "no_budget_match".to_owned(),
                 reason: "no matching budget rule; request allowed".to_owned(),
@@ -1261,7 +1281,7 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::{BudgetRule, RuleMatch};
+    use crate::contract::{BudgetModelPolicy, BudgetRule, RuleMatch};
 
     use super::*;
 
@@ -1274,6 +1294,7 @@ mod tests {
                 warn_at_fraction,
                 window_seconds: 60,
                 eligible: Default::default(),
+                models: Default::default(),
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
                     ..RuleMatch::default()
@@ -1330,6 +1351,28 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.reservation.is_none());
+    }
+
+    #[test]
+    fn budget_evaluator_denies_model_disallowed_by_matching_budget() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].models = BudgetModelPolicy {
+            allow: vec!["openai:gpt-4.1-mini".to_owned()],
+        };
+        let mut request = request(0.25);
+        request.provider = Some("openai".to_owned());
+        request.model = Some("gpt-4.1".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.reservation.is_none());
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget"
+                && explanation.reason == "requested provider/model is not allowed by budget"
+                && explanation.severity == DecisionSeverity::Deny
+        }));
     }
 
     #[test]

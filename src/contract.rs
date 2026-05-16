@@ -173,6 +173,8 @@ pub struct BudgetRule {
     pub window_seconds: i64,
     #[serde(default)]
     pub eligible: BudgetEligibility,
+    #[serde(default)]
+    pub models: BudgetModelPolicy,
     #[serde(default, rename = "match")]
     pub rule_match: RuleMatch,
 }
@@ -181,6 +183,12 @@ pub struct BudgetRule {
 pub struct BudgetEligibility {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BudgetModelPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -212,6 +212,7 @@ mod tests {
                 warn_at_fraction: 0.8,
                 window_seconds: 60,
                 eligible: Default::default(),
+                models: Default::default(),
                 rule_match: RuleMatch::default(),
             }],
             policies: Vec::new(),

@@ -58,6 +58,14 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
+        for pattern in &budget.models.allow {
+            if pattern.trim().is_empty() {
+                errors.push(format!(
+                    "budget {} models.allow must not contain empty values",
+                    budget.id
+                ));
+            }
+        }
     }
 
     for policy_rule in &policy.policies {
@@ -106,6 +114,10 @@ pub fn matching_policy_explanations(
 }
 
 pub fn budget_rule_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> bool {
+    budget_scope_matches(rule, request) && budget_model_allowed(rule, request)
+}
+
+pub fn budget_scope_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> bool {
     if !rule.eligible.entities.is_empty() {
         return rule
             .eligible
@@ -117,11 +129,41 @@ pub fn budget_rule_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> boo
     rule_match_matches(&rule.rule_match, request)
 }
 
+pub fn budget_model_allowed(rule: &BudgetRule, request: &AuthorizeRequest) -> bool {
+    if rule.models.allow.is_empty() {
+        return true;
+    }
+
+    let Some(provider) = request.provider.as_deref() else {
+        return false;
+    };
+    let Some(model) = request.model.as_deref() else {
+        return false;
+    };
+    let provider_model = format!("{provider}:{model}");
+
+    rule.models
+        .allow
+        .iter()
+        .any(|pattern| model_pattern_matches(pattern, &provider_model))
+}
+
 pub fn rule_match_matches(rule_match: &RuleMatch, request: &AuthorizeRequest) -> bool {
     matches_optional(&rule_match.subject, &request.subject)
         && matches_optional(&rule_match.project, &request.project)
         && matches_optional(&rule_match.provider, &request.provider)
         && matches_optional(&rule_match.model, &request.model)
+}
+
+fn model_pattern_matches(pattern: &str, provider_model: &str) -> bool {
+    let pattern = pattern.trim();
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        provider_model
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+    } else {
+        provider_model.eq_ignore_ascii_case(pattern)
+    }
 }
 
 fn request_matches_entity(request: &AuthorizeRequest, expected: &str) -> bool {
@@ -310,9 +352,89 @@ budgets:
         assert!(!budget_rule_matches(&policy.budgets[0], &other_request));
     }
 
+    #[test]
+    fn model_allowlist_matches_provider_model_exactly_or_by_wildcard_suffix() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: premium-budget
+    limit_usd: 1.0
+    eligible:
+      entities: [project:noether]
+    models:
+      allow:
+        - openai:gpt-4.1
+        - anthropic:claude-sonnet-*
+"#,
+        )
+        .expect("policy parses");
+        let rule = &policy.budgets[0];
+
+        assert!(budget_rule_matches(
+            rule,
+            &request_with_model("openai", "gpt-4.1")
+        ));
+        assert!(budget_rule_matches(
+            rule,
+            &request_with_model("anthropic", "claude-sonnet-4")
+        ));
+        assert!(!budget_rule_matches(
+            rule,
+            &request_with_model("openai", "gpt-4.1-mini")
+        ));
+    }
+
+    #[test]
+    fn omitted_model_allowlist_allows_all_models() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: unrestricted-budget
+    limit_usd: 1.0
+    eligible:
+      entities: [project:noether]
+"#,
+        )
+        .expect("policy parses");
+
+        assert!(budget_rule_matches(
+            &policy.budgets[0],
+            &request_with_model("openai", "any-model")
+        ));
+    }
+
+    #[test]
+    fn model_allowlist_requires_provider_and_model() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: restricted-budget
+    limit_usd: 1.0
+    eligible:
+      entities: [project:noether]
+    models:
+      allow: [openai:gpt-4.1]
+"#,
+        )
+        .expect("policy parses");
+        let request = request_with_entities(["project:noether"]);
+
+        assert!(!budget_rule_matches(&policy.budgets[0], &request));
+    }
+
     fn request_with_project(project: &str) -> AuthorizeRequest {
         let mut request = request_with_entities([]);
         request.project = Some(project.to_owned());
+        request
+    }
+
+    fn request_with_model(provider: &str, model: &str) -> AuthorizeRequest {
+        let mut request = request_with_entities(["project:noether"]);
+        request.provider = Some(provider.to_owned());
+        request.model = Some(model.to_owned());
         request
     }
 
