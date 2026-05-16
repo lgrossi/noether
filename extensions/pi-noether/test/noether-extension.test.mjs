@@ -737,6 +737,46 @@ async function waitFor(predicate, label) {
 }
 
 {
+	const hookLogDir = await mkdtemp(resolve(tmpdir(), "pi-noether-hooks-default-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_default_no_hook",
+				outcome: "allow",
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				debugHookLogDir: hookLogDir,
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext());
+		await assert.rejects(readFile(resolve(hookLogDir, "before_provider_request.raw.jsonl"), "utf8"));
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(hookLogDir, { recursive: true, force: true });
+	}
+}
+
+{
 	const hookLogDir = await mkdtemp(resolve(tmpdir(), "pi-noether-hooks-disabled-"));
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url) => {
