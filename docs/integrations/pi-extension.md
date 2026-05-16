@@ -59,6 +59,9 @@ agent_end
 Only `before_provider_request` waits for Noether, because it is the authorization point before Pi
 sends the provider request. All lifecycle reporting, reservation finalization, and debug logging is
 queued and delivered best-effort so Noether persistence cannot degrade Pi interaction latency.
+Queued deliveries use bounded retries and bounded timeouts; failures are surfaced as
+`pi.authorize_error`, `pi.reservation_finalize_error`, or `pi.delivery_error` when the extension can
+still reach Noether.
 
 ### `before_agent_start`
 
@@ -387,6 +390,10 @@ Configure the extension with environment variables:
 | `NOET_PI_DEBUG_HOOKS` | unset | Set to `raw` to enable local raw hook dump mode. |
 | `NOET_PI_DEBUG_HOOK_LOG_DIR` | unset | Directory for raw debug hook JSONL files when debug mode is enabled. |
 
+Queued event/finalization delivery currently uses internal bounded retries with short backoff and a
+bounded per-attempt timeout. Those values are intentionally internal for now; the public runtime
+knobs are the hot-path authorize timeout and the queue size.
+
 ## Raw hook dump mode
 
 For live Pi inspection, explicitly enable raw debug hooks before starting Pi:
@@ -436,6 +443,16 @@ Noether unavailability is configurable:
 - default: `fail_open` so local development does not break when the sidecar is down;
 - strict: `fail_closed` so provider sends are aborted if authorization cannot be obtained.
 
+Current regression coverage covers:
+
+- `allow` continues without abort;
+- `deny` aborts before provider send;
+- authorize timeout in `fail_open` and `fail_closed`;
+- immediate sidecar-unavailable failure in `fail_open` and `fail_closed`;
+- bounded retries for queued lifecycle delivery;
+- surfaced queued delivery failures via `pi.delivery_error`;
+- raw hook logs remaining opt-in.
+
 ## Local safe proof
 
 The safe proof script uses only local mock Noether and provider servers plus a mock Pi extension lifecycle. It writes no credentials and cannot reach a real provider:
@@ -447,6 +464,47 @@ npm --prefix extensions/pi-noether run proof:deny
 The script starts a mock Noether endpoint that returns `deny`, registers the Noether extension against a small mock Pi API, emits `before_provider_request`, and only sends to the mock provider if the extension did not abort. It asserts Noether saw one authorization request, the provider saw zero requests, and prompt text was not sent to Noether.
 
 Generated proof files stay under ignored `.noet/`.
+
+## Troubleshooting
+
+### Pi keeps running when Noether is down
+
+That is the default `fail_open` behavior. Set:
+
+```bash
+export NOET_PI_FAIL_MODE=fail_closed
+```
+
+if you want the provider send aborted when Noether cannot be reached.
+
+### Pi stalls before provider send
+
+Check the Noether authorize timeout:
+
+```bash
+export NOET_PI_AUTHORIZE_TIMEOUT_MS=1000
+```
+
+Lower it for stricter hot-path bounds or raise it only if the local sidecar is expected to be
+slow.
+
+### Lifecycle events or finalize calls seem to be missing
+
+They are queued asynchronously after authorization. Check:
+
+- `NOET_PI_QUEUE_MAX_ITEMS` if the run is very event-heavy;
+- Noether-side `pi.authorize_error`, `pi.reservation_finalize_error`, or `pi.delivery_error`
+  observations;
+- local debug hook logs only if you explicitly enabled `NOET_PI_DEBUG_HOOKS=raw`.
+
+### Raw hook logs did not appear
+
+That is expected unless you explicitly opt in:
+
+```bash
+export NOET_PI_DEBUG_HOOKS=raw
+export NOET_PI_DEBUG_HOOK_LOG_DIR="$PWD/.noet/pi-hook-logs"
+```
 
 ## Known limits
 
