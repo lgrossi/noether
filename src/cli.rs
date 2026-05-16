@@ -1226,6 +1226,109 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_renders_real_pi_run_shape_without_raw_logs() {
+        let usage = UsageReport {
+            total_cost_usd: 0.0019,
+            rows: vec![UsageReportRow {
+                subject: Some("user:demo".to_owned()),
+                project: Some("noether".to_owned()),
+                provider: Some("openai-codex".to_owned()),
+                model: Some("gpt-demo".to_owned()),
+                input_tokens: 900,
+                output_tokens: 180,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 1080,
+                cache_read_cost_usd: 0.0,
+                cache_write_cost_usd: 0.0,
+                total_cost_usd: 0.0019,
+                reservations: 1,
+                active_reservations: 0,
+                finalized_reservations: 1,
+            }],
+            protected_adoption: None,
+        };
+        let now = Utc::now();
+        let decisions = vec![TraceReportItem {
+            occurred_at: now,
+            kind: "decision.allow".to_owned(),
+            summary: "decision_id=dec_pi trace=trace-pi model=openai-codex/gpt-demo".to_owned(),
+            routing: None,
+            guard_hits: None,
+        }];
+        let trace = TraceReport {
+            trace_id: "trace-pi".to_owned(),
+            items: vec![
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.agent_context".to_owned(),
+                    summary: "selected_tools=read,bash skills=diagnose context_files=AGENTS.md".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.provider_call.started".to_owned(),
+                    summary: "provider=openai-codex model=gpt-demo shape=input_count=1".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.tool_call".to_owned(),
+                    summary: "tool_name=bash input_summary.command.length=42".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "tool.observed".to_owned(),
+                    summary: "name=bash success=true duration_ms=42".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.message_end".to_owned(),
+                    summary: "provider=openai-codex model=gpt-demo tokens=1080 cost=0.001900".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.turn_end".to_owned(),
+                    summary: "turn=1 usage=(provider=openai-codex model=gpt-demo tokens=1080 cost=0.001900)".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+                TraceReportItem {
+                    occurred_at: now,
+                    kind: "pi.agent_end".to_owned(),
+                    summary: "messages=2".to_owned(),
+                    routing: None,
+                    guard_hits: None,
+                },
+            ],
+        };
+
+        let html = render_dashboard(&usage, &decisions, Some(&trace), &[]);
+
+        for marker in [
+            "Tool usage",
+            "Agent activity",
+            "Skills and context",
+            "pi.provider_call.started",
+            "pi.agent_context",
+            "pi.turn_end",
+            "pi.agent_end",
+            "tool.observed",
+        ] {
+            assert!(html.contains(marker), "missing Pi run marker: {marker}");
+        }
+        assert!(!html.contains(".raw.jsonl"));
+    }
+
+    #[test]
     fn items_report_human_output_has_stable_header_and_rows() {
         let items = vec![TraceReportItem {
             occurred_at: Utc::now(),
