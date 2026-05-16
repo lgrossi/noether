@@ -2,7 +2,7 @@
 
 Date: 2026-05-15
 
-Branch: `lgrossi/pi-real-signal-hardening`
+Branch: feature branch for Pi real-signal hardening
 
 ## Commands
 

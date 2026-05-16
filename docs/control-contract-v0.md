@@ -10,7 +10,7 @@ Request:
 
 ```json
 {
-  "subject": "user:lgrossi",
+  "subject": "user:alice",
   "project": "noether",
   "provider": "openai",
   "model": "gpt-example",

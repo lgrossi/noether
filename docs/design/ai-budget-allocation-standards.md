@@ -47,7 +47,7 @@ Sources:
 ## Decision 1: request metadata is trusted input, not proven truth
 
 The request should expose an optional `budget_id` and a normalized entity list such as
-`user:lucas`, `team:platform`, `org:engineering`, `project:noether`, or `purpose:learning`.
+`user:alice`, `team:core`, `org:example`, `project:demo`, or `purpose:learning`.
 Noether does not validate whether those claims are true. It only evaluates them against configured
 budgets.
 
@@ -218,7 +218,7 @@ budgets:
     window: monthly
     priority: 10
     eligible:
-      entities: [org:engineering]
+      entities: [org:example]
     allocation:
       standard: reserved_plus_shared
       by: team
@@ -230,7 +230,7 @@ budgets:
     window: monthly
     priority: 20
     eligible:
-      entities: [org:engineering]
+      entities: [org:example]
     models:
       allow: [openai:gpt-4.1-mini, anthropic:claude-haiku-*]
     allocation:
