@@ -234,14 +234,8 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
             if command.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("trace\t{}", report.trace_id);
-                for item in report.items {
-                    println!(
-                        "{}\t{}\t{}",
-                        item.occurred_at.to_rfc3339(),
-                        item.kind,
-                        item.summary
-                    );
+                for line in render_trace_report_lines(&report) {
+                    println!("{line}");
                 }
             }
         }
@@ -350,18 +344,31 @@ fn render_usage_report_lines(report: &UsageReport) -> Vec<String> {
     lines
 }
 
+fn render_items_lines(items: &[crate::ledger::TraceReportItem]) -> Vec<String> {
+    let mut lines = vec!["occurred_at\tkind\tsummary".to_owned()];
+    for item in items {
+        lines.push(format!(
+            "{}\t{}\t{}",
+            item.occurred_at.to_rfc3339(),
+            item.kind,
+            item.summary
+        ));
+    }
+    lines
+}
+
+fn render_trace_report_lines(report: &TraceReport) -> Vec<String> {
+    let mut lines = vec![format!("trace\t{}", report.trace_id)];
+    lines.extend(render_items_lines(&report.items));
+    lines
+}
+
 fn print_items(items: Vec<crate::ledger::TraceReportItem>, json: bool) -> Result<(), NoetError> {
     if json {
         println!("{}", serde_json::to_string_pretty(&items)?);
     } else {
-        println!("occurred_at\tkind\tsummary");
-        for item in items {
-            println!(
-                "{}\t{}\t{}",
-                item.occurred_at.to_rfc3339(),
-                item.kind,
-                item.summary
-            );
+        for line in render_items_lines(&items) {
+            println!("{line}");
         }
     }
     Ok(())
@@ -1133,5 +1140,41 @@ mod tests {
 
         assert!(html.contains("Lifecycle guardrails"));
         assert!(html.contains("guard.report_only.tool_calls"));
+    }
+
+    #[test]
+    fn trace_report_human_output_has_stable_header_and_rows() {
+        let report = TraceReport {
+            trace_id: "trace-1".to_owned(),
+            items: vec![TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "decision.allow".to_owned(),
+                summary: "decision_id=dec_1".to_owned(),
+                routing: None,
+                guard_hits: None,
+            }],
+        };
+
+        let lines = render_trace_report_lines(&report);
+
+        assert_eq!(lines[0], "trace\ttrace-1");
+        assert_eq!(lines[1], "occurred_at\tkind\tsummary");
+        assert!(lines[2].contains("\tdecision.allow\tdecision_id=dec_1"));
+    }
+
+    #[test]
+    fn items_report_human_output_has_stable_header_and_rows() {
+        let items = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "tool.observed".to_owned(),
+            summary: "name=bash success=true".to_owned(),
+            routing: None,
+            guard_hits: None,
+        }];
+
+        let lines = render_items_lines(&items);
+
+        assert_eq!(lines[0], "occurred_at\tkind\tsummary");
+        assert!(lines[1].contains("\ttool.observed\tname=bash success=true"));
     }
 }
