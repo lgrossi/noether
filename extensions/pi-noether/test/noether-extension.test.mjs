@@ -41,6 +41,102 @@ async function waitFor(predicate, label) {
 	assert.fail(`timed out waiting for ${label}`);
 }
 
+function deferred() {
+	let resolve;
+	const promise = new Promise((innerResolve) => {
+		resolve = innerResolve;
+	});
+	return { promise, resolve };
+}
+
+{
+	const queue = extension.createDeliveryQueue(2);
+	const release = deferred();
+	let running = 0;
+	let maxRunning = 0;
+	let completed = 0;
+
+	for (let index = 0; index < 4; index += 1) {
+		queue.enqueue(
+			3,
+			async () => {
+				running += 1;
+				maxRunning = Math.max(maxRunning, running);
+				await release.promise;
+				running -= 1;
+				completed += 1;
+			},
+			`item-${index}`,
+		);
+	}
+
+	await sleep(10);
+	assert.equal(maxRunning, 2);
+	release.resolve();
+	await waitFor(() => completed === 4, "bounded queue completion");
+	assert.equal(maxRunning, 2);
+}
+
+{
+	const calls = [];
+	const blockedEvent = deferred();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		const body = init.body && JSON.parse(init.body);
+		calls.push({ url: String(url), body });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_drop",
+				outcome: "allow",
+				reservation: { id: "res_drop" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		if (String(url).endsWith("/v1/events") && body.kind === "pi.delivery_drop") {
+			return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+		}
+		if (String(url).endsWith("/v1/events")) {
+			return blockedEvent.promise;
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				queueMaxItems: 1,
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext());
+		await handlers.get("tool_call")({ toolName: "bash", toolCallId: "tool_drop" }, fakeContext());
+		await handlers.get("tool_result")({ toolName: "bash", toolCallId: "tool_drop", isError: false }, fakeContext());
+
+		await waitFor(
+			() => calls.some((call) => call.body?.kind === "pi.delivery_drop"),
+			"delivery drop event",
+		);
+		const drop = calls.find((call) => call.body?.kind === "pi.delivery_drop");
+		assert(["replaced", "rejected"].includes(drop.body.payload.reason));
+		assert.equal(typeof drop.body.payload.dropped_kind, "string");
+		assert.equal(typeof drop.body.payload.enqueued_kind, "string");
+	} finally {
+		blockedEvent.resolve(new Response("{}", { status: 202, headers: { "content-type": "application/json" } }));
+		globalThis.fetch = originalFetch;
+	}
+}
+
 {
 	const request = extension.buildAuthorizeRequest(
 		{

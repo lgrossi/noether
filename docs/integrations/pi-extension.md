@@ -386,13 +386,13 @@ Configure the extension with environment variables:
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |
 | `NOET_PI_AUTHORIZE_TIMEOUT_MS` | `1000` | Maximum time the hot-path authorization hook waits for Noether. |
-| `NOET_PI_QUEUE_MAX_ITEMS` | `100` | Bounded async delivery queue size for events, finalization, and debug logs. |
+| `NOET_PI_QUEUE_MAX_ITEMS` | `100` | Bound applied to both concurrent async deliveries and queued backlog for events, finalization, and debug logs. |
 | `NOET_PI_DEBUG_HOOKS` | unset | Set to `raw` to enable local raw hook dump mode. |
 | `NOET_PI_DEBUG_HOOK_LOG_DIR` | unset | Directory for raw debug hook JSONL files when debug mode is enabled. |
 
 Queued event/finalization delivery currently uses internal bounded retries with short backoff and a
 bounded per-attempt timeout. Those values are intentionally internal for now; the public runtime
-knobs are the hot-path authorize timeout and the queue size.
+knobs are the hot-path authorize timeout and the delivery queue/concurrency bound.
 
 ## Raw hook dump mode
 
@@ -490,7 +490,9 @@ slow.
 
 ### Lifecycle events or finalize calls seem to be missing
 
-They are queued asynchronously after authorization. Check:
+They are queued asynchronously after authorization. `NOET_PI_QUEUE_MAX_ITEMS` caps both active
+deliveries and queued backlog, so a busy run can still drop best-effort lifecycle work when either
+bound is saturated. Check:
 
 - `NOET_PI_QUEUE_MAX_ITEMS` if the run is very event-heavy;
 - Noether-side `pi.authorize_error`, `pi.reservation_finalize_error`, or `pi.delivery_error`

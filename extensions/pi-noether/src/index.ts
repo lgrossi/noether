@@ -635,40 +635,49 @@ function delay(ms = 0): Promise<void> {
 
 type QueuePriority = 1 | 2 | 3 | 4 | 5 | 6;
 
-type DeliveryQueue = {
-	enqueue(priority: QueuePriority, run: () => Promise<void>): void;
+type DeliveryQueueItem = {
+	kind: string;
+	priority: QueuePriority;
+	run: () => Promise<void>;
 };
 
-function createDeliveryQueue(maxItems: number): DeliveryQueue {
-	const queue: Array<{ priority: QueuePriority; run: () => Promise<void> }> = [];
-	let draining = false;
+type DeliveryQueueDrop = {
+	dropped: { kind: string; priority: QueuePriority };
+	enqueued: { kind: string; priority: QueuePriority };
+	reason: "replaced" | "rejected";
+};
+
+type DeliveryQueue = {
+	enqueue(priority: QueuePriority, run: () => Promise<void>, kind?: string): void;
+};
+
+type DeliveryQueueOptions = {
+	onDrop?: (drop: DeliveryQueueDrop) => void;
+};
+
+export function createDeliveryQueue(maxItems: number, options: DeliveryQueueOptions = {}): DeliveryQueue {
+	const queue: DeliveryQueueItem[] = [];
+	let activeCount = 0;
 
 	function schedule(): void {
-		if (draining) {
-			return;
-		}
-		draining = true;
-		Promise.resolve().then(drain);
-	}
-
-	async function drain(): Promise<void> {
-		try {
-			while (queue.length > 0) {
-				const item = queue.shift()!;
-				item.run().catch(() => {
+		while (activeCount < maxItems && queue.length > 0) {
+			const item = queue.shift()!;
+			activeCount += 1;
+			Promise.resolve()
+				.then(() => item.run())
+				.catch(() => {
 					// Delivery failures must never affect Pi's provider behavior.
+				})
+				.finally(() => {
+					activeCount -= 1;
+					schedule();
 				});
-			}
-		} finally {
-			draining = false;
-			if (queue.length > 0) {
-				schedule();
-			}
 		}
 	}
 
 	return {
-		enqueue(priority, run) {
+		enqueue(priority, run, kind = "delivery") {
+			const nextItem = { kind, priority, run };
 			if (queue.length >= maxItems) {
 				let lowestIndex = -1;
 				let lowestPriority = priority;
@@ -679,11 +688,21 @@ function createDeliveryQueue(maxItems: number): DeliveryQueue {
 					}
 				}
 				if (lowestIndex === -1) {
+					options.onDrop?.({
+						dropped: { kind, priority },
+						enqueued: { kind, priority },
+						reason: "rejected",
+					});
 					return;
 				}
-				queue.splice(lowestIndex, 1);
+				const [dropped] = queue.splice(lowestIndex, 1);
+				options.onDrop?.({
+					dropped: { kind: dropped.kind, priority: dropped.priority },
+					enqueued: { kind, priority },
+					reason: "replaced",
+				});
 			}
-			queue.push({ priority, run });
+			queue.push(nextItem);
 			queue.sort((left, right) => right.priority - left.priority);
 			schedule();
 		},
@@ -822,7 +841,26 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	const providerCallByToolCallId = new Map<string, string>();
 	const recentProviderCalls: ActiveRequest[] = [];
 	const attributionCounts: Record<AttributionStatus, number> = { exact: 0, fallback: 0, unmatched: 0 };
-	const delivery = createDeliveryQueue(config.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS);
+	const delivery = createDeliveryQueue(config.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS, {
+		onDrop(drop) {
+			void postEvent(
+				config.noetherUrl,
+				buildTraceEvent(
+					"pi.delivery_drop",
+					{
+						dropped_kind: drop.dropped.kind,
+						dropped_priority: drop.dropped.priority,
+						enqueued_kind: drop.enqueued.kind,
+						enqueued_priority: drop.enqueued.priority,
+						reason: drop.reason,
+					},
+					latestProviderCall ? { span: latestProviderCall, status: "fallback" } : { status: "unmatched" },
+				),
+			).catch(() => {
+				// Best-effort surfacing only.
+			});
+		},
+	});
 
 	function enqueueEvent(
 		kind: string,
@@ -855,14 +893,14 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 					// Best-effort surfacing only.
 				}
 			}
-		});
+		}, kind);
 	}
 
 	function enqueueHookLog(
 		hook: "before_provider_request" | "message_update" | "message_end" | "turn_end" | "agent_end",
 		payload: Record<string, unknown>,
 	): void {
-		delivery.enqueue(1, () => safeWriteHookLog(config, hook, payload));
+		delivery.enqueue(1, () => safeWriteHookLog(config, hook, payload), `hook.${hook}`);
 	}
 
 	function rememberProviderCall(span: ActiveRequest): void {
@@ -1096,7 +1134,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 			} catch {
 				enqueueEvent("pi.reservation_finalize_error", { usage }, { span: request, status: "exact" }, 3);
 			}
-		});
+		}, "pi.finalize_reservation");
 	});
 
 	pi.on("turn_end", (event, ctx) => {
