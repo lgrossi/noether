@@ -518,6 +518,41 @@ impl BudgetLedger {
         let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
             return None;
         };
+        if let Some(guard) = &rule.guards.max_estimated_request_cost_usd
+            && estimated_cost > guard.max_usd
+        {
+            let (severity, reason) = match guard.effect {
+                PolicyEffect::Warn => (
+                    DecisionSeverity::Warn,
+                    format!(
+                        "estimated request cost ${estimated_cost:.6} exceeds guard max ${:.6}",
+                        guard.max_usd
+                    ),
+                ),
+                PolicyEffect::Deny => {
+                    *outcome = DecisionOutcome::Deny;
+                    (
+                        DecisionSeverity::Deny,
+                        format!(
+                            "estimated request cost ${estimated_cost:.6} exceeds enforced guard max ${:.6}",
+                            guard.max_usd
+                        ),
+                    )
+                }
+                PolicyEffect::Allow => unreachable!("guard validation forbids allow effects"),
+            };
+            if *outcome != DecisionOutcome::Deny {
+                *outcome = DecisionOutcome::Warn;
+            }
+            explanations.push(DecisionExplanation {
+                rule_id: format!("{}.max_estimated_request_cost_usd", rule.id),
+                reason,
+                severity,
+            });
+            if matches!(guard.effect, PolicyEffect::Deny) {
+                return Some(rule.id.clone());
+            }
+        }
         let projected = self.window_used_usd(rule, now) + estimated_cost;
         if projected >= rule.limit_usd * rule.warn_at_fraction {
             *outcome = DecisionOutcome::Warn;
@@ -1777,7 +1812,10 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::{BudgetEligibility, BudgetModelPolicy, BudgetRule, RuleMatch};
+    use crate::contract::{
+        BudgetEligibility, BudgetGuardPolicy, BudgetModelPolicy, BudgetRule,
+        MaxEstimatedRequestCostGuard, RuleMatch,
+    };
 
     use super::*;
 
@@ -1793,6 +1831,7 @@ mod tests {
                 window_seconds: 60,
                 eligible: Default::default(),
                 models: Default::default(),
+                guards: Default::default(),
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
                     ..RuleMatch::default()
@@ -1869,6 +1908,52 @@ mod tests {
         assert!(decision.explanations.iter().any(|explanation| {
             explanation.rule_id == "dev-budget"
                 && explanation.reason == "requested provider/model is not allowed by budget"
+                && explanation.severity == DecisionSeverity::Deny
+        }));
+    }
+
+    #[test]
+    fn budget_guard_warns_on_expensive_single_request() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: Some(MaxEstimatedRequestCostGuard {
+                max_usd: 0.20,
+                effect: PolicyEffect::Warn,
+            }),
+        };
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request(0.25));
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(decision.reservation.is_some());
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.max_estimated_request_cost_usd"
+                && explanation.reason
+                    == "estimated request cost $0.250000 exceeds guard max $0.200000"
+                && explanation.severity == DecisionSeverity::Warn
+        }));
+    }
+
+    #[test]
+    fn budget_guard_denies_expensive_single_request_when_enforced() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: Some(MaxEstimatedRequestCostGuard {
+                max_usd: 0.20,
+                effect: PolicyEffect::Deny,
+            }),
+        };
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request(0.25));
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.reservation.is_none());
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.max_estimated_request_cost_usd"
+                && explanation.reason
+                    == "estimated request cost $0.250000 exceeds enforced guard max $0.200000"
                 && explanation.severity == DecisionSeverity::Deny
         }));
     }
@@ -2015,9 +2100,10 @@ mod tests {
         request.entities = vec!["project:noether".to_owned()];
         request.provider = Some("openai".to_owned());
         request.model = Some("gpt-4.1".to_owned());
-        request
-            .metadata
-            .insert("trace_id".to_owned(), Value::String("trace-report".to_owned()));
+        request.metadata.insert(
+            "trace_id".to_owned(),
+            Value::String("trace-report".to_owned()),
+        );
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
 
         let decision = ledger.authorize(Some(&policy), &request);
@@ -2106,6 +2192,7 @@ mod tests {
                 entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
             },
             models: BudgetModelPolicy::default(),
+            guards: BudgetGuardPolicy::default(),
             rule_match: RuleMatch::default(),
         }
     }

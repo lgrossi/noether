@@ -215,6 +215,7 @@ mod tests {
                 window_seconds: 60,
                 eligible: Default::default(),
                 models: Default::default(),
+                guards: Default::default(),
                 rule_match: RuleMatch::default(),
             }],
             policies: Vec::new(),

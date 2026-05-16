@@ -177,6 +177,8 @@ pub struct BudgetRule {
     pub eligible: BudgetEligibility,
     #[serde(default)]
     pub models: BudgetModelPolicy,
+    #[serde(default)]
+    pub guards: BudgetGuardPolicy,
     #[serde(default, rename = "match")]
     pub rule_match: RuleMatch,
 }
@@ -191,6 +193,19 @@ pub struct BudgetEligibility {
 pub struct BudgetModelPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BudgetGuardPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_request_cost_usd: Option<MaxEstimatedRequestCostGuard>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MaxEstimatedRequestCostGuard {
+    pub max_usd: f64,
+    #[serde(default = "default_guard_effect")]
+    pub effect: PolicyEffect,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,6 +251,10 @@ fn default_warn_at_fraction() -> f64 {
 
 fn default_window_seconds() -> i64 {
     86_400
+}
+
+fn default_guard_effect() -> PolicyEffect {
+    PolicyEffect::Deny
 }
 
 #[cfg(test)]

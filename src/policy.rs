@@ -91,6 +91,20 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
+        if let Some(guard) = &budget.guards.max_estimated_request_cost_usd {
+            if !guard.max_usd.is_finite() || guard.max_usd <= 0.0 {
+                errors.push(format!(
+                    "budget {} guards.max_estimated_request_cost_usd.max_usd must be positive",
+                    budget.id
+                ));
+            }
+            if !matches!(guard.effect, PolicyEffect::Warn | PolicyEffect::Deny) {
+                errors.push(format!(
+                    "budget {} guards.max_estimated_request_cost_usd.effect must be warn or deny",
+                    budget.id
+                ));
+            }
+        }
     }
 
     for policy_rule in &policy.policies {
@@ -278,6 +292,10 @@ budgets:
     limit_usd: 1.0
     warn_at_fraction: 0.5
     window_seconds: 60
+    guards:
+      max_estimated_request_cost_usd:
+        max_usd: 0.25
+        effect: warn
     match:
       project: noether
 policies:
@@ -293,6 +311,28 @@ policies:
         validate_policy(&policy).expect("policy is valid");
         assert_eq!(policy.budgets.len(), 1);
         assert_eq!(policy.policies.len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_guard_policy() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev-daily
+    limit_usd: 1.0
+    guards:
+      max_estimated_request_cost_usd:
+        max_usd: 0
+        effect: allow
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("guard policy should be invalid");
+        let message = error.to_string();
+        assert!(message.contains("max_usd must be positive"));
+        assert!(message.contains("effect must be warn or deny"));
     }
 
     #[test]

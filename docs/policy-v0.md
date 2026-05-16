@@ -39,6 +39,10 @@ budgets:
       allow:
         - openai:gpt-4.1
         - anthropic:claude-sonnet-*
+    guards:
+      max_estimated_request_cost_usd:
+        max_usd: 0.50
+        effect: warn
     match:
       project: noether
 policies:
@@ -62,6 +66,8 @@ The v0 evaluator is an in-memory fixed-window budget:
   `user:alice`, `team:core`, `org:example`, or `global`;
 - `models.allow` constrains a matching budget to provider/model patterns such as
   `openai:gpt-4.1` or wildcard suffixes such as `anthropic:claude-sonnet-*`;
+- `guards.max_estimated_request_cost_usd` can warn or deny when one request's estimated cost
+  exceeds a configured per-budget threshold;
 - omitted `models.allow` means all provider/model pairs are allowed;
 - when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
   `provider`, and `model`;
