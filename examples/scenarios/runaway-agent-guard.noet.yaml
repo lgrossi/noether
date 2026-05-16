@@ -30,6 +30,7 @@ assertions:
     request_id: req-1
     rule_id: runaway-budget.max_estimated_request_cost_usd
   - kind: report_contains
+    report: decisions
     text: guard_hits=runaway-budget.max_estimated_request_cost_usd
   - kind: dashboard_contains
     text: Risky runs

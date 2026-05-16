@@ -41,12 +41,17 @@ requests:
       selected_budget_id: openai-project
       matched_entity: project:noether
 assertions:
+  - kind: decision_outcome
+    request_id: req-1
+    outcome: allow
   - kind: fallback
     request_id: req-1
     requested_budget_id: restricted-claude
     selected_budget_id: openai-project
     matched_entity: project:noether
   - kind: report_contains
+    report: decisions
     text: rejected_reason=requested
   - kind: report_contains
+    report: decisions
     text: model_check=denied

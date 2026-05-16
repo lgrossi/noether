@@ -134,6 +134,9 @@ pub enum ScenarioAssertion {
         equals: Value,
     },
     ReportContains {
+        report: ScenarioReportSource,
+        #[serde(default)]
+        request_id: Option<String>,
         text: String,
     },
     DashboardContains {
@@ -173,6 +176,7 @@ pub fn validate_scenario(file: &ScenarioFile) -> Result<(), NoetError> {
             ));
             let _ = tool;
         }
+        validate_reserved_metadata_keys(request, &mut errors);
     }
     for request in &file.requests {
         validate_assertions(
@@ -234,6 +238,64 @@ fn validate_assertions(
                 }
             }
         }
+        if let ScenarioAssertion::ReportContains {
+            report, request_id, ..
+        } = assertion
+        {
+            validate_report_target(
+                "report_contains",
+                *report,
+                request_id.as_deref(),
+                enclosing_request_id,
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_reserved_metadata_keys(request: &ScenarioRequest, errors: &mut Vec<String>) {
+    for key in ["request_id", "trace_id", "session_id", "source"] {
+        if request.authorize.metadata.contains_key(key) {
+            errors.push(format!(
+                "scenario request {} authorize.metadata must not set reserved key {key}",
+                request.id
+            ));
+        }
+        if request
+            .finalize
+            .as_ref()
+            .is_some_and(|finalize| finalize.metadata.contains_key(key))
+        {
+            errors.push(format!(
+                "scenario request {} finalize.metadata must not set reserved key {key}",
+                request.id
+            ));
+        }
+    }
+}
+
+fn validate_report_target(
+    assertion_kind: &str,
+    report: ScenarioReportSource,
+    request_id: Option<&str>,
+    enclosing_request_id: Option<&str>,
+    errors: &mut Vec<String>,
+) {
+    match report {
+        ScenarioReportSource::Trace => {
+            if request_id.is_none() && enclosing_request_id.is_none() {
+                errors.push(format!(
+                    "scenario trace {assertion_kind} assertion requires request_id"
+                ));
+            }
+        }
+        ScenarioReportSource::Usage | ScenarioReportSource::Decisions => {
+            if request_id.is_some() {
+                errors.push(format!(
+                    "scenario usage/decisions {assertion_kind} assertions must not set request_id"
+                ));
+            }
+        }
     }
 }
 
@@ -245,6 +307,11 @@ fn assertion_request_id(assertion: &ScenarioAssertion) -> Option<&str> {
         | ScenarioAssertion::GuardHit { request_id, .. }
         | ScenarioAssertion::Fallback { request_id, .. } => Some(request_id.as_str()),
         ScenarioAssertion::ReportJson {
+            report: ScenarioReportSource::Trace,
+            request_id,
+            ..
+        }
+        | ScenarioAssertion::ReportContains {
             report: ScenarioReportSource::Trace,
             request_id,
             ..
@@ -305,6 +372,7 @@ requests:
         pointer: /rows/0/model
         equals: gpt-4.1
       - kind: report_contains
+        report: decisions
         text: selected_budget=project-noether
 "#,
         )
@@ -336,6 +404,11 @@ requests:
       project: noether
     tool_activity:
       - name: ""
+  - id: req-2
+    authorize:
+      project: noether
+      metadata:
+        trace_id: shared
 assertions:
   - kind: selected_budget
     request_id: missing
@@ -356,5 +429,6 @@ assertions:
         assert!(message.contains("tool activity with empty name"));
         assert!(message.contains("references unknown request id missing"));
         assert!(message.contains("trace report_json assertion requires request_id"));
+        assert!(message.contains("authorize.metadata must not set reserved key trace_id"));
     }
 }

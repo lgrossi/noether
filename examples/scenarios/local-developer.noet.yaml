@@ -46,6 +46,7 @@ assertions:
     pointer: /rows/0/project
     equals: noether
   - kind: report_contains
+    report: decisions
     text: selected_budget=project-noether
   - kind: dashboard_contains
     text: name=bash success=true

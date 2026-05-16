@@ -59,15 +59,18 @@ This is the export surface for denials, fallbacks, remaining budget, and guard-h
 
 ## Trace and observation shapes
 
-Mirror the current `report trace --json` and `report observations --json` output:
+Mirror the current CLI output shapes exactly:
 
-- chronological `items[]`
-- `kind`
-- `summary`
-- optional routing/guard fields on decision items
+- `report trace --json` returns an object with:
+  - `trace_id`
+  - chronological `items[]`
+  - each item has `kind`, `summary`, and optional routing/guard fields on decision items
+- `report observations --json` returns a bare array of `TraceReportItem` values ordered
+  newest-first
 
 Trace exports are the review surface for one run's decision, usage, tool, lifecycle, and
-observation story.
+observation story. Observation exports remain a filtered event stream rather than a wrapped trace
+document.
 
 ## API design constraints
 

@@ -19,8 +19,8 @@ use crate::scenario::{
     ScenarioAssertion, ScenarioFallbackExpectation, ScenarioFile, ScenarioReportSource,
     ScenarioRequest, validate_scenario,
 };
-use crate::simulation::{SimulationFile, compare_strategies, validate_simulation};
 use crate::server::{ServeConfig, serve};
+use crate::simulation::{SimulationFile, compare_strategies, validate_simulation};
 
 #[derive(Parser)]
 #[command(name = "noet")]
@@ -347,9 +347,9 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         .name
         .clone()
         .unwrap_or_else(|| simulation_output_slug(&command.path));
-    let out_dir = command
-        .out_dir
-        .unwrap_or_else(|| PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path)));
+    let out_dir = command.out_dir.unwrap_or_else(|| {
+        PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path))
+    });
     let report = compare_strategies(&simulation, &out_dir)?;
     let report_path = out_dir.join("simulation-report.json");
     write_json_file(&report_path, &report).await?;
@@ -383,7 +383,10 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         println!("strategy\t{}", strategy.id);
         println!("db_path\t{}", strategy.db_path.display());
         println!("usage_report\t{}", strategy.usage_report_path.display());
-        println!("decisions_report\t{}", strategy.decisions_report_path.display());
+        println!(
+            "decisions_report\t{}",
+            strategy.decisions_report_path.display()
+        );
         println!("dashboard\t{}", strategy_dashboard_path.display());
     }
     Ok(())
@@ -440,12 +443,11 @@ async fn replay_scenario_file(
     let mut trace_reports = BTreeMap::new();
 
     for request in &scenario.requests {
-        let replay_result =
-            replay_scenario_request(&mut ledger, &scenario, request, &session_id)?;
+        let replay_result = replay_scenario_request(&mut ledger, &scenario, request, &session_id)?;
         let trace_report = ledger.trace_report(&replay_result.trace_id)?;
         let trace_report_path = traces_dir.join(format!(
             "{}.json",
-            sanitize_path_component(&replay_result.request_id)
+            encode_path_component(&replay_result.request_id, "trace")
         ));
         write_json_file(&trace_report_path, &trace_report).await?;
         trace_report_paths.push((replay_result.request_id.clone(), trace_report_path));
@@ -516,24 +518,15 @@ fn replay_scenario_request(
     authorize.entities = merged_entities(&scenario.entities, &authorize.entities);
 
     let metadata = &mut authorize.metadata;
-    metadata
-        .entry("request_id".to_owned())
-        .or_insert_with(|| Value::String(request.id.clone()));
-    metadata
-        .entry("trace_id".to_owned())
-        .or_insert_with(|| Value::String(request.id.clone()));
-    metadata
-        .entry("session_id".to_owned())
-        .or_insert_with(|| Value::String(session_id.to_owned()));
-    metadata
-        .entry("source".to_owned())
-        .or_insert_with(|| Value::String("scenario".to_owned()));
+    metadata.insert("request_id".to_owned(), Value::String(request.id.clone()));
+    metadata.insert("trace_id".to_owned(), Value::String(request.id.clone()));
+    metadata.insert(
+        "session_id".to_owned(),
+        Value::String(session_id.to_owned()),
+    );
+    metadata.insert("source".to_owned(), Value::String("scenario".to_owned()));
 
-    let trace_id = metadata
-        .get("trace_id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| request.id.clone());
+    let trace_id = request.id.clone();
     let decision = ledger.try_authorize(Some(&scenario.policy), &authorize)?;
 
     if decision.outcome != crate::contract::DecisionOutcome::Deny {
@@ -613,15 +606,9 @@ fn scenario_finalize_payload(
     }
 
     let mut metadata = finalize.metadata.clone();
-    metadata
-        .entry("request_id".to_owned())
-        .or_insert_with(|| Value::String(request.id.clone()));
-    metadata
-        .entry("trace_id".to_owned())
-        .or_insert_with(|| Value::String(trace_id.to_owned()));
-    metadata
-        .entry("source".to_owned())
-        .or_insert_with(|| Value::String("scenario".to_owned()));
+    metadata.insert("request_id".to_owned(), Value::String(request.id.clone()));
+    metadata.insert("trace_id".to_owned(), Value::String(trace_id.to_owned()));
+    metadata.insert("source".to_owned(), Value::String("scenario".to_owned()));
 
     FinalizeReservation {
         reservation_id: None,
@@ -652,7 +639,7 @@ fn scenario_output_slug(path: &Path) -> String {
         .unwrap_or(file_name)
         .strip_suffix(".noet")
         .unwrap_or(file_name);
-    sanitize_path_component(trimmed)
+    encode_path_component(trimmed, "scenario")
 }
 
 fn simulation_output_slug(path: &Path) -> String {
@@ -666,25 +653,25 @@ fn simulation_output_slug(path: &Path) -> String {
         .unwrap_or(file_name)
         .strip_suffix(".noet")
         .unwrap_or(file_name);
-    sanitize_path_component(trimmed)
+    encode_path_component(trimmed, "simulation")
 }
 
-fn sanitize_path_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
+fn encode_path_component(value: &str, fallback: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                encoded.push(*byte as char);
             }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "scenario".to_owned()
+            _ => {
+                let _ = write!(&mut encoded, "~{byte:02x}");
+            }
+        }
+    }
+    if encoded.is_empty() {
+        fallback.to_owned()
     } else {
-        sanitized.to_owned()
+        encoded
     }
 }
 
@@ -706,17 +693,24 @@ fn evaluate_scenario_assertions(
     trace_reports: &BTreeMap<String, TraceReport>,
     dashboard: &str,
 ) -> Result<(), NoetError> {
-    let decision_reports: BTreeMap<String, &TraceReportItem> = decisions
-        .iter()
-        .filter_map(|item| summary_value(&item.summary, "request").map(|request_id| (request_id, item)))
-        .collect();
+    let decision_reports = scenario_decision_reports(replay_results, trace_reports);
     let replay_by_request: BTreeMap<&str, &ScenarioReplayRequestResult> = replay_results
         .iter()
         .map(|result| (result.request_id.as_str(), result))
         .collect();
     let usage_json = serde_json::to_value(usage)?;
     let decisions_json = serde_json::to_value(decisions)?;
-    let report_text = scenario_report_text(usage, decisions, trace_reports);
+    let usage_text = render_usage_report_lines(usage).join("\n");
+    let decisions_text = render_items_lines(decisions).join("\n");
+    let trace_texts: BTreeMap<String, String> = trace_reports
+        .iter()
+        .map(|(request_id, trace)| {
+            (
+                request_id.clone(),
+                render_trace_report_lines(trace).join("\n"),
+            )
+        })
+        .collect();
     let mut failures = Vec::new();
 
     for assertion in &scenario.assertions {
@@ -727,7 +721,9 @@ fn evaluate_scenario_assertions(
             &usage_json,
             &decisions_json,
             trace_reports,
-            &report_text,
+            &usage_text,
+            &decisions_text,
+            &trace_texts,
             dashboard,
             &mut failures,
         );
@@ -792,7 +788,9 @@ fn evaluate_scenario_assertions(
                 &usage_json,
                 &decisions_json,
                 trace_reports,
-                &report_text,
+                &usage_text,
+                &decisions_text,
+                &trace_texts,
                 dashboard,
                 &mut failures,
             );
@@ -809,21 +807,6 @@ fn evaluate_scenario_assertions(
     }
 }
 
-fn scenario_report_text(
-    usage: &UsageReport,
-    decisions: &[TraceReportItem],
-    trace_reports: &BTreeMap<String, TraceReport>,
-) -> String {
-    let mut sections = vec![
-        render_usage_report_lines(usage).join("\n"),
-        render_items_lines(decisions).join("\n"),
-    ];
-    for trace in trace_reports.values() {
-        sections.push(render_trace_report_lines(trace).join("\n"));
-    }
-    sections.join("\n")
-}
-
 fn evaluate_scenario_assertion(
     assertion: &ScenarioAssertion,
     default_request_id: Option<&str>,
@@ -831,7 +814,9 @@ fn evaluate_scenario_assertion(
     usage_json: &Value,
     decisions_json: &Value,
     trace_reports: &BTreeMap<String, TraceReport>,
-    report_text: &str,
+    usage_text: &str,
+    decisions_text: &str,
+    trace_texts: &BTreeMap<String, String>,
     dashboard: &str,
     failures: &mut Vec<String>,
 ) {
@@ -865,7 +850,8 @@ fn evaluate_scenario_assertion(
             )),
             None => failures.push(format!("missing decision report for request {request_id}")),
         },
-        ScenarioAssertion::Denied { request_id } => match decision_reports.get(request_id.as_str()) {
+        ScenarioAssertion::Denied { request_id } => match decision_reports.get(request_id.as_str())
+        {
             Some(item)
                 if decision_matches_outcome(
                     item.kind.as_str(),
@@ -896,9 +882,7 @@ fn evaluate_scenario_assertion(
                     .guard_hits
                     .as_ref()
                     .is_some_and(|hits| hits.iter().any(|hit| hit.rule_id == *rule_id)) => {}
-            Some(_) => failures.push(format!(
-                "request {request_id} expected guard hit {rule_id}"
-            )),
+            Some(_) => failures.push(format!("request {request_id} expected guard hit {rule_id}")),
             None => failures.push(format!("missing decision report for request {request_id}")),
         },
         ScenarioAssertion::Fallback {
@@ -940,9 +924,21 @@ fn evaluate_scenario_assertion(
                 )),
             }
         }
-        ScenarioAssertion::ReportContains { text } => {
-            if !report_text.contains(text) {
-                failures.push(format!("report output missing {text}"));
+        ScenarioAssertion::ReportContains {
+            report,
+            request_id,
+            text,
+        } => {
+            if !report_text_value(
+                *report,
+                request_id.as_deref().or(default_request_id),
+                usage_text,
+                decisions_text,
+                trace_texts,
+            )
+            .is_some_and(|report_text| report_text.contains(text))
+            {
+                failures.push(format!("report output {:?} missing {text}", report));
             }
         }
         ScenarioAssertion::DashboardContains { text } => {
@@ -951,6 +947,26 @@ fn evaluate_scenario_assertion(
             }
         }
     }
+}
+
+fn scenario_decision_reports<'a>(
+    replay_results: &[ScenarioReplayRequestResult],
+    trace_reports: &'a BTreeMap<String, TraceReport>,
+) -> BTreeMap<String, &'a TraceReportItem> {
+    replay_results
+        .iter()
+        .filter_map(|result| {
+            trace_reports
+                .get(&result.request_id)
+                .and_then(|trace| {
+                    trace
+                        .items
+                        .iter()
+                        .find(|item| item.kind.starts_with("decision."))
+                })
+                .map(|item| (result.request_id.clone(), item))
+        })
+        .collect()
 }
 
 fn report_json_value(
@@ -968,6 +984,22 @@ fn report_json_value(
             .and_then(|request_id| trace_reports.get(request_id))
             .and_then(|trace| serde_json::to_value(trace).ok())
             .and_then(|trace_json| trace_json.pointer(pointer).cloned()),
+    }
+}
+
+fn report_text_value<'a>(
+    report: ScenarioReportSource,
+    request_id: Option<&str>,
+    usage_text: &'a str,
+    decisions_text: &'a str,
+    trace_texts: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    match report {
+        ScenarioReportSource::Usage => Some(usage_text),
+        ScenarioReportSource::Decisions => Some(decisions_text),
+        ScenarioReportSource::Trace => request_id
+            .and_then(|request_id| trace_texts.get(request_id))
+            .map(String::as_str),
     }
 }
 
@@ -999,7 +1031,8 @@ fn evaluate_fallback_assertion(
         Some(item) => {
             let routing = item.routing.as_ref();
             if let Some(expected) = requested_budget_id
-                && routing.and_then(|routing| routing.rejected_budget_id.as_deref()) != Some(expected)
+                && routing.and_then(|routing| routing.rejected_budget_id.as_deref())
+                    != Some(expected)
             {
                 failures.push(format!(
                     "request {request_id} expected fallback from requested budget {expected} but saw {:?}",
@@ -1007,7 +1040,8 @@ fn evaluate_fallback_assertion(
                 ));
             }
             if let Some(expected) = selected_budget_id
-                && routing.and_then(|routing| routing.selected_budget_id.as_deref()) != Some(expected)
+                && routing.and_then(|routing| routing.selected_budget_id.as_deref())
+                    != Some(expected)
             {
                 failures.push(format!(
                     "request {request_id} expected fallback selected budget {expected} but saw {:?}",
@@ -2274,6 +2308,7 @@ assertions:
     pointer: /rows/0/model
     equals: gpt-4.1
   - kind: report_contains
+    report: decisions
     text: selected_budget=project-noether
   - kind: dashboard_contains
     text: name=bash success=true
@@ -2376,7 +2411,8 @@ requests:
         cost_usd: 0.002
 assertions:
   - kind: report_contains
-    text: selected_budget=wrong-budget
+    report: usage
+    text: selected_budget=project-noether
 "#,
         )
         .expect("write scenario");
@@ -2391,7 +2427,11 @@ assertions:
         .expect_err("scenario run should fail");
 
         assert!(error.to_string().contains("scenario assertions failed"));
-        assert!(error.to_string().contains("selected_budget=wrong-budget"));
+        assert!(
+            error
+                .to_string()
+                .contains("selected_budget=project-noether")
+        );
     }
 
     #[tokio::test]
@@ -2481,7 +2521,10 @@ assertions:
             &std::fs::read(out_dir.join("decisions-report.json")).expect("read decisions report"),
         )
         .expect("decisions report json");
-        assert_eq!(decisions_report.as_array().expect("decision array").len(), 2);
+        assert_eq!(
+            decisions_report.as_array().expect("decision array").len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2531,6 +2574,88 @@ assertions:
     }
 
     #[tokio::test]
+    async fn scenario_run_disambiguates_colliding_request_ids() {
+        let tempdir = tempdir().expect("tempdir");
+        let scenario_path = tempdir.path().join("colliding-request-ids.noet.yaml");
+        let out_dir = tempdir.path().join("artifacts");
+        std::fs::write(
+            &scenario_path,
+            r#"
+version: 1
+policy:
+  version: 0
+  budgets:
+    - id: project-noether
+      limit_usd: 10
+      eligible:
+        entities: [project:noether]
+requests:
+  - id: req/1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 0.001
+      entities: [project:noether]
+    finalize:
+      actual_cost_usd: 0.001
+      usage:
+        provider: openai
+        model: gpt-4.1
+        total_tokens: 100
+        cost_usd: 0.001
+    assertions:
+      - kind: decision_outcome
+        request_id: req/1
+        outcome: allow
+      - kind: report_json
+        report: trace
+        pointer: /items/0/kind
+        equals: decision.allow
+  - id: req 1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 0.001
+      entities: [project:noether]
+    finalize:
+      actual_cost_usd: 0.001
+      usage:
+        provider: openai
+        model: gpt-4.1
+        total_tokens: 100
+        cost_usd: 0.001
+    assertions:
+      - kind: decision_outcome
+        request_id: req 1
+        outcome: allow
+      - kind: report_contains
+        report: trace
+        text: request=req 1
+"#,
+        )
+        .expect("write scenario");
+
+        run_scenario(ScenarioCommand {
+            command: ScenarioSubcommand::Run {
+                path: scenario_path,
+                out_dir: Some(out_dir.clone()),
+            },
+        })
+        .await
+        .expect("scenario run succeeds");
+
+        let trace_paths: Vec<_> = std::fs::read_dir(out_dir.join("traces"))
+            .expect("read traces dir")
+            .map(|entry| entry.expect("trace entry").file_name())
+            .collect();
+        assert_eq!(trace_paths.len(), 2);
+        assert!(trace_paths.iter().any(|name| name == "req~2f1.json"));
+        assert!(trace_paths.iter().any(|name| name == "req~201.json"));
+    }
+
+    #[tokio::test]
     async fn simulate_command_compares_checked_in_strategies() {
         let tempdir = tempdir().expect("tempdir");
         let out_dir = tempdir.path().join("simulation-output");
@@ -2546,28 +2671,55 @@ assertions:
         let dashboard_path = out_dir.join("simulation-dashboard.html");
         assert!(report_path.exists());
         assert!(dashboard_path.exists());
-        assert!(out_dir
-            .join("strategies/pooled-caps/noether-dashboard.html")
-            .exists());
-        assert!(out_dir
-            .join("strategies/protected-adoption/noether-dashboard.html")
-            .exists());
+        assert!(
+            out_dir
+                .join("strategies/pooled-caps/noether-dashboard.html")
+                .exists()
+        );
+        assert!(
+            out_dir
+                .join("strategies/protected-adoption/noether-dashboard.html")
+                .exists()
+        );
 
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&report_path).expect("read report"))
                 .expect("report json");
-        assert!(report["total_requests"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(report["total_requests"], 337);
         let strategies = report["strategies"].as_array().expect("strategies");
         assert_eq!(strategies.len(), 2);
-        for strategy in strategies {
-            assert!(strategy.get("unused_budget_usd").is_some());
-            assert!(strategy.get("useful_work_blocked_score").is_some());
-            assert!(strategy.get("runaway_spend_prevented_usd").is_some());
-            assert!(strategy.get("adoption_coverage").is_some());
-            assert!(strategy.get("fairness_score").is_some());
-            assert!(strategy.get("model_mix").is_some());
-            assert!(strategy.get("carryover_liability_usd").is_some());
-            assert!(strategy.get("exhaustion_day").is_some());
+        let pooled = strategies
+            .iter()
+            .find(|strategy| strategy["id"] == "pooled-caps")
+            .expect("pooled strategy");
+        let adoption = strategies
+            .iter()
+            .find(|strategy| strategy["id"] == "protected-adoption")
+            .expect("protected adoption strategy");
+        for strategy in [pooled, adoption] {
+            assert_eq!(strategy["total_requests"], 337);
+            assert_eq!(strategy["allowed_requests"], 337);
+            assert_eq!(strategy["warned_requests"], 0);
+            assert_eq!(strategy["denied_requests"], 0);
+            assert_eq!(strategy["fallback_count"], 337);
+            assert_eq!(strategy["guard_hit_count"], 0);
+            assert_eq!(strategy["useful_work_blocked_score"], 0);
+            assert_eq!(strategy["runaway_spend_prevented_usd"], 0.0);
+            assert_eq!(strategy["adoption_coverage"], 1.0);
+            assert_eq!(strategy["fairness_score"], 0.0);
+            assert_eq!(strategy["carryover_liability_usd"], 0.0);
+            assert!(strategy["exhaustion_day"].is_null());
+            assert_eq!(strategy["total_cost_usd"], 33.552336);
+            assert_eq!(strategy["unused_budget_usd"], 566.447664);
+
+            let model_mix = strategy["model_mix"].as_array().expect("model mix");
+            assert_eq!(model_mix.len(), 2);
+            assert_eq!(model_mix[0]["model_id"], "flagship");
+            assert_eq!(model_mix[0]["requests"], 242);
+            assert_eq!(model_mix[0]["total_cost_usd"], 32.44564000000001_f64);
+            assert_eq!(model_mix[1]["model_id"], "fast");
+            assert_eq!(model_mix[1]["requests"], 95);
+            assert_eq!(model_mix[1]["total_cost_usd"], 1.106696);
         }
     }
 }

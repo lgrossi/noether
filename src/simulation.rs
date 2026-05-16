@@ -146,7 +146,10 @@ pub struct SimulationModelMixEntry {
 pub fn validate_simulation(file: &SimulationFile) -> Result<(), NoetError> {
     let mut errors = Vec::new();
     if file.version != 1 {
-        errors.push(format!("simulation version must be 1, got {}", file.version));
+        errors.push(format!(
+            "simulation version must be 1, got {}",
+            file.version
+        ));
     }
     if file.company.id.trim().is_empty() {
         errors.push("simulation company id must not be empty".to_owned());
@@ -176,7 +179,10 @@ pub fn validate_simulation(file: &SimulationFile) -> Result<(), NoetError> {
         &mut errors,
     );
     let project_ids = collect_ids(
-        file.company.projects.iter().map(|project| project.id.as_str()),
+        file.company
+            .projects
+            .iter()
+            .map(|project| project.id.as_str()),
         "project",
         &mut errors,
     );
@@ -328,7 +334,7 @@ pub fn compare_strategies(
     let mut strategies = Vec::new();
 
     for strategy in &file.strategies {
-        let strategy_slug = sanitize_simulation_path_component(&strategy.id);
+        let strategy_slug = encode_path_component(&strategy.id, "simulation");
         let strategy_dir = strategies_dir.join(&strategy_slug);
         std::fs::create_dir_all(&strategy_dir)?;
         let db_path = strategy_dir.join("simulation.sqlite");
@@ -439,7 +445,8 @@ pub fn compare_strategies(
                     ]),
                 };
                 let _ = ledger.finalize(&reservation.id, &finalize)?;
-                *user_spend.entry(request.subject.clone()).or_insert(0.0) += request.estimated_cost_usd;
+                *user_spend.entry(request.subject.clone()).or_insert(0.0) +=
+                    request.estimated_cost_usd;
                 let entry = model_mix
                     .entry(request.model_id.clone())
                     .or_insert((0_u64, 0.0_f64));
@@ -467,19 +474,21 @@ pub fn compare_strategies(
         report.fairness_score = fairness_score(&file.company.users, &user_spend);
         report.model_mix = model_mix
             .into_iter()
-            .map(|(model_id, (requests, total_cost_usd))| SimulationModelMixEntry {
-                model_id,
-                requests,
-                total_cost_usd,
-            })
+            .map(
+                |(model_id, (requests, total_cost_usd))| SimulationModelMixEntry {
+                    model_id,
+                    requests,
+                    total_cost_usd,
+                },
+            )
             .collect();
-        report
-            .model_mix
-            .sort_by(|left, right| right
+        report.model_mix.sort_by(|left, right| {
+            right
                 .total_cost_usd
                 .partial_cmp(&left.total_cost_usd)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.model_id.cmp(&right.model_id)));
+                .then_with(|| left.model_id.cmp(&right.model_id))
+        });
         report.carryover_liability_usd = usage
             .protected_adoption
             .as_ref()
@@ -555,11 +564,7 @@ fn choose_model<'a>(
     }
 }
 
-fn profile_request_count(
-    profile: UsageProfile,
-    rng: &mut DeterministicRng,
-    day_index: u32,
-) -> u32 {
+fn profile_request_count(profile: UsageProfile, rng: &mut DeterministicRng, day_index: u32) -> u32 {
     match profile {
         UsageProfile::PowerUser => 3 + rng.next_bounded(3) as u32,
         UsageProfile::SteadyUser => 1 + rng.next_bounded(2) as u32,
@@ -696,22 +701,23 @@ fn is_guard_rule_id(rule_id: &str) -> bool {
         || rule_id.contains(".spend_window.")
 }
 
-fn sanitize_simulation_path_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
+fn encode_path_component(value: &str, fallback: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                encoded.push(*byte as char);
             }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "simulation".to_owned()
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut encoded, "~{byte:02x}");
+            }
+        }
+    }
+    if encoded.is_empty() {
+        fallback.to_owned()
     } else {
-        sanitized.to_owned()
+        encoded
     }
 }
 
@@ -721,7 +727,12 @@ fn fairness_score(users: &[SyntheticUser], user_spend: &BTreeMap<String, f64>) -
     }
     let values: Vec<f64> = users
         .iter()
-        .map(|user| user_spend.get(&format!("user:{}", user.id)).copied().unwrap_or(0.0))
+        .map(|user| {
+            user_spend
+                .get(&format!("user:{}", user.id))
+                .copied()
+                .unwrap_or(0.0)
+        })
         .collect();
     let total: f64 = values.iter().sum();
     if total == 0.0 {
@@ -838,9 +849,10 @@ strategies:
 
     #[test]
     fn checked_in_simulation_example_validates() {
-        let simulation: SimulationFile =
-            serde_yaml::from_str(include_str!("../examples/simulations/synthetic-company.noet.yaml"))
-                .expect("example simulation parses");
+        let simulation: SimulationFile = serde_yaml::from_str(include_str!(
+            "../examples/simulations/synthetic-company.noet.yaml"
+        ))
+        .expect("example simulation parses");
 
         validate_simulation(&simulation).expect("example simulation is valid");
         assert_eq!(simulation.strategies.len(), 2);
@@ -848,9 +860,10 @@ strategies:
 
     #[test]
     fn synthetic_demand_is_deterministic_for_a_seed() {
-        let simulation: SimulationFile =
-            serde_yaml::from_str(include_str!("../examples/simulations/synthetic-company.noet.yaml"))
-                .expect("example simulation parses");
+        let simulation: SimulationFile = serde_yaml::from_str(include_str!(
+            "../examples/simulations/synthetic-company.noet.yaml"
+        ))
+        .expect("example simulation parses");
 
         let first = generate_synthetic_demand(&simulation).expect("first demand");
         let second = generate_synthetic_demand(&simulation).expect("second demand");
@@ -864,14 +877,24 @@ strategies:
 
     #[test]
     fn synthetic_demand_reflects_profile_shapes() {
-        let simulation: SimulationFile =
-            serde_yaml::from_str(include_str!("../examples/simulations/synthetic-company.noet.yaml"))
-                .expect("example simulation parses");
+        let simulation: SimulationFile = serde_yaml::from_str(include_str!(
+            "../examples/simulations/synthetic-company.noet.yaml"
+        ))
+        .expect("example simulation parses");
         let demand = generate_synthetic_demand(&simulation).expect("demand");
 
-        let power_count = demand.iter().filter(|request| request.subject == "user:alice").count();
-        let steady_count = demand.iter().filter(|request| request.subject == "user:ben").count();
-        let low_count = demand.iter().filter(|request| request.subject == "user:chloe").count();
+        let power_count = demand
+            .iter()
+            .filter(|request| request.subject == "user:alice")
+            .count();
+        let steady_count = demand
+            .iter()
+            .filter(|request| request.subject == "user:ben")
+            .count();
+        let low_count = demand
+            .iter()
+            .filter(|request| request.subject == "user:chloe")
+            .count();
         assert!(power_count > steady_count);
         assert!(steady_count > low_count);
 
@@ -891,6 +914,65 @@ strategies:
             loop_risk_requests
                 .iter()
                 .any(|request| request.tool_call_count >= 6 || request.estimated_tokens >= 40_000)
+        );
+    }
+
+    #[test]
+    fn compare_strategies_disambiguates_colliding_strategy_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let simulation: SimulationFile = serde_yaml::from_str(
+            r#"
+version: 1
+seed: 7
+horizon_days: 1
+company:
+  id: example
+  teams:
+    - id: platform
+  projects:
+    - id: noether
+      team_id: platform
+  users:
+    - id: alice
+      team_id: platform
+      project_ids: [noether]
+      profile: steady_user
+models:
+  - id: flagship
+    provider: openai
+    model: gpt-4.1
+    cost_per_1k_tokens_usd: 0.01
+strategies:
+  - id: team/a
+    policy:
+      version: 0
+      budgets:
+        - id: team-platform
+          limit_usd: 10
+          eligible:
+            entities: [team:platform]
+  - id: team a
+    policy:
+      version: 0
+      budgets:
+        - id: team-platform
+          limit_usd: 10
+          eligible:
+            entities: [team:platform]
+"#,
+        )
+        .expect("simulation parses");
+
+        let report = compare_strategies(&simulation, tempdir.path()).expect("compare strategies");
+        assert_eq!(report.strategies.len(), 2);
+        assert_ne!(report.strategies[0].db_path, report.strategies[1].db_path);
+        assert_ne!(
+            report.strategies[0].usage_report_path,
+            report.strategies[1].usage_report_path
+        );
+        assert_ne!(
+            report.strategies[0].decisions_report_path,
+            report.strategies[1].decisions_report_path
         );
     }
 }

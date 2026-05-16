@@ -47,13 +47,22 @@ requests:
         total_tokens: 96000
         cost_usd: 24.0
 assertions:
+  - kind: decision_outcome
+    request_id: req-alice
+    outcome: allow
+  - kind: decision_outcome
+    request_id: req-bob
+    outcome: allow
   - kind: total_cost_usd
     amount_usd: 25.0
   - kind: report_contains
+    report: usage
     text: unused_protected_opportunity_usd
   - kind: report_contains
+    report: usage
     text: user:alice
   - kind: report_contains
+    report: usage
     text: user:bob
   - kind: dashboard_contains
     text: Adoption health

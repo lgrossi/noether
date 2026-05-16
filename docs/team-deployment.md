@@ -20,8 +20,10 @@ noet serve \
 Recommended shared-server shape:
 
 - terminate TLS and service authentication in front of Noether;
-- expose `/v1/authorize`, `/v1/reservations/{id}/finalize`, `/v1/events`, and report/export
-  endpoints only to trusted callers;
+- expose `/v1/authorize`, `/v1/reservations/{id}/finalize`, and `/v1/events` only to trusted
+  callers;
+- treat report/export access as CLI/SQLite-only today; do not route `/v1/reports/*` to `noet serve`
+  until dedicated HTTP endpoints exist;
 - keep `--decision-mode enforce` explicit for shared deployments;
 - store the policy file outside the application checkout and deploy it like other config;
 - treat fixture capture as a controlled debug path, not a default central retention path.
