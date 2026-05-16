@@ -205,6 +205,12 @@ pub struct BudgetGuardPolicy {
     pub max_context_tokens: Option<MaxContextTokensGuard>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spend_windows: Vec<SpendWindowGuard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

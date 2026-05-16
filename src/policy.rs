@@ -139,6 +139,24 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
+        if budget.guards.max_tool_calls == Some(0) {
+            errors.push(format!(
+                "budget {} guards.max_tool_calls must be positive",
+                budget.id
+            ));
+        }
+        if budget.guards.max_agent_steps == Some(0) {
+            errors.push(format!(
+                "budget {} guards.max_agent_steps must be positive",
+                budget.id
+            ));
+        }
+        if budget.guards.max_retries == Some(0) {
+            errors.push(format!(
+                "budget {} guards.max_retries must be positive",
+                budget.id
+            ));
+        }
         if let Some(allocation) = &budget.allocation
             && allocation.standard == "protected_adoption_pool"
         {
@@ -472,6 +490,29 @@ budgets:
         assert!(message.contains("guards.spend_windows.window must use <number><s|m|h|d>"));
         assert!(message.contains("guards.spend_windows.max_usd must be positive"));
         assert!(message.contains("guards.spend_windows.effect must be warn or deny"));
+    }
+
+    #[test]
+    fn rejects_invalid_lifecycle_guard_policy() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev-daily
+    limit_usd: 1.0
+    guards:
+      max_tool_calls: 0
+      max_agent_steps: 0
+      max_retries: 0
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("lifecycle guard policy should be invalid");
+        let message = error.to_string();
+        assert!(message.contains("guards.max_tool_calls must be positive"));
+        assert!(message.contains("guards.max_agent_steps must be positive"));
+        assert!(message.contains("guards.max_retries must be positive"));
     }
 
     #[test]

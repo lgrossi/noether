@@ -76,6 +76,9 @@ struct RoutingPersistenceFields {
     rejected_budget_reason: Option<String>,
     model_check: Option<String>,
     remaining_budget_usd: Option<f64>,
+    max_tool_calls: Option<u64>,
+    max_agent_steps: Option<u64>,
+    max_retries: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +505,10 @@ impl BudgetLedger {
             items.push(row?);
         }
 
+        if let Some(guard_items) = self.lifecycle_guard_report_items(trace_id)? {
+            items.extend(guard_items);
+        }
+
         items.sort_by_key(|item| item.occurred_at);
         Ok(TraceReport {
             trace_id: trace_id.to_owned(),
@@ -864,10 +871,11 @@ impl BudgetLedger {
                 decision_id, trace_id, session_id, request_id, subject, project, provider, model,
                 estimated_tokens, estimated_cost_usd, outcome, explanations_json, metadata_json,
                 selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
-                rejected_budget_reason, model_check, remaining_budget_usd, created_at
+                rejected_budget_reason, model_check, remaining_budget_usd, max_tool_calls,
+                max_agent_steps, max_retries, created_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21
+                ?19, ?20, ?21, ?22, ?23, ?24
             )
             ",
             params![
@@ -891,6 +899,9 @@ impl BudgetLedger {
                 routing.rejected_budget_reason.as_deref(),
                 routing.model_check.as_deref(),
                 routing.remaining_budget_usd,
+                routing.max_tool_calls.map(|value| value as i64),
+                routing.max_agent_steps.map(|value| value as i64),
+                routing.max_retries.map(|value| value as i64),
                 decision.created_at.to_rfc3339(),
             ],
         )?;
@@ -959,6 +970,9 @@ impl BudgetLedger {
                 fields.remaining_budget_usd = Some(
                     (rule.limit_usd - self.window_used_usd(rule, decision.created_at)).max(0.0),
                 );
+                fields.max_tool_calls = rule.guards.max_tool_calls;
+                fields.max_agent_steps = rule.guards.max_agent_steps;
+                fields.max_retries = rule.guards.max_retries;
             }
             fields.selection_reason = decision
                 .explanations
@@ -980,6 +994,104 @@ impl BudgetLedger {
 
         fields.model_check = routing_model_check(decision, selected_budget_id.as_deref());
         fields
+    }
+
+    fn lifecycle_guard_report_items(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<Vec<TraceReportItem>>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(None);
+        };
+        let config = conn
+            .query_row(
+                "
+                SELECT created_at, max_tool_calls, max_agent_steps, max_retries
+                FROM decisions
+                WHERE trace_id = ?1
+                ORDER BY created_at DESC
+                LIMIT 1
+                ",
+                [trace_id],
+                |row| {
+                    Ok((
+                        parse_time(row.get::<_, String>(0)?),
+                        row.get::<_, Option<i64>>(1)?
+                            .map(|value| value.max(0) as u64),
+                        row.get::<_, Option<i64>>(2)?
+                            .map(|value| value.max(0) as u64),
+                        row.get::<_, Option<i64>>(3)?
+                            .map(|value| value.max(0) as u64),
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((occurred_at, max_tool_calls, max_agent_steps, max_retries)) = config else {
+            return Ok(None);
+        };
+
+        let tool_calls = self.event_count_for_trace(trace_id, "pi.tool_call")?;
+        let agent_steps = self.event_count_for_trace(trace_id, "pi.turn_end")?;
+        let provider_calls = self.event_count_for_trace(trace_id, "pi.provider_call.started")?;
+        let retries = provider_calls.saturating_sub(agent_steps);
+
+        let mut items = Vec::new();
+        if let Some(limit) = max_tool_calls
+            && tool_calls > limit
+        {
+            items.push(TraceReportItem {
+                occurred_at,
+                kind: "guard.report_only.tool_calls".to_owned(),
+                summary: format!(
+                    "tool_calls={tool_calls} max_tool_calls={limit} reporting_only=true source=pi.tool_call"
+                ),
+                routing: None,
+                guard_hits: None,
+            });
+        }
+        if let Some(limit) = max_agent_steps
+            && agent_steps > limit
+        {
+            items.push(TraceReportItem {
+                occurred_at,
+                kind: "guard.report_only.agent_steps".to_owned(),
+                summary: format!(
+                    "agent_steps={agent_steps} max_agent_steps={limit} reporting_only=true source=pi.turn_end"
+                ),
+                routing: None,
+                guard_hits: None,
+            });
+        }
+        if let Some(limit) = max_retries
+            && retries > limit
+        {
+            items.push(TraceReportItem {
+                occurred_at,
+                kind: "guard.report_only.retries".to_owned(),
+                summary: format!(
+                    "retries={retries} provider_calls={provider_calls} turns={agent_steps} max_retries={limit} reporting_only=true source=pi.provider_call.started,pi.turn_end"
+                ),
+                routing: None,
+                guard_hits: None,
+            });
+        }
+        Ok((!items.is_empty()).then_some(items))
+    }
+
+    fn event_count_for_trace(&self, trace_id: &str, kind: &str) -> Result<u64, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(0);
+        };
+        conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM events
+            WHERE trace_id = ?1 AND kind = ?2
+            ",
+            params![trace_id, kind],
+            |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+        )
+        .map_err(NoetError::from)
     }
 
     fn persist_finalization(
@@ -1362,6 +1474,19 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "remaining_budget_usd",
         "remaining_budget_usd REAL",
     )?;
+    ensure_column(
+        conn,
+        "decisions",
+        "max_tool_calls",
+        "max_tool_calls INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "decisions",
+        "max_agent_steps",
+        "max_agent_steps INTEGER",
+    )?;
+    ensure_column(conn, "decisions", "max_retries", "max_retries INTEGER")?;
     ensure_column(
         conn,
         "reservations",
@@ -2468,6 +2593,9 @@ mod tests {
             }),
             max_context_tokens: None,
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2493,6 +2621,9 @@ mod tests {
             }),
             max_context_tokens: None,
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2518,6 +2649,9 @@ mod tests {
                 effect: PolicyEffect::Warn,
             }),
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2544,6 +2678,9 @@ mod tests {
                 effect: PolicyEffect::Deny,
             }),
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2571,6 +2708,9 @@ mod tests {
                 effect: PolicyEffect::Deny,
             }),
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2597,6 +2737,9 @@ mod tests {
                 max_usd: 10.0,
                 effect: PolicyEffect::Warn,
             }],
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2624,6 +2767,9 @@ mod tests {
                 max_usd: 10.0,
                 effect: PolicyEffect::Deny,
             }],
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2837,6 +2983,9 @@ mod tests {
                 effect: PolicyEffect::Deny,
             }),
             spend_windows: Vec::new(),
+            max_tool_calls: None,
+            max_agent_steps: None,
+            max_retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2872,6 +3021,72 @@ mod tests {
             .as_ref()
             .expect("trace guard hits");
         assert_eq!(trace_guard_hits[0].rule_id, "dev-budget.max_context_tokens");
+    }
+
+    #[test]
+    fn trace_report_includes_report_only_lifecycle_guard_detections() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("lifecycle-guards.sqlite");
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: None,
+            spend_windows: Vec::new(),
+            max_tool_calls: Some(1),
+            max_agent_steps: Some(1),
+            max_retries: Some(1),
+        };
+        let mut request = request(1.0);
+        request.metadata.insert(
+            "trace_id".to_owned(),
+            Value::String("trace-lifecycle".to_owned()),
+        );
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        for kind in [
+            "pi.provider_call.started",
+            "pi.provider_call.started",
+            "pi.provider_call.started",
+            "pi.provider_call.started",
+            "pi.tool_call",
+            "pi.tool_call",
+            "pi.turn_end",
+            "pi.turn_end",
+        ] {
+            ledger
+                .record_event(TraceEvent {
+                    id: None,
+                    trace_id: Some("trace-lifecycle".to_owned()),
+                    occurred_at: None,
+                    kind: kind.to_owned(),
+                    payload: Value::Object(Default::default()),
+                })
+                .expect("record event");
+        }
+
+        let trace = ledger
+            .trace_report("trace-lifecycle")
+            .expect("trace report");
+        assert!(
+            trace
+                .items
+                .iter()
+                .any(|item| item.kind == "guard.report_only.tool_calls")
+        );
+        assert!(
+            trace
+                .items
+                .iter()
+                .any(|item| item.kind == "guard.report_only.agent_steps")
+        );
+        assert!(
+            trace
+                .items
+                .iter()
+                .any(|item| item.kind == "guard.report_only.retries")
+        );
     }
 
     #[test]

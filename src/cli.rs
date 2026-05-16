@@ -510,6 +510,7 @@ fn render_dashboard(
     skill_context_panel(&mut html, &activity);
     decisions_panel(&mut html, decisions);
     risky_runs_panel(&mut html, decisions);
+    lifecycle_guardrails_panel(&mut html, trace);
     timeline_panel(&mut html, trace, observations);
 
     html.push_str("</main></body></html>");
@@ -812,6 +813,38 @@ fn risky_runs_panel(html: &mut String, decisions: &[TraceReportItem]) {
     html.push_str("</tbody></table></section>");
 }
 
+fn lifecycle_guardrails_panel(html: &mut String, trace: Option<&TraceReport>) {
+    html.push_str("<section class=\"panel\"><h2>Lifecycle guardrails</h2>");
+    let items: Vec<&TraceReportItem> = trace
+        .map(|trace| {
+            trace
+                .items
+                .iter()
+                .filter(|item| item.kind.starts_with("guard.report_only."))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No lifecycle-backed report-only guard detections were recorded.</div></section>",
+        );
+        return;
+    }
+    html.push_str(
+        "<table><thead><tr><th>When</th><th>Lifecycle guard</th><th>Detection</th></tr></thead><tbody>",
+    );
+    for item in items {
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            event_pill(&item.kind),
+            escape_html(&item.summary)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
 fn timeline_panel(
     html: &mut String,
     trace: Option<&TraceReport>,
@@ -1075,5 +1108,30 @@ mod tests {
 
         assert!(html.contains("Risky runs"));
         assert!(html.contains("dev-budget.max_context_tokens"));
+    }
+
+    #[test]
+    fn dashboard_renders_lifecycle_guardrail_section() {
+        let usage = UsageReport {
+            total_cost_usd: 0.0,
+            rows: Vec::new(),
+            protected_adoption: None,
+        };
+        let trace = TraceReport {
+            trace_id: "trace-lifecycle".to_owned(),
+            items: vec![TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "guard.report_only.tool_calls".to_owned(),
+                summary: "tool_calls=12 max_tool_calls=10 reporting_only=true source=pi.tool_call"
+                    .to_owned(),
+                routing: None,
+                guard_hits: None,
+            }],
+        };
+
+        let html = render_dashboard(&usage, &[], Some(&trace), &[]);
+
+        assert!(html.contains("Lifecycle guardrails"));
+        assert!(html.contains("guard.report_only.tool_calls"));
     }
 }
