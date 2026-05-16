@@ -47,6 +47,7 @@ struct StoredReservation {
     estimated_cost_usd: f64,
     budget_rule_ids: Vec<String>,
     allocation_spends: Vec<AllocationReservationSpend>,
+    matched_entity: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -562,7 +563,16 @@ impl BudgetLedger {
         let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
             return None;
         };
-        if apply_budget_guards(rule, request, estimated_cost, outcome, explanations) {
+        if apply_budget_guards(
+            self,
+            rule,
+            request,
+            candidate.matched_entity.as_deref(),
+            estimated_cost,
+            now,
+            outcome,
+            explanations,
+        ) {
             return Some(rule.id.clone());
         }
         let projected = self.window_used_usd(rule, now) + estimated_cost;
@@ -748,6 +758,20 @@ impl BudgetLedger {
             .unwrap_or_default();
         let budget_rule_ids: Vec<String> =
             matching_rules.iter().map(|rule| rule.id.clone()).collect();
+        let matched_entity = selected_budget_id.and_then(|selected_budget_id| {
+            policy
+                .and_then(|policy| {
+                    policy
+                        .budgets
+                        .iter()
+                        .find(|rule| rule.id == selected_budget_id)
+                })
+                .and_then(|rule| {
+                    policy.map(|policy| {
+                        matched_entity_and_rank(rule, request, &specificity_order(policy)).0
+                    })?
+                })
+        });
         let mut allocation_spends = Vec::new();
         let expires_at = matching_rules
             .iter()
@@ -777,6 +801,7 @@ impl BudgetLedger {
                 estimated_cost_usd: amount_usd,
                 budget_rule_ids,
                 allocation_spends,
+                matched_entity,
             },
         );
         reservation
@@ -1176,6 +1201,7 @@ impl BudgetLedger {
                         estimated_cost_usd: row.get(2)?,
                         budget_rule_ids,
                         allocation_spends,
+                        matched_entity: None,
                     },
                 ))
             })?
@@ -1552,9 +1578,12 @@ fn decision_routing_report(
 }
 
 fn apply_budget_guards(
+    ledger: &BudgetLedger,
     rule: &BudgetRule,
     request: &AuthorizeRequest,
+    matched_entity: Option<&str>,
     estimated_cost: f64,
+    now: DateTime<Utc>,
     outcome: &mut DecisionOutcome,
     explanations: &mut Vec<DecisionExplanation>,
 ) -> bool {
@@ -1597,6 +1626,32 @@ fn apply_budget_guards(
         )
     {
         return true;
+    }
+
+    for guard in &rule.guards.spend_windows {
+        let Some(window) = crate::policy::parse_guard_window(&guard.window) else {
+            continue;
+        };
+        let recent_spend = recent_spend_usd(ledger, &rule.id, matched_entity, now - window, now);
+        let projected_spend = recent_spend + estimated_cost;
+        if projected_spend > guard.max_usd
+            && push_guard_explanation(
+                format!("{}.spend_window.{}", rule.id, guard.window),
+                format!(
+                    "projected spend ${projected_spend:.6} exceeds {} guard max ${:.6}",
+                    guard.window, guard.max_usd
+                ),
+                format!(
+                    "projected spend ${projected_spend:.6} exceeds enforced {} guard max ${:.6}",
+                    guard.window, guard.max_usd
+                ),
+                guard.effect,
+                outcome,
+                explanations,
+            )
+        {
+            return true;
+        }
     }
 
     false
@@ -1737,6 +1792,72 @@ fn rolled_allocation_bucket_state(
     bucket.current_grant_usd = protected_amount_usd;
     bucket.started_at = now;
     Some(bucket)
+}
+
+fn recent_spend_usd(
+    ledger: &BudgetLedger,
+    rule_id: &str,
+    matched_entity: Option<&str>,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> f64 {
+    if let Some(conn) = &ledger.conn {
+        let sql = if matched_entity.is_some() {
+            "
+            SELECT COALESCE(SUM(r.amount_usd), 0)
+            FROM reservations r
+            JOIN decisions d ON d.decision_id = r.decision_id
+            WHERE d.selected_budget_id = ?1
+              AND d.matched_entity = ?2
+              AND d.created_at >= ?3
+              AND d.created_at <= ?4
+            "
+        } else {
+            "
+            SELECT COALESCE(SUM(r.amount_usd), 0)
+            FROM reservations r
+            JOIN decisions d ON d.decision_id = r.decision_id
+            WHERE d.selected_budget_id = ?1
+              AND d.created_at >= ?2
+              AND d.created_at <= ?3
+            "
+        };
+        let value = if let Some(matched_entity) = matched_entity {
+            conn.query_row(
+                sql,
+                params![
+                    rule_id,
+                    matched_entity,
+                    since.to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+                |row| row.get::<_, f64>(0),
+            )
+        } else {
+            conn.query_row(
+                sql,
+                params![rule_id, since.to_rfc3339(), now.to_rfc3339()],
+                |row| row.get::<_, f64>(0),
+            )
+        };
+        return value.unwrap_or(0.0);
+    }
+
+    ledger
+        .reservations
+        .values()
+        .filter(|stored| {
+            stored
+                .budget_rule_ids
+                .iter()
+                .any(|stored_rule_id| stored_rule_id == rule_id)
+                && stored.reservation.created_at >= since
+                && stored.reservation.created_at <= now
+                && matched_entity
+                    .is_none_or(|entity| stored.matched_entity.as_deref() == Some(entity))
+        })
+        .map(|stored| stored.reservation.amount_usd)
+        .sum()
 }
 
 fn matched_entity_and_rank(
@@ -2188,7 +2309,7 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 mod tests {
     use crate::contract::{
         BudgetEligibility, BudgetGuardPolicy, BudgetModelPolicy, BudgetRule, MaxContextTokensGuard,
-        MaxEstimatedRequestCostGuard, RuleMatch,
+        MaxEstimatedRequestCostGuard, RuleMatch, SpendWindowGuard,
     };
 
     use super::*;
@@ -2296,6 +2417,7 @@ mod tests {
                 effect: PolicyEffect::Warn,
             }),
             max_context_tokens: None,
+            spend_windows: Vec::new(),
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2320,6 +2442,7 @@ mod tests {
                 effect: PolicyEffect::Deny,
             }),
             max_context_tokens: None,
+            spend_windows: Vec::new(),
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2344,6 +2467,7 @@ mod tests {
                 max_tokens: 1_000,
                 effect: PolicyEffect::Warn,
             }),
+            spend_windows: Vec::new(),
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2369,6 +2493,7 @@ mod tests {
                 max_tokens: 1_000,
                 effect: PolicyEffect::Deny,
             }),
+            spend_windows: Vec::new(),
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2395,6 +2520,7 @@ mod tests {
                 max_tokens: 1_000,
                 effect: PolicyEffect::Deny,
             }),
+            spend_windows: Vec::new(),
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2408,6 +2534,60 @@ mod tests {
                 .iter()
                 .any(|explanation| { explanation.rule_id == "dev-budget.max_context_tokens" })
         );
+    }
+
+    #[test]
+    fn spend_window_guard_warns_on_projected_recent_spend() {
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: None,
+            spend_windows: vec![SpendWindowGuard {
+                window: "5h".to_owned(),
+                max_usd: 10.0,
+                effect: PolicyEffect::Warn,
+            }],
+        };
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        assert_eq!(second.outcome, DecisionOutcome::Warn);
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.5h"
+                && explanation.reason
+                    == "projected spend $11.000000 exceeds 5h guard max $10.000000"
+                && explanation.severity == DecisionSeverity::Warn
+        }));
+    }
+
+    #[test]
+    fn spend_window_guard_denies_on_projected_recent_spend() {
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: None,
+            spend_windows: vec![SpendWindowGuard {
+                window: "7d".to_owned(),
+                max_usd: 10.0,
+                effect: PolicyEffect::Deny,
+            }],
+        };
+        let mut ledger = BudgetLedger::default();
+
+        ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+        assert!(second.reservation.is_none());
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.7d"
+                && explanation.reason
+                    == "projected spend $11.000000 exceeds enforced 7d guard max $10.000000"
+                && explanation.severity == DecisionSeverity::Deny
+        }));
     }
 
     #[test]

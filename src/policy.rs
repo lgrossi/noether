@@ -119,6 +119,26 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
+        for guard in &budget.guards.spend_windows {
+            if parse_guard_window(&guard.window).is_none() {
+                errors.push(format!(
+                    "budget {} guards.spend_windows.window must use <number><s|m|h|d>, got {}",
+                    budget.id, guard.window
+                ));
+            }
+            if !guard.max_usd.is_finite() || guard.max_usd <= 0.0 {
+                errors.push(format!(
+                    "budget {} guards.spend_windows.max_usd must be positive",
+                    budget.id
+                ));
+            }
+            if !guard_effect_is_supported(guard.effect) {
+                errors.push(format!(
+                    "budget {} guards.spend_windows.effect must be warn or deny",
+                    budget.id
+                ));
+            }
+        }
         if let Some(allocation) = &budget.allocation
             && allocation.standard == "protected_adoption_pool"
         {
@@ -346,6 +366,22 @@ fn guard_effect_is_supported(effect: PolicyEffect) -> bool {
     matches!(effect, PolicyEffect::Warn | PolicyEffect::Deny)
 }
 
+pub fn parse_guard_window(value: &str) -> Option<chrono::Duration> {
+    let trimmed = value.trim();
+    let (amount, unit) = trimmed.split_at(trimmed.len().checked_sub(1)?);
+    let amount: i64 = amount.parse().ok()?;
+    if amount <= 0 {
+        return None;
+    }
+    match unit {
+        "s" => Some(chrono::Duration::seconds(amount)),
+        "m" => Some(chrono::Duration::minutes(amount)),
+        "h" => Some(chrono::Duration::hours(amount)),
+        "d" => Some(chrono::Duration::days(amount)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +403,10 @@ budgets:
       max_context_tokens:
         max_tokens: 120000
         effect: deny
+      spend_windows:
+        - window: 5h
+          max_usd: 10
+          effect: warn
     match:
       project: noether
 policies:
@@ -408,6 +448,30 @@ budgets:
         assert!(message.contains("max_usd must be positive"));
         assert!(message.contains("effect must be warn or deny"));
         assert!(message.contains("max_tokens must be positive"));
+    }
+
+    #[test]
+    fn rejects_invalid_spend_window_guard_policy() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev-daily
+    limit_usd: 1.0
+    guards:
+      spend_windows:
+        - window: 5x
+          max_usd: 0
+          effect: allow
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("spend window guard should be invalid");
+        let message = error.to_string();
+        assert!(message.contains("guards.spend_windows.window must use <number><s|m|h|d>"));
+        assert!(message.contains("guards.spend_windows.max_usd must be positive"));
+        assert!(message.contains("guards.spend_windows.effect must be warn or deny"));
     }
 
     #[test]
