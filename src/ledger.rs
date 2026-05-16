@@ -10,12 +10,12 @@ use uuid::Uuid;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
     DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyEffect, Reservation,
-    ReservationStatus, ToolEvent, TraceEvent, UsageObservation,
+    ReservationStatus, RuleMatch, ToolEvent, TraceEvent, UsageObservation,
 };
 use crate::error::NoetError;
 use crate::policy::{
     PolicyFile, budget_model_allowed, budget_rule_matches, budget_scope_matches,
-    matching_policy_explanations,
+    matching_policy_explanations, specificity_order,
 };
 
 #[derive(Debug, Default)]
@@ -37,6 +37,15 @@ struct StoredReservation {
     reservation: Reservation,
     estimated_cost_usd: f64,
     budget_rule_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BudgetCandidate {
+    id: String,
+    matched_entity: Option<String>,
+    specificity_rank: usize,
+    priority: i64,
+    pressure_micros: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +119,7 @@ impl BudgetLedger {
         let now = Utc::now();
         let mut outcome = DecisionOutcome::Allow;
         let mut explanations = Vec::new();
+        let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
             for (effect, explanation) in matching_policy_explanations(policy, request) {
@@ -118,7 +128,13 @@ impl BudgetLedger {
             }
 
             if outcome != DecisionOutcome::Deny {
-                self.evaluate_budget_rules(policy, request, now, &mut outcome, &mut explanations);
+                selected_budget_id = self.evaluate_budget_rules(
+                    policy,
+                    request,
+                    now,
+                    &mut outcome,
+                    &mut explanations,
+                );
             }
         } else {
             explanations.push(DecisionExplanation {
@@ -131,7 +147,7 @@ impl BudgetLedger {
         let reservation = if outcome == DecisionOutcome::Deny {
             None
         } else {
-            Some(self.create_reservation(policy, request, now))
+            Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
         };
 
         let decision = AuthorizeDecision {
@@ -455,67 +471,210 @@ impl BudgetLedger {
         now: DateTime<Utc>,
         outcome: &mut DecisionOutcome,
         explanations: &mut Vec<DecisionExplanation>,
-    ) {
+    ) -> Option<String> {
         let estimated_cost = request.estimated_cost();
-        let matching_rules: Vec<&BudgetRule> = policy
-            .budgets
-            .iter()
-            .filter(|rule| budget_rule_matches(rule, request))
-            .collect();
+        let candidate = self.select_budget_rule(policy, request, now, explanations);
 
-        if matching_rules.is_empty() {
-            let model_denied_rules: Vec<&BudgetRule> = policy
+        let Some(candidate) = candidate else {
+            let exhausted_rules = self.exhausted_budget_rules(policy, request, now);
+            if !exhausted_rules.is_empty() {
+                *outcome = DecisionOutcome::Deny;
+                for (rule_id, projected, limit_usd) in exhausted_rules {
+                    explanations.push(DecisionExplanation {
+                        rule_id,
+                        reason: format!(
+                            "estimated cost ${projected:.6} exceeds fixed-window limit ${limit_usd:.6}"
+                        ),
+                        severity: DecisionSeverity::Deny,
+                    });
+                }
+                return None;
+            }
+            let scoped_rules: Vec<&BudgetRule> = policy
                 .budgets
                 .iter()
                 .filter(|rule| budget_scope_matches(rule, request))
-                .filter(|rule| !budget_model_allowed(rule, request))
                 .collect();
-            if !model_denied_rules.is_empty() {
+            if scoped_rules
+                .iter()
+                .any(|rule| !budget_model_allowed(rule, request))
+            {
                 *outcome = DecisionOutcome::Deny;
-                for rule in model_denied_rules {
+                for rule in scoped_rules
+                    .into_iter()
+                    .filter(|rule| !budget_model_allowed(rule, request))
+                {
                     explanations.push(DecisionExplanation {
                         rule_id: rule.id.clone(),
                         reason: "requested provider/model is not allowed by budget".to_owned(),
                         severity: DecisionSeverity::Deny,
                     });
                 }
-                return;
+                return None;
+            }
+            if explanations
+                .iter()
+                .any(|explanation| explanation.rule_id == "no_fallback_budget")
+            {
+                *outcome = DecisionOutcome::Deny;
+                return None;
             }
             explanations.push(DecisionExplanation {
                 rule_id: "no_budget_match".to_owned(),
                 reason: "no matching budget rule; request allowed".to_owned(),
                 severity: DecisionSeverity::Info,
             });
-            return;
-        }
+            return None;
+        };
 
-        for rule in matching_rules {
-            let window = self.window(rule, now);
-            let projected = window.used_usd + estimated_cost;
-            if projected > rule.limit_usd {
-                *outcome = DecisionOutcome::Deny;
-                explanations.push(DecisionExplanation {
-                    rule_id: rule.id.clone(),
-                    reason: format!(
-                        "estimated cost ${projected:.6} exceeds fixed-window limit ${:.6}",
-                        rule.limit_usd
-                    ),
-                    severity: DecisionSeverity::Deny,
-                });
-            } else if projected >= rule.limit_usd * rule.warn_at_fraction
-                && *outcome != DecisionOutcome::Deny
+        let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
+            return None;
+        };
+        let projected = self.window_used_usd(rule, now) + estimated_cost;
+        if projected >= rule.limit_usd * rule.warn_at_fraction {
+            *outcome = DecisionOutcome::Warn;
+            explanations.push(DecisionExplanation {
+                rule_id: rule.id.clone(),
+                reason: format!(
+                    "estimated cost ${projected:.6} reaches warning threshold ${:.6}",
+                    rule.limit_usd * rule.warn_at_fraction
+                ),
+                severity: DecisionSeverity::Warn,
+            });
+        }
+        Some(rule.id.clone())
+    }
+
+    fn select_budget_rule(
+        &mut self,
+        policy: &PolicyFile,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+        explanations: &mut Vec<DecisionExplanation>,
+    ) -> Option<BudgetCandidate> {
+        if let Some(requested_budget_id) = request.budget_id.as_deref() {
+            if let Some(rule) = policy
+                .budgets
+                .iter()
+                .find(|rule| rule.id == requested_budget_id)
             {
-                *outcome = DecisionOutcome::Warn;
+                if let Some(candidate) = self.valid_budget_candidate(policy, rule, request, now) {
+                    explanations.push(DecisionExplanation {
+                        rule_id: rule.id.clone(),
+                        reason: "selected requested budget".to_owned(),
+                        severity: DecisionSeverity::Info,
+                    });
+                    return Some(candidate);
+                }
                 explanations.push(DecisionExplanation {
                     rule_id: rule.id.clone(),
-                    reason: format!(
-                        "estimated cost ${projected:.6} reaches warning threshold ${:.6}",
-                        rule.limit_usd * rule.warn_at_fraction
-                    ),
-                    severity: DecisionSeverity::Warn,
+                    reason: self.budget_rejection_reason(rule, request, now),
+                    severity: DecisionSeverity::Info,
+                });
+            } else {
+                explanations.push(DecisionExplanation {
+                    rule_id: requested_budget_id.to_owned(),
+                    reason: "requested budget does not exist".to_owned(),
+                    severity: DecisionSeverity::Info,
                 });
             }
         }
+
+        let mut candidates: Vec<BudgetCandidate> = policy
+            .budgets
+            .iter()
+            .filter_map(|rule| self.valid_budget_candidate(policy, rule, request, now))
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.specificity_rank
+                .cmp(&right.specificity_rank)
+                .then_with(|| right.priority.cmp(&left.priority))
+                .then_with(|| left.pressure_micros.cmp(&right.pressure_micros))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let candidate = candidates.into_iter().next();
+        if let Some(candidate) = &candidate {
+            explanations.push(DecisionExplanation {
+                rule_id: candidate.id.clone(),
+                reason: match candidate.matched_entity.as_deref() {
+                    Some(entity) => format!("selected fallback budget for {entity}"),
+                    None => "selected fallback budget".to_owned(),
+                },
+                severity: DecisionSeverity::Info,
+            });
+        } else if request.budget_id.is_some() {
+            explanations.push(DecisionExplanation {
+                rule_id: "no_fallback_budget".to_owned(),
+                reason: "no fallback budget can satisfy the request".to_owned(),
+                severity: DecisionSeverity::Deny,
+            });
+        }
+        candidate
+    }
+
+    fn valid_budget_candidate(
+        &mut self,
+        policy: &PolicyFile,
+        rule: &BudgetRule,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> Option<BudgetCandidate> {
+        if !budget_rule_matches(rule, request) {
+            return None;
+        }
+        let estimated_cost = request.estimated_cost();
+        let projected = self.window_used_usd(rule, now) + estimated_cost;
+        if projected > rule.limit_usd {
+            return None;
+        }
+        let (matched_entity, specificity_rank) =
+            matched_entity_and_rank(rule, request, &specificity_order(policy));
+        Some(BudgetCandidate {
+            id: rule.id.clone(),
+            matched_entity,
+            specificity_rank,
+            priority: rule.priority,
+            pressure_micros: ((projected / rule.limit_usd) * 1_000_000.0).round() as u64,
+        })
+    }
+
+    fn budget_rejection_reason(
+        &mut self,
+        rule: &BudgetRule,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> String {
+        if !budget_scope_matches(rule, request) {
+            return "requested budget is not eligible for request entities".to_owned();
+        }
+        if !budget_model_allowed(rule, request) {
+            return "requested provider/model is not allowed by requested budget".to_owned();
+        }
+        let projected = self.window_used_usd(rule, now) + request.estimated_cost();
+        if projected > rule.limit_usd {
+            return format!(
+                "requested budget would exceed fixed-window limit: projected ${projected:.6} > ${:.6}",
+                rule.limit_usd
+            );
+        }
+        "requested budget is not valid for the request".to_owned()
+    }
+
+    fn exhausted_budget_rules(
+        &mut self,
+        policy: &PolicyFile,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, f64, f64)> {
+        policy
+            .budgets
+            .iter()
+            .filter(|rule| budget_rule_matches(rule, request))
+            .filter_map(|rule| {
+                let projected = self.window_used_usd(rule, now) + request.estimated_cost();
+                (projected > rule.limit_usd).then(|| (rule.id.clone(), projected, rule.limit_usd))
+            })
+            .collect()
     }
 
     fn create_reservation(
@@ -523,6 +682,7 @@ impl BudgetLedger {
         policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
+        selected_budget_id: Option<&str>,
     ) -> Reservation {
         let amount_usd = request.estimated_cost();
         let matching_rules: Vec<&BudgetRule> = policy
@@ -530,7 +690,11 @@ impl BudgetLedger {
                 policy
                     .budgets
                     .iter()
-                    .filter(|rule| budget_rule_matches(rule, request))
+                    .filter(|rule| {
+                        selected_budget_id
+                            .map(|selected_budget_id| rule.id == selected_budget_id)
+                            .unwrap_or_else(|| budget_rule_matches(rule, request))
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -578,6 +742,17 @@ impl BudgetLedger {
         }
 
         window
+    }
+
+    fn window_used_usd(&self, rule: &BudgetRule, now: DateTime<Utc>) -> f64 {
+        let Some(window) = self.windows.get(&rule.id) else {
+            return 0.0;
+        };
+        if now - window.started_at >= Duration::seconds(rule.window_seconds) {
+            0.0
+        } else {
+            window.used_usd
+        }
     }
 
     fn persist_decision(
@@ -965,6 +1140,81 @@ fn parse_time(value: String) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn matched_entity_and_rank(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+    specificity: &[String],
+) -> (Option<String>, usize) {
+    let matched_entity = candidate_matched_entities(rule, request)
+        .into_iter()
+        .min_by_key(|entity| entity_specificity_rank(entity, specificity));
+    let rank = matched_entity
+        .as_deref()
+        .map(|entity| entity_specificity_rank(entity, specificity))
+        .unwrap_or(specificity.len());
+    (matched_entity, rank)
+}
+
+fn candidate_matched_entities(rule: &BudgetRule, request: &AuthorizeRequest) -> Vec<String> {
+    if !rule.eligible.entities.is_empty() {
+        return rule
+            .eligible
+            .entities
+            .iter()
+            .filter(|entity| request_entity_matches(request, entity))
+            .cloned()
+            .collect();
+    }
+
+    let mut entities = Vec::new();
+    if let Some(project) = rule.rule_match.project.as_deref() {
+        entities.push(format!("project:{project}"));
+    }
+    if let Some(subject) = rule.rule_match.subject.as_deref() {
+        entities.push(if subject.contains(':') {
+            subject.to_owned()
+        } else {
+            format!("user:{subject}")
+        });
+    }
+    if entities.is_empty() && rule.rule_match == RuleMatch::default() {
+        entities.push("global".to_owned());
+    }
+    entities
+}
+
+fn request_entity_matches(request: &AuthorizeRequest, expected: &str) -> bool {
+    if expected.eq_ignore_ascii_case("global") {
+        return true;
+    }
+    request
+        .entities
+        .iter()
+        .any(|entity| entity.eq_ignore_ascii_case(expected))
+        || request
+            .project
+            .as_deref()
+            .is_some_and(|project| expected.eq_ignore_ascii_case(&format!("project:{project}")))
+        || request.subject.as_deref().is_some_and(|subject| {
+            if subject.contains(':') {
+                expected.eq_ignore_ascii_case(subject)
+            } else {
+                expected.eq_ignore_ascii_case(&format!("user:{subject}"))
+            }
+        })
+}
+
+fn entity_specificity_rank(entity: &str, specificity: &[String]) -> usize {
+    let kind = entity
+        .split_once(':')
+        .map(|(kind, _)| kind)
+        .unwrap_or(entity);
+    specificity
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(kind))
+        .unwrap_or(specificity.len())
+}
+
 struct DecisionSummary<'a> {
     decision_id: &'a str,
     trace_id: Option<&'a str>,
@@ -1281,16 +1531,18 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::{BudgetModelPolicy, BudgetRule, RuleMatch};
+    use crate::contract::{BudgetEligibility, BudgetModelPolicy, BudgetRule, RuleMatch};
 
     use super::*;
 
     fn policy(limit_usd: f64, warn_at_fraction: f64) -> PolicyFile {
         PolicyFile {
             version: 0,
+            routing: Default::default(),
             budgets: vec![BudgetRule {
                 id: "dev-budget".to_owned(),
                 limit_usd,
+                priority: 0,
                 warn_at_fraction,
                 window_seconds: 60,
                 eligible: Default::default(),
@@ -1376,6 +1628,88 @@ mod tests {
     }
 
     #[test]
+    fn explicit_valid_budget_wins_and_only_selected_budget_is_reserved() {
+        let policy = routing_policy([
+            budget("project-budget", 1.0, 0, ["project:noether"]),
+            budget("team-budget", 1.0, 0, ["team:core"]),
+        ]);
+        let mut request = request(0.25);
+        request.budget_id = Some("team-budget".to_owned());
+        request.entities = vec!["project:noether".to_owned(), "team:core".to_owned()];
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(ledger.windows.get("team-budget").unwrap().used_usd, 0.25);
+        assert!(!ledger.windows.contains_key("project-budget"));
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "team-budget"
+                && explanation.reason == "selected requested budget"
+        }));
+    }
+
+    #[test]
+    fn invalid_explicit_budget_falls_back_to_inferred_budget() {
+        let policy = routing_policy([budget("project-budget", 1.0, 0, ["project:noether"])]);
+        let mut request = request(0.25);
+        request.budget_id = Some("missing-budget".to_owned());
+        request.entities = vec!["project:noether".to_owned()];
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(ledger.windows.get("project-budget").unwrap().used_usd, 0.25);
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "missing-budget"
+                && explanation.reason == "requested budget does not exist"
+        }));
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "project-budget"
+                && explanation.reason == "selected fallback budget for project:noether"
+        }));
+    }
+
+    #[test]
+    fn fallback_inference_prefers_specificity_before_priority() {
+        let policy = routing_policy([
+            budget("team-budget", 1.0, 100, ["team:core"]),
+            budget("project-budget", 1.0, 0, ["project:noether"]),
+        ]);
+        let mut request = request(0.25);
+        request.entities = vec!["team:core".to_owned(), "project:noether".to_owned()];
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(ledger.windows.get("project-budget").unwrap().used_usd, 0.25);
+        assert!(!ledger.windows.contains_key("team-budget"));
+    }
+
+    #[test]
+    fn fallback_inference_uses_priority_pressure_then_stable_id() {
+        let policy = routing_policy([
+            budget("z-low-priority", 1.0, 1, ["project:noether"]),
+            budget("z-high-tight", 0.5, 10, ["project:noether"]),
+            budget("b-high-wide", 1.0, 10, ["project:noether"]),
+            budget("a-high-wide", 1.0, 10, ["project:noether"]),
+        ]);
+        let mut request = request(0.25);
+        request.entities = vec!["project:noether".to_owned()];
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(ledger.windows.get("a-high-wide").unwrap().used_usd, 0.25);
+        assert!(!ledger.windows.contains_key("b-high-wide"));
+        assert!(!ledger.windows.contains_key("z-high-tight"));
+        assert!(!ledger.windows.contains_key("z-low-priority"));
+    }
+
+    #[test]
     fn finalize_is_idempotent() {
         let policy = policy(1.0, 0.8);
         let mut ledger = BudgetLedger::default();
@@ -1397,5 +1731,34 @@ mod tests {
 
         assert_eq!(first.status, ReservationStatus::Finalized);
         assert_eq!(second.amount_usd, 0.20);
+    }
+
+    fn routing_policy<const N: usize>(budgets: [BudgetRule; N]) -> PolicyFile {
+        PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: budgets.into_iter().collect(),
+            policies: Vec::new(),
+        }
+    }
+
+    fn budget<const N: usize>(
+        id: &str,
+        limit_usd: f64,
+        priority: i64,
+        entities: [&str; N],
+    ) -> BudgetRule {
+        BudgetRule {
+            id: id.to_owned(),
+            limit_usd,
+            priority,
+            warn_at_fraction: 1.0,
+            window_seconds: 60,
+            eligible: BudgetEligibility {
+                entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
+            },
+            models: BudgetModelPolicy::default(),
+            rule_match: RuleMatch::default(),
+        }
     }
 }

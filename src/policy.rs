@@ -13,9 +13,28 @@ use crate::error::NoetError;
 pub struct PolicyFile {
     pub version: u16,
     #[serde(default)]
+    pub routing: RoutingPolicy,
+    #[serde(default)]
     pub budgets: Vec<BudgetRule>,
     #[serde(default, rename = "policies")]
     pub policies: Vec<PolicyRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoutingPolicy {
+    #[serde(default = "default_routing_mode")]
+    pub mode: String,
+    #[serde(default = "default_specificity")]
+    pub specificity: Vec<String>,
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        Self {
+            mode: default_routing_mode(),
+            specificity: default_specificity(),
+        }
+    }
 }
 
 pub async fn load_policy(path: &Path) -> Result<PolicyFile, NoetError> {
@@ -29,6 +48,12 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
     let mut errors = Vec::new();
     if policy.version != 0 {
         errors.push(format!("version must be 0, got {}", policy.version));
+    }
+    if policy.routing.mode != "explicit_then_fallback" {
+        errors.push(format!(
+            "routing.mode must be explicit_then_fallback, got {}",
+            policy.routing.mode
+        ));
     }
 
     for budget in &policy.budgets {
@@ -111,6 +136,14 @@ pub fn matching_policy_explanations(
             )
         })
         .collect()
+}
+
+pub fn specificity_order(policy: &PolicyFile) -> Vec<String> {
+    if policy.routing.specificity.is_empty() {
+        default_specificity()
+    } else {
+        policy.routing.specificity.clone()
+    }
 }
 
 pub fn budget_rule_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> bool {
@@ -220,6 +253,17 @@ fn matches_optional(expected: &Option<String>, actual: &Option<String>) -> bool 
     })
 }
 
+fn default_routing_mode() -> String {
+    "explicit_then_fallback".to_owned()
+}
+
+fn default_specificity() -> Vec<String> {
+    ["project", "user", "team", "group", "org", "global"]
+        .iter()
+        .map(|kind| (*kind).to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +299,7 @@ policies:
     fn rejects_invalid_policy() {
         let policy = PolicyFile {
             version: 1,
+            routing: Default::default(),
             budgets: Vec::new(),
             policies: Vec::new(),
         };

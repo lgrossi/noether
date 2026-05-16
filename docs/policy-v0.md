@@ -24,9 +24,13 @@ noet serve --policy policy.noet.yaml --decision-mode enforce
 
 ```yaml
 version: 0
+routing:
+  mode: explicit_then_fallback
+  specificity: [project, user, team, group, org, global]
 budgets:
   - id: dev-daily
     limit_usd: 1.00
+    priority: 0
     warn_at_fraction: 0.8
     window_seconds: 86400
     eligible:
@@ -49,6 +53,11 @@ policies:
 
 The v0 evaluator is an in-memory fixed-window budget:
 
+- routing defaults to `explicit_then_fallback`;
+- when `budget_id` is present, Noether tries that budget first and records why it was rejected
+  before falling back;
+- inferred fallback budgets sort by entity specificity, higher `priority`, lower projected budget
+  pressure, and stable budget id;
 - `eligible.entities` can match trusted request entities such as `project:noether`,
   `user:alice`, `team:core`, `org:example`, or `global`;
 - `models.allow` constrains a matching budget to provider/model patterns such as

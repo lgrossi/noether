@@ -167,6 +167,8 @@ pub struct EvalAnnotation {
 pub struct BudgetRule {
     pub id: String,
     pub limit_usd: f64,
+    #[serde(default)]
+    pub priority: i64,
     #[serde(default = "default_warn_at_fraction")]
     pub warn_at_fraction: f64,
     #[serde(default = "default_window_seconds")]
@@ -191,7 +193,7 @@ pub struct BudgetModelPolicy {
     pub allow: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuleMatch {
     #[serde(default)]
     pub subject: Option<String>,

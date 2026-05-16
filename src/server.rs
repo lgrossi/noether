@@ -206,9 +206,11 @@ mod tests {
     fn strict_policy() -> PolicyFile {
         PolicyFile {
             version: 0,
+            routing: Default::default(),
             budgets: vec![BudgetRule {
                 id: "tiny".to_owned(),
                 limit_usd: 0.01,
+                priority: 0,
                 warn_at_fraction: 0.8,
                 window_seconds: 60,
                 eligible: Default::default(),
@@ -222,6 +224,7 @@ mod tests {
     fn require_project_policy() -> PolicyFile {
         PolicyFile {
             version: 0,
+            routing: Default::default(),
             budgets: Vec::new(),
             policies: vec![PolicyRule {
                 id: "require-project".to_owned(),
