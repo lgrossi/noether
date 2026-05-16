@@ -509,6 +509,7 @@ fn render_dashboard(
     agent_activity_panel(&mut html, &activity);
     skill_context_panel(&mut html, &activity);
     decisions_panel(&mut html, decisions);
+    risky_runs_panel(&mut html, decisions);
     timeline_panel(&mut html, trace, observations);
 
     html.push_str("</main></body></html>");
@@ -772,6 +773,45 @@ fn decisions_panel(html: &mut String, decisions: &[TraceReportItem]) {
     html.push_str("</tbody></table></section>");
 }
 
+fn risky_runs_panel(html: &mut String, decisions: &[TraceReportItem]) {
+    html.push_str("<section class=\"panel\"><h2>Risky runs</h2>");
+    let risky: Vec<_> = decisions
+        .iter()
+        .filter(|item| {
+            item.guard_hits
+                .as_ref()
+                .is_some_and(|hits| !hits.is_empty())
+        })
+        .collect();
+    if risky.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No guard hits were recorded for recent decisions.</div></section>",
+        );
+        return;
+    }
+    html.push_str(
+        "<table><thead><tr><th>When</th><th>Outcome</th><th>Guard hits</th></tr></thead><tbody>",
+    );
+    for item in risky {
+        let hits = item
+            .guard_hits
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|hit| format!("{}: {}", hit.rule_id, hit.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            escape_html(&short_time(item)),
+            outcome_pill(&item.kind),
+            escape_html(&hits)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+}
+
 fn timeline_panel(
     html: &mut String,
     trace: Option<&TraceReport>,
@@ -917,6 +957,7 @@ mod tests {
             kind: "decision.allow".to_owned(),
             summary: "decision_id=dec_1 selected_budget=project-budget matched_entity=project:noether selection_reason=selected fallback budget for project:noether rejected_budget=missing-budget rejected_reason=requested budget does not exist model_check=allowed:project-budget remaining_budget=0.750000".to_owned(),
             routing: None,
+            guard_hits: None,
         }];
         let usage = UsageReport {
             total_cost_usd: 0.0,
@@ -1009,5 +1050,30 @@ mod tests {
         assert!(html.contains("Low adopters"));
         assert!(html.contains("Top consumers"));
         assert!(html.contains("Adoption health"));
+    }
+
+    #[test]
+    fn dashboard_renders_risky_run_section_for_guard_hits() {
+        let usage = UsageReport {
+            total_cost_usd: 0.0,
+            rows: Vec::new(),
+            protected_adoption: None,
+        };
+        let decisions = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.deny".to_owned(),
+            summary: "decision_id=dec_guard guard_hits=dev-budget.max_context_tokens".to_owned(),
+            routing: None,
+            guard_hits: Some(vec![crate::ledger::DecisionGuardHitReport {
+                rule_id: "dev-budget.max_context_tokens".to_owned(),
+                reason: "estimated context tokens 1200 exceed enforced guard max 1000".to_owned(),
+                severity: crate::contract::DecisionSeverity::Deny,
+            }]),
+        }];
+
+        let html = render_dashboard(&usage, &decisions, None, &[]);
+
+        assert!(html.contains("Risky runs"));
+        assert!(html.contains("dev-budget.max_context_tokens"));
     }
 }

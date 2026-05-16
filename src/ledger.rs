@@ -136,6 +136,8 @@ pub struct TraceReportItem {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<DecisionRoutingReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_hits: Option<Vec<DecisionGuardHitReport>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -154,6 +156,13 @@ pub struct DecisionRoutingReport {
     pub model_check: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_budget_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DecisionGuardHitReport {
+    pub rule_id: String,
+    pub reason: String,
+    pub severity: DecisionSeverity,
 }
 
 impl BudgetLedger {
@@ -343,7 +352,7 @@ impl BudgetLedger {
         let mut stmt = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, metadata_json, selected_budget_id,
+                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, selected_budget_id,
                    matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
                    model_check, remaining_budget_usd
             FROM decisions
@@ -386,6 +395,7 @@ impl BudgetLedger {
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
                 routing: None,
+                guard_hits: None,
             })
         };
         match (prefix, trace_id) {
@@ -420,7 +430,7 @@ impl BudgetLedger {
         let mut decisions = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, metadata_json, selected_budget_id,
+                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, selected_budget_id,
                    matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
                    model_check, remaining_budget_usd
             FROM decisions
@@ -464,6 +474,7 @@ impl BudgetLedger {
                     metadata_json: &metadata_json,
                 }),
                 routing: None,
+                guard_hits: None,
             })
         })? {
             items.push(row?);
@@ -485,6 +496,7 @@ impl BudgetLedger {
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
                 routing: None,
+                guard_hits: None,
             })
         })? {
             items.push(row?);
@@ -1507,14 +1519,16 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
     let model: Option<String> = row.get(6)?;
     let estimated_tokens: Option<i64> = row.get(7)?;
     let estimated_cost_usd: Option<f64> = row.get(8)?;
-    let metadata_json: String = row.get(9)?;
-    let selected_budget_id: Option<String> = row.get(10)?;
-    let matched_entity: Option<String> = row.get(11)?;
-    let selection_reason: Option<String> = row.get(12)?;
-    let rejected_budget_id: Option<String> = row.get(13)?;
-    let rejected_budget_reason: Option<String> = row.get(14)?;
-    let model_check: Option<String> = row.get(15)?;
-    let remaining_budget_usd: Option<f64> = row.get(16)?;
+    let explanations_json: String = row.get(9)?;
+    let metadata_json: String = row.get(10)?;
+    let selected_budget_id: Option<String> = row.get(11)?;
+    let matched_entity: Option<String> = row.get(12)?;
+    let selection_reason: Option<String> = row.get(13)?;
+    let rejected_budget_id: Option<String> = row.get(14)?;
+    let rejected_budget_reason: Option<String> = row.get(15)?;
+    let model_check: Option<String> = row.get(16)?;
+    let remaining_budget_usd: Option<f64> = row.get(17)?;
+    let guard_hits = guard_hits_from_explanations_json(&explanations_json);
     let summary = DecisionSummary {
         decision_id: &decision_id,
         trace_id: trace_id.as_deref(),
@@ -1524,6 +1538,7 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
         estimated_tokens,
         estimated_cost_usd,
         metadata_json: &metadata_json,
+        guard_hits: guard_hits.as_deref(),
         routing: DecisionRoutingSummary {
             selected_budget_id: selected_budget_id.as_deref(),
             matched_entity: matched_entity.as_deref(),
@@ -1547,6 +1562,7 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
             model_check,
             remaining_budget_usd,
         ),
+        guard_hits,
     })
 }
 
@@ -1575,6 +1591,29 @@ fn decision_routing_report(
         model_check,
         remaining_budget_usd,
     })
+}
+
+fn guard_hits_from_explanations_json(
+    explanations_json: &str,
+) -> Option<Vec<DecisionGuardHitReport>> {
+    let hits: Vec<DecisionGuardHitReport> =
+        serde_json::from_str::<Vec<DecisionExplanation>>(explanations_json)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|explanation| is_guard_rule_id(&explanation.rule_id))
+            .map(|explanation| DecisionGuardHitReport {
+                rule_id: explanation.rule_id,
+                reason: explanation.reason,
+                severity: explanation.severity,
+            })
+            .collect();
+    (!hits.is_empty()).then_some(hits)
+}
+
+fn is_guard_rule_id(rule_id: &str) -> bool {
+    rule_id.contains(".max_estimated_request_cost_usd")
+        || rule_id.contains(".max_context_tokens")
+        || rule_id.contains(".spend_window.")
 }
 
 fn apply_budget_guards(
@@ -1959,6 +1998,7 @@ struct DecisionSummary<'a> {
     estimated_tokens: Option<i64>,
     estimated_cost_usd: Option<f64>,
     metadata_json: &'a str,
+    guard_hits: Option<&'a [DecisionGuardHitReport]>,
     routing: DecisionRoutingSummary<'a>,
 }
 
@@ -2021,6 +2061,16 @@ fn summarize_decision(decision: DecisionSummary<'_>) -> String {
     push_opt(&mut parts, "model_check", decision.routing.model_check);
     if let Some(remaining_budget_usd) = decision.routing.remaining_budget_usd {
         parts.push(format!("remaining_budget={remaining_budget_usd:.6}"));
+    }
+    if let Some(guard_hits) = decision.guard_hits
+        && !guard_hits.is_empty()
+    {
+        let hits = guard_hits
+            .iter()
+            .map(|hit| hit.rule_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("guard_hits={hits}"));
     }
     let shape = summarize_request_shape(&metadata);
     if !shape.is_empty() {
@@ -2773,6 +2823,55 @@ mod tests {
             trace_routing.selected_budget_id.as_deref(),
             Some("project-budget")
         );
+    }
+
+    #[test]
+    fn report_items_include_guard_hits() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("guard-hits-report.sqlite");
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].guards = BudgetGuardPolicy {
+            max_estimated_request_cost_usd: None,
+            max_context_tokens: Some(MaxContextTokensGuard {
+                max_tokens: 1_000,
+                effect: PolicyEffect::Deny,
+            }),
+            spend_windows: Vec::new(),
+        };
+        let mut request = request(0.25);
+        request.estimated_tokens = Some(1_200);
+        request.metadata.insert(
+            "trace_id".to_owned(),
+            Value::String("trace-guard".to_owned()),
+        );
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+
+        let decisions = ledger.decisions_report().expect("decisions report");
+        let guard_hits = decisions[0]
+            .guard_hits
+            .as_ref()
+            .expect("decision guard hits");
+        assert_eq!(guard_hits.len(), 1);
+        assert_eq!(guard_hits[0].rule_id, "dev-budget.max_context_tokens");
+        assert_eq!(
+            guard_hits[0].reason,
+            "estimated context tokens 1200 exceed enforced guard max 1000"
+        );
+        assert!(
+            decisions[0]
+                .summary
+                .contains("guard_hits=dev-budget.max_context_tokens")
+        );
+
+        let trace = ledger.trace_report("trace-guard").expect("trace report");
+        let trace_guard_hits = trace.items[0]
+            .guard_hits
+            .as_ref()
+            .expect("trace guard hits");
+        assert_eq!(trace_guard_hits[0].rule_id, "dev-budget.max_context_tokens");
     }
 
     #[test]
