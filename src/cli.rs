@@ -221,29 +221,8 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
             if command.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("total_cost_usd\t{:.6}", report.total_cost_usd);
-                println!(
-                    "project\tprovider\tmodel\tsubject\tinput_tokens\toutput_tokens\tcache_read_tokens\tcache_write_tokens\ttotal_tokens\tcost_usd\tcache_read_cost_usd\tcache_write_cost_usd\treservations\tactive\tfinalized"
-                );
-                for row in report.rows {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}",
-                        row.project.as_deref().unwrap_or("-"),
-                        row.provider.as_deref().unwrap_or("-"),
-                        row.model.as_deref().unwrap_or("-"),
-                        row.subject.as_deref().unwrap_or("-"),
-                        row.input_tokens,
-                        row.output_tokens,
-                        row.cache_read_tokens,
-                        row.cache_write_tokens,
-                        row.total_tokens,
-                        row.total_cost_usd,
-                        row.cache_read_cost_usd,
-                        row.cache_write_cost_usd,
-                        row.reservations,
-                        row.active_reservations,
-                        row.finalized_reservations
-                    );
+                for line in render_usage_report_lines(&report) {
+                    println!("{line}");
                 }
             }
         }
@@ -305,6 +284,70 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
         }
     }
     Ok(())
+}
+
+fn render_usage_report_lines(report: &UsageReport) -> Vec<String> {
+    let mut lines = vec![
+        format!("total_cost_usd\t{:.6}", report.total_cost_usd),
+        "project\tprovider\tmodel\tsubject\tinput_tokens\toutput_tokens\tcache_read_tokens\tcache_write_tokens\ttotal_tokens\tcost_usd\tcache_read_cost_usd\tcache_write_cost_usd\treservations\tactive\tfinalized".to_owned(),
+    ];
+    for row in &report.rows {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}",
+            row.project.as_deref().unwrap_or("-"),
+            row.provider.as_deref().unwrap_or("-"),
+            row.model.as_deref().unwrap_or("-"),
+            row.subject.as_deref().unwrap_or("-"),
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+            row.total_tokens,
+            row.total_cost_usd,
+            row.cache_read_cost_usd,
+            row.cache_write_cost_usd,
+            row.reservations,
+            row.active_reservations,
+            row.finalized_reservations
+        ));
+    }
+    if let Some(adoption) = &report.protected_adoption {
+        lines.push(format!(
+            "unused_protected_opportunity_usd\t{:.6}",
+            adoption.unused_protected_opportunity_usd
+        ));
+        lines.push(format!(
+            "carryover_liability_usd\t{:.6}",
+            adoption.carryover_liability_usd
+        ));
+        lines.push(
+            "adoption_level\tbudget_id\tentity_key\tprotected_amount_usd\tcurrent_grant_usd\tcarryover_usd\tused_current_grant_usd"
+                .to_owned(),
+        );
+        for entity in &adoption.low_adopters {
+            lines.push(format!(
+                "low\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+                entity.budget_id,
+                entity.entity_key,
+                entity.protected_amount_usd,
+                entity.current_grant_usd,
+                entity.carryover_usd,
+                entity.used_current_grant_usd
+            ));
+        }
+        for entity in &adoption.high_adopters {
+            lines.push(format!(
+                "high\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+                entity.budget_id,
+                entity.entity_key,
+                entity.protected_amount_usd,
+                entity.current_grant_usd,
+                entity.carryover_usd,
+                entity.used_current_grant_usd
+            ));
+        }
+    }
+    lines
 }
 
 fn print_items(items: Vec<crate::ledger::TraceReportItem>, json: bool) -> Result<(), NoetError> {
@@ -795,6 +838,7 @@ mod tests {
         let usage = UsageReport {
             total_cost_usd: 0.0,
             rows: Vec::new(),
+            protected_adoption: None,
         };
 
         let html = render_dashboard(&usage, &decisions, None, &[]);
@@ -803,5 +847,48 @@ mod tests {
         assert!(html.contains("matched_entity=project:noether"));
         assert!(html.contains("rejected_budget=missing-budget"));
         assert!(html.contains("model_check=allowed:project-budget"));
+    }
+
+    #[test]
+    fn usage_report_human_output_includes_protected_adoption_summary() {
+        let usage = UsageReport {
+            total_cost_usd: 30.0,
+            rows: Vec::new(),
+            protected_adoption: Some(crate::ledger::ProtectedAdoptionReport {
+                unused_protected_opportunity_usd: 25.0,
+                carryover_liability_usd: 5.0,
+                low_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:alice".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 24.0,
+                    carryover_usd: 0.0,
+                    used_current_grant_usd: 1.0,
+                }],
+                high_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:bob".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 1.0,
+                    carryover_usd: 5.0,
+                    used_current_grant_usd: 24.0,
+                }],
+            }),
+        };
+
+        let lines = render_usage_report_lines(&usage);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "unused_protected_opportunity_usd\t25.000000")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "carryover_liability_usd\t5.000000")
+        );
+        assert!(lines.iter().any(|line| line.contains("user:alice")));
+        assert!(lines.iter().any(|line| line.contains("user:bob")));
     }
 }

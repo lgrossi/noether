@@ -36,6 +36,7 @@ struct WindowState {
 #[derive(Clone, Debug)]
 struct AllocationBucketState {
     started_at: DateTime<Utc>,
+    protected_amount_usd: f64,
     current_grant_usd: f64,
     carryover_usd: f64,
 }
@@ -80,6 +81,8 @@ struct RoutingPersistenceFields {
 pub struct UsageReport {
     pub total_cost_usd: f64,
     pub rows: Vec<UsageReportRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_adoption: Option<ProtectedAdoptionReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +102,24 @@ pub struct UsageReportRow {
     pub reservations: u64,
     pub active_reservations: u64,
     pub finalized_reservations: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProtectedAdoptionReport {
+    pub unused_protected_opportunity_usd: f64,
+    pub carryover_liability_usd: f64,
+    pub low_adopters: Vec<ProtectedAdoptionEntityReport>,
+    pub high_adopters: Vec<ProtectedAdoptionEntityReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProtectedAdoptionEntityReport {
+    pub budget_id: String,
+    pub entity_key: String,
+    pub protected_amount_usd: f64,
+    pub current_grant_usd: f64,
+    pub carryover_usd: f64,
+    pub used_current_grant_usd: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +284,7 @@ impl BudgetLedger {
             return Ok(UsageReport {
                 total_cost_usd: 0.0,
                 rows: Vec::new(),
+                protected_adoption: None,
             });
         };
         let mut stmt = conn.prepare(
@@ -309,6 +331,7 @@ impl BudgetLedger {
         Ok(UsageReport {
             total_cost_usd: rows.iter().map(|row| row.total_cost_usd).sum(),
             rows,
+            protected_adoption: protected_adoption_report(conn)?,
         })
     }
 
@@ -1047,10 +1070,11 @@ impl BudgetLedger {
             conn.execute(
                 "
                 INSERT INTO budget_allocation_buckets (
-                    rule_id, entity_key, started_at, current_grant_usd, carryover_usd
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(rule_id, entity_key) DO UPDATE SET
                     started_at = excluded.started_at,
+                    protected_amount_usd = excluded.protected_amount_usd,
                     current_grant_usd = excluded.current_grant_usd,
                     carryover_usd = excluded.carryover_usd
                 ",
@@ -1058,6 +1082,7 @@ impl BudgetLedger {
                     rule_id,
                     entity_key,
                     bucket.started_at.to_rfc3339(),
+                    bucket.protected_amount_usd,
                     bucket.current_grant_usd,
                     bucket.carryover_usd
                 ],
@@ -1092,7 +1117,7 @@ impl BudgetLedger {
         };
         let mut stmt = conn.prepare(
             "
-            SELECT rule_id, entity_key, started_at, current_grant_usd, carryover_usd
+            SELECT rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
             FROM budget_allocation_buckets
             ",
         )?;
@@ -1105,8 +1130,9 @@ impl BudgetLedger {
                     (rule_id, entity_key),
                     AllocationBucketState {
                         started_at: started_at.map(parse_time).unwrap_or_else(Utc::now),
-                        current_grant_usd: row.get(3)?,
-                        carryover_usd: row.get(4)?,
+                        protected_amount_usd: row.get(3)?,
+                        current_grant_usd: row.get(4)?,
+                        carryover_usd: row.get(5)?,
                     },
                 ))
             })?
@@ -1259,6 +1285,7 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             rule_id TEXT NOT NULL,
             entity_key TEXT NOT NULL,
             started_at TEXT,
+            protected_amount_usd REAL NOT NULL DEFAULT 0,
             current_grant_usd REAL NOT NULL,
             carryover_usd REAL NOT NULL,
             PRIMARY KEY (rule_id, entity_key)
@@ -1308,6 +1335,12 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "budget_allocation_buckets",
         "started_at",
         "started_at TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "budget_allocation_buckets",
+        "protected_amount_usd",
+        "protected_amount_usd REAL NOT NULL DEFAULT 0",
     )?;
     Ok(())
 }
@@ -1380,6 +1413,63 @@ fn parse_time(value: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn protected_adoption_report(
+    conn: &Connection,
+) -> Result<Option<ProtectedAdoptionReport>, NoetError> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT rule_id, entity_key, protected_amount_usd, current_grant_usd, carryover_usd
+        FROM budget_allocation_buckets
+        WHERE protected_amount_usd > 0
+        ORDER BY rule_id, entity_key
+        ",
+    )?;
+    let entities: Vec<ProtectedAdoptionEntityReport> = stmt
+        .query_map([], |row| {
+            let protected_amount_usd: f64 = row.get(2)?;
+            let current_grant_usd: f64 = row.get(3)?;
+            let carryover_usd: f64 = row.get(4)?;
+            Ok(ProtectedAdoptionEntityReport {
+                budget_id: row.get(0)?,
+                entity_key: row.get(1)?,
+                protected_amount_usd,
+                current_grant_usd,
+                carryover_usd,
+                used_current_grant_usd: (protected_amount_usd - current_grant_usd).max(0.0),
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    if entities.is_empty() {
+        return Ok(None);
+    }
+
+    let mut low_adopters = Vec::new();
+    let mut high_adopters = Vec::new();
+    for entity in &entities {
+        let usage_fraction = if entity.protected_amount_usd <= 0.0 {
+            0.0
+        } else {
+            entity.used_current_grant_usd / entity.protected_amount_usd
+        };
+        if usage_fraction <= 0.2 {
+            low_adopters.push(entity.clone());
+        }
+        if usage_fraction >= 0.8 {
+            high_adopters.push(entity.clone());
+        }
+    }
+
+    Ok(Some(ProtectedAdoptionReport {
+        unused_protected_opportunity_usd: entities
+            .iter()
+            .map(|entity| entity.current_grant_usd)
+            .sum(),
+        carryover_liability_usd: entities.iter().map(|entity| entity.carryover_usd).sum(),
+        low_adopters,
+        high_adopters,
+    }))
 }
 
 fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceReportItem> {
@@ -1584,6 +1674,7 @@ fn allocation_bucket_available_usd(
         .cloned()
         .unwrap_or(AllocationBucketState {
             started_at: now,
+            protected_amount_usd,
             current_grant_usd: protected_amount_usd,
             carryover_usd: 0.0,
         });
@@ -1608,6 +1699,7 @@ fn consume_allocation_bucket(
         .entry((rule.id.clone(), entity_key.clone()))
         .or_insert(AllocationBucketState {
             started_at: now,
+            protected_amount_usd,
             current_grant_usd: protected_amount_usd,
             carryover_usd: 0.0,
         });
@@ -2770,6 +2862,82 @@ mod tests {
             .expect("alice bucket");
         assert!((bucket.carryover_usd - 7.3).abs() < 0.000_001);
         assert_eq!(bucket.current_grant_usd, 25.0);
+    }
+
+    #[test]
+    fn usage_report_distinguishes_unused_opportunity_and_adoption_levels() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("adoption-report.sqlite");
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "ai-adoption".to_owned(),
+                limit_usd: 2000.0,
+                priority: 0,
+                warn_at_fraction: 1.0,
+                window_seconds: 60,
+                eligible: BudgetEligibility {
+                    entities: vec!["org:example".to_owned()],
+                },
+                models: BudgetModelPolicy::default(),
+                guards: BudgetGuardPolicy::default(),
+                allocation: Some(crate::contract::BudgetAllocationPolicy {
+                    standard: "protected_adoption_pool".to_owned(),
+                    by: Some("user".to_owned()),
+                    protected_amount_usd: Some(25.0),
+                    window: Some("monthly".to_owned()),
+                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
+                        percent: Some(10.0),
+                        cap_usd: Some(50.0),
+                    }),
+                }),
+                rule_match: RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        };
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let mut alice_request = request(1.0);
+        alice_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+        let mut bob_request = request(24.0);
+        bob_request.entities = vec!["org:example".to_owned(), "user:bob".to_owned()];
+        ledger.authorize(Some(&policy), &alice_request);
+        ledger.authorize(Some(&policy), &bob_request);
+        ledger
+            .conn
+            .as_ref()
+            .expect("sqlite conn")
+            .execute(
+                "
+                UPDATE budget_allocation_buckets
+                SET carryover_usd = 5.0
+                WHERE rule_id = 'ai-adoption' AND entity_key = 'user:bob'
+                ",
+                [],
+            )
+            .expect("seed carryover liability");
+        drop(ledger);
+
+        let ledger = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
+        let report = ledger.usage_report().expect("usage report");
+        let adoption = report
+            .protected_adoption
+            .as_ref()
+            .expect("protected adoption summary");
+        assert_eq!(adoption.unused_protected_opportunity_usd, 25.0);
+        assert_eq!(adoption.carryover_liability_usd, 5.0);
+        assert!(
+            adoption
+                .low_adopters
+                .iter()
+                .any(|entity| entity.entity_key == "user:alice")
+        );
+        assert!(
+            adoption
+                .high_adopters
+                .iter()
+                .any(|entity| entity.entity_key == "user:bob")
+        );
     }
 
     #[test]
