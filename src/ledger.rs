@@ -278,7 +278,9 @@ impl BudgetLedger {
         let mut stmt = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, metadata_json
+                   estimated_tokens, estimated_cost_usd, metadata_json, selected_budget_id,
+                   matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
+                   model_check, remaining_budget_usd
             FROM decisions
             ORDER BY created_at DESC
             ",
@@ -293,6 +295,12 @@ impl BudgetLedger {
             let estimated_tokens: Option<i64> = row.get(7)?;
             let estimated_cost_usd: Option<f64> = row.get(8)?;
             let metadata_json: String = row.get(9)?;
+            let selected_budget_id: Option<String> = row.get(10)?;
+            let matched_entity: Option<String> = row.get(11)?;
+            let selection_reason: Option<String> = row.get(12)?;
+            let rejected_budget_id: Option<String> = row.get(13)?;
+            let rejected_budget_reason: Option<String> = row.get(14)?;
+            let model_check: Option<String> = row.get(15)?;
             let decision_summary = DecisionSummary {
                 decision_id: &decision_id,
                 trace_id: trace_id.as_deref(),
@@ -302,6 +310,15 @@ impl BudgetLedger {
                 estimated_tokens,
                 estimated_cost_usd,
                 metadata_json: &metadata_json,
+                routing: DecisionRoutingSummary {
+                    selected_budget_id: selected_budget_id.as_deref(),
+                    matched_entity: matched_entity.as_deref(),
+                    selection_reason: selection_reason.as_deref(),
+                    rejected_budget_id: rejected_budget_id.as_deref(),
+                    rejected_budget_reason: rejected_budget_reason.as_deref(),
+                    model_check: model_check.as_deref(),
+                    remaining_budget_usd: row.get(16)?,
+                },
             };
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
@@ -377,7 +394,9 @@ impl BudgetLedger {
         let mut decisions = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, metadata_json
+                   estimated_tokens, estimated_cost_usd, metadata_json, selected_budget_id,
+                   matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
+                   model_check, remaining_budget_usd
             FROM decisions
             WHERE trace_id = ?1
             ORDER BY created_at
@@ -393,6 +412,12 @@ impl BudgetLedger {
             let estimated_tokens: Option<i64> = row.get(7)?;
             let estimated_cost_usd: Option<f64> = row.get(8)?;
             let metadata_json: String = row.get(9)?;
+            let selected_budget_id: Option<String> = row.get(10)?;
+            let matched_entity: Option<String> = row.get(11)?;
+            let selection_reason: Option<String> = row.get(12)?;
+            let rejected_budget_id: Option<String> = row.get(13)?;
+            let rejected_budget_reason: Option<String> = row.get(14)?;
+            let model_check: Option<String> = row.get(15)?;
             let decision_summary = DecisionSummary {
                 decision_id: &decision_id,
                 trace_id: trace_id.as_deref(),
@@ -402,6 +427,15 @@ impl BudgetLedger {
                 estimated_tokens,
                 estimated_cost_usd,
                 metadata_json: &metadata_json,
+                routing: DecisionRoutingSummary {
+                    selected_budget_id: selected_budget_id.as_deref(),
+                    matched_entity: matched_entity.as_deref(),
+                    selection_reason: selection_reason.as_deref(),
+                    rejected_budget_id: rejected_budget_id.as_deref(),
+                    rejected_budget_reason: rejected_budget_reason.as_deref(),
+                    model_check: model_check.as_deref(),
+                    remaining_budget_usd: row.get(16)?,
+                },
             };
             Ok(TraceReportItem {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
@@ -1373,6 +1407,18 @@ struct DecisionSummary<'a> {
     estimated_tokens: Option<i64>,
     estimated_cost_usd: Option<f64>,
     metadata_json: &'a str,
+    routing: DecisionRoutingSummary<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct DecisionRoutingSummary<'a> {
+    selected_budget_id: Option<&'a str>,
+    matched_entity: Option<&'a str>,
+    selection_reason: Option<&'a str>,
+    rejected_budget_id: Option<&'a str>,
+    rejected_budget_reason: Option<&'a str>,
+    model_check: Option<&'a str>,
+    remaining_budget_usd: Option<f64>,
 }
 
 fn summarize_decision(decision: DecisionSummary<'_>) -> String {
@@ -1394,6 +1440,35 @@ fn summarize_decision(decision: DecisionSummary<'_>) -> String {
     }
     if let Some(cost) = decision.estimated_cost_usd {
         parts.push(format!("estimated_cost={cost:.6}"));
+    }
+    push_opt(
+        &mut parts,
+        "selected_budget",
+        decision.routing.selected_budget_id,
+    );
+    push_opt(
+        &mut parts,
+        "matched_entity",
+        decision.routing.matched_entity,
+    );
+    push_opt(
+        &mut parts,
+        "selection_reason",
+        decision.routing.selection_reason,
+    );
+    push_opt(
+        &mut parts,
+        "rejected_budget",
+        decision.routing.rejected_budget_id,
+    );
+    push_opt(
+        &mut parts,
+        "rejected_reason",
+        decision.routing.rejected_budget_reason,
+    );
+    push_opt(&mut parts, "model_check", decision.routing.model_check);
+    if let Some(remaining_budget_usd) = decision.routing.remaining_budget_usd {
+        parts.push(format!("remaining_budget={remaining_budget_usd:.6}"));
     }
     let shape = summarize_request_shape(&metadata);
     if !shape.is_empty() {

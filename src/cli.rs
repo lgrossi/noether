@@ -777,3 +777,30 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    #[test]
+    fn dashboard_renders_budget_routing_explanation_markers() {
+        let decisions = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.allow".to_owned(),
+            summary: "decision_id=dec_1 selected_budget=project-budget matched_entity=project:noether selection_reason=selected fallback budget for project:noether rejected_budget=missing-budget rejected_reason=requested budget does not exist model_check=allowed:project-budget remaining_budget=0.750000".to_owned(),
+        }];
+        let usage = UsageReport {
+            total_cost_usd: 0.0,
+            rows: Vec::new(),
+        };
+
+        let html = render_dashboard(&usage, &decisions, None, &[]);
+
+        assert!(html.contains("selected_budget=project-budget"));
+        assert!(html.contains("matched_entity=project:noether"));
+        assert!(html.contains("rejected_budget=missing-budget"));
+        assert!(html.contains("model_check=allowed:project-budget"));
+    }
+}
