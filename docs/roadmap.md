@@ -83,6 +83,24 @@ Acceptance:
 - Reports show attributed usage by project/session.
 - Failure mode is documented: fail-open, fail-closed, or warn-only.
 
+## Slice 6: scenario emulator
+
+Goal: validate Noether's product claims with self-contained realistic examples.
+
+Acceptance:
+
+- Scenario files can describe entities, budgets, requests, model choices, tool activity, usage,
+  denials, fallbacks, and finalization.
+- `noet` can replay a scenario through the public contract instead of private ledger shortcuts.
+- Generated reports/dashboard show the expected story without live provider traffic.
+- Scenarios cover at least:
+  - one individual/local run;
+  - one team/project budget run;
+  - one model-denial/fallback run;
+  - one runaway or spend-window guard run;
+  - one adoption/carryover-style run once that allocation standard exists.
+- Scenario assertions can fail CI when Noether behavior or report output drifts.
+
 ## Later
 
 - Postgres storage.

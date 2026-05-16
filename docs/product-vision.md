@@ -71,6 +71,25 @@ Noether should be useful even when it does not own the model call:
 
 The product must make this enforcement level explicit.
 
+## Scenario emulator
+
+Noether should include a comprehensive scenario emulator. Because Noether is self-contained and its
+contract is explicit, it should be able to simulate realistic companies, users, projects, budgets,
+models, agent runs, tool calls, denials, fallbacks, and adoption patterns without requiring live
+provider traffic.
+
+The emulator is a product feature, not only a test harness. It should let maintainers and adopters
+validate claims such as:
+
+- budget routing chooses the expected budget;
+- model allowlists deny or fallback correctly;
+- spend windows catch runaway burn;
+- protected adoption pools carry over correctly;
+- reports and dashboards explain the scenario in human terms.
+
+This keeps Noether honest: every public governance claim should eventually have an executable
+scenario that demonstrates it end to end.
+
 ## Non-goals
 
 - Rebuild LiteLLM in Rust.
