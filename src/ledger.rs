@@ -95,6 +95,26 @@ pub struct TraceReportItem {
     pub occurred_at: DateTime<Utc>,
     pub kind: String,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<DecisionRoutingReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DecisionRoutingReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_budget_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_entity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_budget_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_budget_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_check: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_budget_usd: Option<f64>,
 }
 
 impl BudgetLedger {
@@ -285,49 +305,9 @@ impl BudgetLedger {
             ORDER BY created_at DESC
             ",
         )?;
-        stmt.query_map([], |row| {
-            let outcome: String = row.get(1)?;
-            let decision_id: String = row.get(2)?;
-            let trace_id: Option<String> = row.get(3)?;
-            let request_id: Option<String> = row.get(4)?;
-            let provider: Option<String> = row.get(5)?;
-            let model: Option<String> = row.get(6)?;
-            let estimated_tokens: Option<i64> = row.get(7)?;
-            let estimated_cost_usd: Option<f64> = row.get(8)?;
-            let metadata_json: String = row.get(9)?;
-            let selected_budget_id: Option<String> = row.get(10)?;
-            let matched_entity: Option<String> = row.get(11)?;
-            let selection_reason: Option<String> = row.get(12)?;
-            let rejected_budget_id: Option<String> = row.get(13)?;
-            let rejected_budget_reason: Option<String> = row.get(14)?;
-            let model_check: Option<String> = row.get(15)?;
-            let decision_summary = DecisionSummary {
-                decision_id: &decision_id,
-                trace_id: trace_id.as_deref(),
-                request_id: request_id.as_deref(),
-                provider: provider.as_deref(),
-                model: model.as_deref(),
-                estimated_tokens,
-                estimated_cost_usd,
-                metadata_json: &metadata_json,
-                routing: DecisionRoutingSummary {
-                    selected_budget_id: selected_budget_id.as_deref(),
-                    matched_entity: matched_entity.as_deref(),
-                    selection_reason: selection_reason.as_deref(),
-                    rejected_budget_id: rejected_budget_id.as_deref(),
-                    rejected_budget_reason: rejected_budget_reason.as_deref(),
-                    model_check: model_check.as_deref(),
-                    remaining_budget_usd: row.get(16)?,
-                },
-            };
-            Ok(TraceReportItem {
-                occurred_at: parse_time(row.get::<_, String>(0)?),
-                kind: format!("decision.{outcome}"),
-                summary: summarize_decision(decision_summary),
-            })
-        })?
-        .collect::<Result<_, _>>()
-        .map_err(NoetError::from)
+        stmt.query_map([], decision_report_item_from_row)?
+            .collect::<Result<_, _>>()
+            .map_err(NoetError::from)
     }
 
     pub fn observations_report(
@@ -360,6 +340,7 @@ impl BudgetLedger {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
+                routing: None,
             })
         };
         match (prefix, trace_id) {
@@ -402,47 +383,7 @@ impl BudgetLedger {
             ORDER BY created_at
             ",
         )?;
-        for row in decisions.query_map([trace_id], |row| {
-            let outcome: String = row.get(1)?;
-            let decision_id: String = row.get(2)?;
-            let trace_id: Option<String> = row.get(3)?;
-            let request_id: Option<String> = row.get(4)?;
-            let provider: Option<String> = row.get(5)?;
-            let model: Option<String> = row.get(6)?;
-            let estimated_tokens: Option<i64> = row.get(7)?;
-            let estimated_cost_usd: Option<f64> = row.get(8)?;
-            let metadata_json: String = row.get(9)?;
-            let selected_budget_id: Option<String> = row.get(10)?;
-            let matched_entity: Option<String> = row.get(11)?;
-            let selection_reason: Option<String> = row.get(12)?;
-            let rejected_budget_id: Option<String> = row.get(13)?;
-            let rejected_budget_reason: Option<String> = row.get(14)?;
-            let model_check: Option<String> = row.get(15)?;
-            let decision_summary = DecisionSummary {
-                decision_id: &decision_id,
-                trace_id: trace_id.as_deref(),
-                request_id: request_id.as_deref(),
-                provider: provider.as_deref(),
-                model: model.as_deref(),
-                estimated_tokens,
-                estimated_cost_usd,
-                metadata_json: &metadata_json,
-                routing: DecisionRoutingSummary {
-                    selected_budget_id: selected_budget_id.as_deref(),
-                    matched_entity: matched_entity.as_deref(),
-                    selection_reason: selection_reason.as_deref(),
-                    rejected_budget_id: rejected_budget_id.as_deref(),
-                    rejected_budget_reason: rejected_budget_reason.as_deref(),
-                    model_check: model_check.as_deref(),
-                    remaining_budget_usd: row.get(16)?,
-                },
-            };
-            Ok(TraceReportItem {
-                occurred_at: parse_time(row.get::<_, String>(0)?),
-                kind: format!("decision.{outcome}"),
-                summary: summarize_decision(decision_summary),
-            })
-        })? {
+        for row in decisions.query_map([trace_id], decision_report_item_from_row)? {
             items.push(row?);
         }
 
@@ -477,6 +418,7 @@ impl BudgetLedger {
                     stop_reason: stop_reason.as_deref(),
                     metadata_json: &metadata_json,
                 }),
+                routing: None,
             })
         })? {
             items.push(row?);
@@ -497,6 +439,7 @@ impl BudgetLedger {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
+                routing: None,
             })
         })? {
             items.push(row?);
@@ -1308,6 +1251,85 @@ fn parse_time(value: String) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceReportItem> {
+    let outcome: String = row.get(1)?;
+    let decision_id: String = row.get(2)?;
+    let trace_id: Option<String> = row.get(3)?;
+    let request_id: Option<String> = row.get(4)?;
+    let provider: Option<String> = row.get(5)?;
+    let model: Option<String> = row.get(6)?;
+    let estimated_tokens: Option<i64> = row.get(7)?;
+    let estimated_cost_usd: Option<f64> = row.get(8)?;
+    let metadata_json: String = row.get(9)?;
+    let selected_budget_id: Option<String> = row.get(10)?;
+    let matched_entity: Option<String> = row.get(11)?;
+    let selection_reason: Option<String> = row.get(12)?;
+    let rejected_budget_id: Option<String> = row.get(13)?;
+    let rejected_budget_reason: Option<String> = row.get(14)?;
+    let model_check: Option<String> = row.get(15)?;
+    let remaining_budget_usd: Option<f64> = row.get(16)?;
+    let summary = DecisionSummary {
+        decision_id: &decision_id,
+        trace_id: trace_id.as_deref(),
+        request_id: request_id.as_deref(),
+        provider: provider.as_deref(),
+        model: model.as_deref(),
+        estimated_tokens,
+        estimated_cost_usd,
+        metadata_json: &metadata_json,
+        routing: DecisionRoutingSummary {
+            selected_budget_id: selected_budget_id.as_deref(),
+            matched_entity: matched_entity.as_deref(),
+            selection_reason: selection_reason.as_deref(),
+            rejected_budget_id: rejected_budget_id.as_deref(),
+            rejected_budget_reason: rejected_budget_reason.as_deref(),
+            model_check: model_check.as_deref(),
+            remaining_budget_usd,
+        },
+    };
+    Ok(TraceReportItem {
+        occurred_at: parse_time(row.get::<_, String>(0)?),
+        kind: format!("decision.{outcome}"),
+        summary: summarize_decision(summary),
+        routing: decision_routing_report(
+            selected_budget_id,
+            matched_entity,
+            selection_reason,
+            rejected_budget_id,
+            rejected_budget_reason,
+            model_check,
+            remaining_budget_usd,
+        ),
+    })
+}
+
+fn decision_routing_report(
+    selected_budget_id: Option<String>,
+    matched_entity: Option<String>,
+    selection_reason: Option<String>,
+    rejected_budget_id: Option<String>,
+    rejected_budget_reason: Option<String>,
+    model_check: Option<String>,
+    remaining_budget_usd: Option<f64>,
+) -> Option<DecisionRoutingReport> {
+    let has_fields = selected_budget_id.is_some()
+        || matched_entity.is_some()
+        || selection_reason.is_some()
+        || rejected_budget_id.is_some()
+        || rejected_budget_reason.is_some()
+        || model_check.is_some()
+        || remaining_budget_usd.is_some();
+    has_fields.then_some(DecisionRoutingReport {
+        selected_budget_id,
+        matched_entity,
+        selection_reason,
+        rejected_budget_id,
+        rejected_budget_reason,
+        model_check,
+        remaining_budget_usd,
+    })
+}
+
 fn matched_entity_and_rank(
     rule: &BudgetRule,
     request: &AuthorizeRequest,
@@ -1981,6 +2003,58 @@ mod tests {
         assert_eq!(row.4.as_deref(), Some("requested budget does not exist"));
         assert_eq!(row.5.as_deref(), Some("allowed:project-budget"));
         assert_eq!(row.6, Some(0.75));
+    }
+
+    #[test]
+    fn report_items_include_structured_routing_fields() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("routing-report.sqlite");
+        let policy = routing_policy([budget("project-budget", 1.0, 0, ["project:noether"])]);
+        let mut request = request(0.25);
+        request.budget_id = Some("missing-budget".to_owned());
+        request.entities = vec!["project:noether".to_owned()];
+        request.provider = Some("openai".to_owned());
+        request.model = Some("gpt-4.1".to_owned());
+        request
+            .metadata
+            .insert("trace_id".to_owned(), Value::String("trace-report".to_owned()));
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+
+        let decisions = ledger.decisions_report().expect("decisions report");
+        assert_eq!(decisions.len(), 1);
+        let routing = decisions[0].routing.as_ref().expect("decision routing");
+        assert_eq!(
+            routing.selected_budget_id.as_deref(),
+            Some("project-budget")
+        );
+        assert_eq!(routing.matched_entity.as_deref(), Some("project:noether"));
+        assert_eq!(
+            routing.selection_reason.as_deref(),
+            Some("selected fallback budget for project:noether")
+        );
+        assert_eq!(
+            routing.rejected_budget_id.as_deref(),
+            Some("missing-budget")
+        );
+        assert_eq!(
+            routing.rejected_budget_reason.as_deref(),
+            Some("requested budget does not exist")
+        );
+        assert_eq!(
+            routing.model_check.as_deref(),
+            Some("allowed:project-budget")
+        );
+        assert_eq!(routing.remaining_budget_usd, Some(0.75));
+
+        let trace = ledger.trace_report("trace-report").expect("trace report");
+        let trace_routing = trace.items[0].routing.as_ref().expect("trace routing");
+        assert_eq!(
+            trace_routing.selected_budget_id.as_deref(),
+            Some("project-budget")
+        );
     }
 
     #[test]

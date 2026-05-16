@@ -790,6 +790,7 @@ mod tests {
             occurred_at: Utc::now(),
             kind: "decision.allow".to_owned(),
             summary: "decision_id=dec_1 selected_budget=project-budget matched_entity=project:noether selection_reason=selected fallback budget for project:noether rejected_budget=missing-budget rejected_reason=requested budget does not exist model_check=allowed:project-budget remaining_budget=0.750000".to_owned(),
+            routing: None,
         }];
         let usage = UsageReport {
             total_cost_usd: 0.0,
