@@ -48,6 +48,17 @@ struct BudgetCandidate {
     pressure_micros: u64,
 }
 
+#[derive(Default)]
+struct RoutingPersistenceFields {
+    selected_budget_id: Option<String>,
+    matched_entity: Option<String>,
+    selection_reason: Option<String>,
+    rejected_budget_id: Option<String>,
+    rejected_budget_reason: Option<String>,
+    model_check: Option<String>,
+    remaining_budget_usd: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct UsageReport {
     pub total_cost_usd: f64,
@@ -157,7 +168,7 @@ impl BudgetLedger {
             explanations,
             created_at: now,
         };
-        self.persist_decision(request, &decision)?;
+        self.persist_decision(policy, request, &decision)?;
         Ok(decision)
     }
 
@@ -757,6 +768,7 @@ impl BudgetLedger {
 
     fn persist_decision(
         &self,
+        policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         decision: &AuthorizeDecision,
     ) -> Result<(), NoetError> {
@@ -766,13 +778,18 @@ impl BudgetLedger {
         let trace_id = string_metadata(request, "trace_id");
         let session_id = string_metadata(request, "session_id");
         let request_id = string_metadata(request, "request_id");
+        let routing = self.routing_persistence_fields(policy, request, decision);
         conn.execute(
             "
             INSERT INTO decisions (
                 decision_id, trace_id, session_id, request_id, subject, project, provider, model,
                 estimated_tokens, estimated_cost_usd, outcome, explanations_json, metadata_json,
-                created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+                rejected_budget_reason, model_check, remaining_budget_usd, created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21
+            )
             ",
             params![
                 decision.decision_id.as_str(),
@@ -788,6 +805,13 @@ impl BudgetLedger {
                 outcome_text(decision.outcome),
                 serde_json::to_string(&decision.explanations)?,
                 serde_json::to_string(&request.metadata)?,
+                routing.selected_budget_id.as_deref(),
+                routing.matched_entity.as_deref(),
+                routing.selection_reason.as_deref(),
+                routing.rejected_budget_id.as_deref(),
+                routing.rejected_budget_reason.as_deref(),
+                routing.model_check.as_deref(),
+                routing.remaining_budget_usd,
                 decision.created_at.to_rfc3339(),
             ],
         )?;
@@ -818,6 +842,58 @@ impl BudgetLedger {
             )?;
         }
         Ok(())
+    }
+
+    fn routing_persistence_fields(
+        &self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        decision: &AuthorizeDecision,
+    ) -> RoutingPersistenceFields {
+        let selected_budget_id = decision
+            .reservation
+            .as_ref()
+            .and_then(|reservation| self.reservations.get(&reservation.id))
+            .and_then(|stored| stored.budget_rule_ids.first())
+            .cloned();
+
+        let mut fields = RoutingPersistenceFields {
+            selected_budget_id: selected_budget_id.clone(),
+            ..RoutingPersistenceFields::default()
+        };
+
+        if let (Some(policy), Some(selected_budget_id)) = (policy, selected_budget_id.as_deref()) {
+            if let Some(rule) = policy
+                .budgets
+                .iter()
+                .find(|rule| rule.id == selected_budget_id)
+            {
+                fields.matched_entity =
+                    matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
+                fields.remaining_budget_usd = Some(
+                    (rule.limit_usd - self.window_used_usd(rule, decision.created_at)).max(0.0),
+                );
+            }
+            fields.selection_reason = decision
+                .explanations
+                .iter()
+                .find(|explanation| explanation.rule_id == selected_budget_id)
+                .map(|explanation| explanation.reason.clone());
+        }
+
+        if let Some(requested_budget_id) = request.budget_id.as_deref() {
+            if selected_budget_id.as_deref() != Some(requested_budget_id) {
+                fields.rejected_budget_id = Some(requested_budget_id.to_owned());
+                fields.rejected_budget_reason = decision
+                    .explanations
+                    .iter()
+                    .find(|explanation| explanation.rule_id == requested_budget_id)
+                    .map(|explanation| explanation.reason.clone());
+            }
+        }
+
+        fields.model_check = routing_model_check(decision, selected_budget_id.as_deref());
+        fields
     }
 
     fn persist_finalization(
@@ -1031,6 +1107,13 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             outcome TEXT NOT NULL,
             explanations_json TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
+            selected_budget_id TEXT,
+            matched_entity TEXT,
+            selection_reason TEXT,
+            rejected_budget_id TEXT,
+            rejected_budget_reason TEXT,
+            model_check TEXT,
+            remaining_budget_usd REAL,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_decisions_trace ON decisions(trace_id);
@@ -1086,6 +1169,57 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         );
         ",
     )?;
+    ensure_column(
+        conn,
+        "decisions",
+        "selected_budget_id",
+        "selected_budget_id TEXT",
+    )?;
+    ensure_column(conn, "decisions", "matched_entity", "matched_entity TEXT")?;
+    ensure_column(
+        conn,
+        "decisions",
+        "selection_reason",
+        "selection_reason TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "decisions",
+        "rejected_budget_id",
+        "rejected_budget_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "decisions",
+        "rejected_budget_reason",
+        "rejected_budget_reason TEXT",
+    )?;
+    ensure_column(conn, "decisions", "model_check", "model_check TEXT")?;
+    ensure_column(
+        conn,
+        "decisions",
+        "remaining_budget_usd",
+        "remaining_budget_usd REAL",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_definition: &str,
+) -> Result<(), NoetError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column_definition}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1213,6 +1347,21 @@ fn entity_specificity_rank(entity: &str, specificity: &[String]) -> usize {
         .iter()
         .position(|candidate| candidate.eq_ignore_ascii_case(kind))
         .unwrap_or(specificity.len())
+}
+
+fn routing_model_check(
+    decision: &AuthorizeDecision,
+    selected_budget_id: Option<&str>,
+) -> Option<String> {
+    if decision
+        .explanations
+        .iter()
+        .any(|explanation| explanation.reason.contains("provider/model is not allowed"))
+    {
+        return Some("denied".to_owned());
+    }
+
+    selected_budget_id.map(|budget_id| format!("allowed:{budget_id}"))
 }
 
 struct DecisionSummary<'a> {
@@ -1707,6 +1856,56 @@ mod tests {
         assert!(!ledger.windows.contains_key("b-high-wide"));
         assert!(!ledger.windows.contains_key("z-high-tight"));
         assert!(!ledger.windows.contains_key("z-low-priority"));
+    }
+
+    #[test]
+    fn sqlite_persists_budget_routing_explanation_fields() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("routing.sqlite");
+        let policy = routing_policy([budget("project-budget", 1.0, 0, ["project:noether"])]);
+        let mut request = request(0.25);
+        request.budget_id = Some("missing-budget".to_owned());
+        request.entities = vec!["project:noether".to_owned()];
+        request.provider = Some("openai".to_owned());
+        request.model = Some("gpt-4.1".to_owned());
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let row = conn
+            .query_row(
+                "
+                SELECT selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+                       rejected_budget_reason, model_check, remaining_budget_usd
+                FROM decisions
+                WHERE decision_id = ?1
+                ",
+                [decision.decision_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<f64>>(6)?,
+                    ))
+                },
+            )
+            .expect("decision routing row");
+
+        assert_eq!(row.0.as_deref(), Some("project-budget"));
+        assert_eq!(row.1.as_deref(), Some("project:noether"));
+        assert_eq!(
+            row.2.as_deref(),
+            Some("selected fallback budget for project:noether")
+        );
+        assert_eq!(row.3.as_deref(), Some("missing-budget"));
+        assert_eq!(row.4.as_deref(), Some("requested budget does not exist"));
+        assert_eq!(row.5.as_deref(), Some("allowed:project-budget"));
+        assert_eq!(row.6, Some(0.75));
     }
 
     #[test]
