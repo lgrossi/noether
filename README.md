@@ -143,6 +143,25 @@ Open the generated file in a browser:
 xdg-open .noet/noether-dashboard.html
 ```
 
+## Scenario examples
+
+Replay checked-in local scenarios with no provider credentials:
+
+```bash
+cargo run --bin noet -- scenario run examples/scenarios/local-developer.noet.yaml
+cargo run --bin noet -- scenario run examples/scenarios/team-pooled-budget.noet.yaml
+```
+
+Each run writes a fresh SQLite ledger, JSON reports, per-request traces, and an HTML dashboard
+under `.noet/scenarios/<scenario-name>/`.
+
+Additional checked-in scenarios cover:
+
+- project budget fallback
+- model-denial fallback
+- runaway-cost guard denial
+- protected adoption pool behavior
+
 ## Use with Pi
 
 Start Noether:
@@ -211,6 +230,8 @@ scenario that demonstrates it.
 
 - [Product vision](./docs/product-vision.md)
 - [Roadmap](./docs/roadmap.md)
+- [Team deployment](./docs/team-deployment.md)
+- [Export and reporting API contract](./docs/export-reporting-api.md)
 - [AI budget allocation standards](./docs/design/ai-budget-allocation-standards.md)
 - [Control contract v0](./docs/control-contract-v0.md)
 - [Policy v0](./docs/policy-v0.md)

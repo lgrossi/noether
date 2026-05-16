@@ -1,0 +1,78 @@
+# Export and reporting API contract
+
+The current stable reporting contract is the CLI JSON emitted from the SQLite ledger. A future HTTP
+export API should preserve those shapes as directly as possible.
+
+## Proposed endpoints
+
+```text
+GET /v1/reports/usage
+GET /v1/reports/decisions
+GET /v1/reports/traces/{trace_id}
+GET /v1/reports/observations?kind=<prefix>&trace=<trace_id>
+GET /v1/reports/dashboard?trace=<trace_id>
+```
+
+Simulation/export extensions can layer on top:
+
+```text
+GET /v1/simulations/{simulation_id}
+GET /v1/simulations/{simulation_id}/dashboard
+```
+
+## Usage report shape
+
+Mirror the current `report usage --json` output:
+
+- `total_cost_usd`
+- `rows[]` with project/provider/model/subject/token/cost/reservation fields
+- optional `protected_adoption` summary with:
+  - `unused_protected_opportunity_usd`
+  - `carryover_liability_usd`
+  - `low_adopters[]`
+  - `high_adopters[]`
+
+This is the export surface for budget usage, unused budget opportunity, adoption coverage inputs,
+and carryover liability.
+
+## Decisions report shape
+
+Mirror the current `report decisions --json` output:
+
+- `occurred_at`
+- `kind` (`decision.allow`, `decision.warn`, `decision.deny`)
+- `summary`
+- optional `routing`:
+  - `selected_budget_id`
+  - `matched_entity`
+  - `selection_reason`
+  - `rejected_budget_id`
+  - `rejected_budget_reason`
+  - `model_check`
+  - `remaining_budget_usd`
+- optional `guard_hits[]`:
+  - `rule_id`
+  - `reason`
+  - `severity`
+
+This is the export surface for denials, fallbacks, remaining budget, and guard-hit reporting.
+
+## Trace and observation shapes
+
+Mirror the current `report trace --json` and `report observations --json` output:
+
+- chronological `items[]`
+- `kind`
+- `summary`
+- optional routing/guard fields on decision items
+
+Trace exports are the review surface for one run's decision, usage, tool, lifecycle, and
+observation story.
+
+## API design constraints
+
+- preserve the current JSON field names to avoid drift between CLI and HTTP exports;
+- keep filtering simple: kind prefix and trace id are enough for the first export API;
+- return dashboard HTML as a rendered artifact, not as a new source of truth;
+- do not require a shared-storage migration before defining the read contract;
+- keep local SQLite and future shared storage behind the same report/export shapes.

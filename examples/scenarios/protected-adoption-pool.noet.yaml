@@ -1,0 +1,59 @@
+version: 1
+name: protected adoption pool
+policy:
+  version: 0
+  budgets:
+    - id: ai-adoption
+      limit_usd: 2000
+      eligible:
+        entities: [org:example]
+      allocation:
+        standard: protected_adoption_pool
+        by: user
+        protected_amount_usd: 25
+        window: monthly
+        carryover:
+          percent: 10
+          cap_usd: 50
+requests:
+  - id: req-alice
+    authorize:
+      subject: user:alice
+      project: docs
+      provider: openai
+      model: gpt-4.1-mini
+      estimated_cost_usd: 1.0
+      entities: [org:example, user:alice]
+    finalize:
+      actual_cost_usd: 1.0
+      usage:
+        provider: openai
+        model: gpt-4.1-mini
+        total_tokens: 4000
+        cost_usd: 1.0
+  - id: req-bob
+    authorize:
+      subject: user:bob
+      project: platform
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 24.0
+      entities: [org:example, user:bob]
+    finalize:
+      actual_cost_usd: 24.0
+      usage:
+        provider: openai
+        model: gpt-4.1
+        total_tokens: 96000
+        cost_usd: 24.0
+assertions:
+  - kind: total_cost_usd
+    amount_usd: 25.0
+  - kind: report_contains
+    text: unused_protected_opportunity_usd
+  - kind: report_contains
+    text: user:alice
+  - kind: report_contains
+    text: user:bob
+  - kind: dashboard_contains
+    text: Adoption health

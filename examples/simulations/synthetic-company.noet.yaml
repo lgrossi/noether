@@ -1,0 +1,86 @@
+version: 1
+name: benchmark company
+seed: 42
+horizon_days: 30
+company:
+  id: example-co
+  teams:
+    - id: platform
+      name: Platform
+    - id: product
+      name: Product
+  projects:
+    - id: noether
+      team_id: platform
+      name: Noether
+    - id: editor
+      team_id: product
+      name: Editor
+    - id: search
+      team_id: product
+      name: Search
+  users:
+    - id: alice
+      team_id: platform
+      project_ids: [noether]
+      profile: power_user
+    - id: ben
+      team_id: platform
+      project_ids: [noether]
+      profile: steady_user
+    - id: chloe
+      team_id: product
+      project_ids: [editor]
+      profile: low_adopter
+    - id: diego
+      team_id: product
+      project_ids: [search]
+      profile: experimenter
+    - id: eva
+      team_id: product
+      project_ids: [editor, search]
+      profile: loop_risk
+models:
+  - id: flagship
+    provider: openai
+    model: gpt-4.1
+    cost_per_1k_tokens_usd: 0.01
+  - id: fast
+    provider: openai
+    model: gpt-4.1-mini
+    cost_per_1k_tokens_usd: 0.002
+strategies:
+  - id: pooled-caps
+    description: Team pooled caps without protected adoption buckets.
+    policy:
+      version: 0
+      budgets:
+        - id: team-platform
+          limit_usd: 250
+          eligible:
+            entities: [team:platform]
+        - id: team-product
+          limit_usd: 350
+          eligible:
+            entities: [team:product]
+  - id: protected-adoption
+    description: Product team keeps a protected adoption pool for individual users.
+    policy:
+      version: 0
+      budgets:
+        - id: team-platform
+          limit_usd: 250
+          eligible:
+            entities: [team:platform]
+        - id: product-adoption
+          limit_usd: 350
+          eligible:
+            entities: [team:product]
+          allocation:
+            standard: protected_adoption_pool
+            by: user
+            protected_amount_usd: 25
+            window: monthly
+            carryover:
+              percent: 10
+              cap_usd: 50

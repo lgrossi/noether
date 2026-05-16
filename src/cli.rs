@@ -1,18 +1,25 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::fs;
 
-use crate::contract::DecisionMode;
+use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, TraceEvent};
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
 use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
 use crate::policy::load_policy;
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
+use crate::scenario::{
+    ScenarioAssertion, ScenarioFallbackExpectation, ScenarioFile, ScenarioReportSource,
+    ScenarioRequest, validate_scenario,
+};
+use crate::simulation::{SimulationFile, compare_strategies, validate_simulation};
 use crate::server::{ServeConfig, serve};
 
 #[derive(Parser)]
@@ -33,6 +40,10 @@ enum Command {
     Fixtures(FixturesCommand),
     /// Report persisted decisions, usage, traces, and observations.
     Report(ReportCommand),
+    /// Replay executable Noether scenarios without live provider traffic.
+    Scenario(ScenarioCommand),
+    /// Compare strategy variants over synthetic demand.
+    Simulate(SimulateCommand),
 }
 
 #[derive(Parser)]
@@ -137,6 +148,33 @@ enum ReportSubcommand {
     },
 }
 
+#[derive(Parser)]
+struct ScenarioCommand {
+    #[command(subcommand)]
+    command: ScenarioSubcommand,
+}
+
+#[derive(Subcommand)]
+enum ScenarioSubcommand {
+    /// Replay a scenario file and generate local artifacts.
+    Run {
+        /// Scenario YAML file.
+        path: PathBuf,
+        /// Directory where scenario artifacts are written.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Parser)]
+struct SimulateCommand {
+    /// Simulation YAML file.
+    path: PathBuf,
+    /// Directory where simulation artifacts are written.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+}
+
 pub async fn run() -> Result<(), NoetError> {
     let cli = Cli::parse();
 
@@ -164,6 +202,8 @@ pub async fn run() -> Result<(), NoetError> {
         Command::Policy(command) => run_policy(command).await,
         Command::Fixtures(command) => run_fixtures(command).await,
         Command::Report(command) => run_report(command).await,
+        Command::Scenario(command) => run_scenario(command).await,
+        Command::Simulate(command) => run_simulate(command).await,
     }
 }
 
@@ -278,6 +318,721 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
         }
     }
     Ok(())
+}
+
+async fn run_scenario(command: ScenarioCommand) -> Result<(), NoetError> {
+    match command.command {
+        ScenarioSubcommand::Run { path, out_dir } => {
+            let artifacts = replay_scenario_file(&path, out_dir.as_deref()).await?;
+            println!("scenario\t{}", artifacts.name);
+            println!("output_dir\t{}", artifacts.output_dir.display());
+            println!("db_path\t{}", artifacts.db_path.display());
+            println!("usage_report\t{}", artifacts.usage_report_path.display());
+            println!(
+                "decisions_report\t{}",
+                artifacts.decisions_report_path.display()
+            );
+            println!("dashboard\t{}", artifacts.dashboard_path.display());
+            for (request_id, path) in artifacts.trace_report_paths {
+                println!("trace_report\t{request_id}\t{}", path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
+    let simulation = load_simulation_file(&command.path).await?;
+    let simulation_name = simulation
+        .name
+        .clone()
+        .unwrap_or_else(|| simulation_output_slug(&command.path));
+    let out_dir = command
+        .out_dir
+        .unwrap_or_else(|| PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path)));
+    let report = compare_strategies(&simulation, &out_dir)?;
+    let report_path = out_dir.join("simulation-report.json");
+    write_json_file(&report_path, &report).await?;
+    let simulation_dashboard_path = out_dir.join("simulation-dashboard.html");
+    fs::write(
+        &simulation_dashboard_path,
+        render_simulation_dashboard(&report),
+    )
+    .await?;
+    println!("simulation\t{}", simulation_name);
+    println!("output_dir\t{}", out_dir.display());
+    println!("simulation_report\t{}", report_path.display());
+    println!(
+        "simulation_dashboard\t{}",
+        simulation_dashboard_path.display()
+    );
+    for strategy in &report.strategies {
+        let strategy_dashboard_path = strategy
+            .db_path
+            .parent()
+            .unwrap_or(&out_dir)
+            .join("noether-dashboard.html");
+        let ledger = BudgetLedger::open_sqlite(&strategy.db_path)?;
+        let usage = ledger.usage_report()?;
+        let decisions = ledger.decisions_report()?;
+        fs::write(
+            &strategy_dashboard_path,
+            render_dashboard(&usage, &decisions, None, &[]),
+        )
+        .await?;
+        println!("strategy\t{}", strategy.id);
+        println!("db_path\t{}", strategy.db_path.display());
+        println!("usage_report\t{}", strategy.usage_report_path.display());
+        println!("decisions_report\t{}", strategy.decisions_report_path.display());
+        println!("dashboard\t{}", strategy_dashboard_path.display());
+    }
+    Ok(())
+}
+
+struct ScenarioArtifacts {
+    name: String,
+    output_dir: PathBuf,
+    db_path: PathBuf,
+    usage_report_path: PathBuf,
+    decisions_report_path: PathBuf,
+    dashboard_path: PathBuf,
+    trace_report_paths: Vec<(String, PathBuf)>,
+}
+
+struct ScenarioReplayRequestResult {
+    request_id: String,
+    trace_id: String,
+    decision: AuthorizeDecision,
+}
+
+async fn replay_scenario_file(
+    path: &Path,
+    out_dir: Option<&Path>,
+) -> Result<ScenarioArtifacts, NoetError> {
+    let scenario = load_scenario_file(path).await?;
+    let scenario_name = scenario
+        .name
+        .clone()
+        .unwrap_or_else(|| scenario_output_slug(path));
+    let output_dir = out_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".noet/scenarios").join(scenario_output_slug(path)));
+    fs::create_dir_all(&output_dir).await?;
+
+    let traces_dir = output_dir.join("traces");
+    if fs::try_exists(&traces_dir).await? {
+        fs::remove_dir_all(&traces_dir).await?;
+    }
+    fs::create_dir_all(&traces_dir).await?;
+
+    let db_path = output_dir.join("noether.sqlite");
+    if fs::try_exists(&db_path).await? {
+        fs::remove_file(&db_path).await?;
+    }
+
+    let session_id = format!(
+        "scenario:{}",
+        scenario_name.replace(char::is_whitespace, "-")
+    );
+    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let mut trace_report_paths = Vec::new();
+    let mut replay_results = Vec::new();
+    let mut trace_reports = BTreeMap::new();
+
+    for request in &scenario.requests {
+        let replay_result =
+            replay_scenario_request(&mut ledger, &scenario, request, &session_id)?;
+        let trace_report = ledger.trace_report(&replay_result.trace_id)?;
+        let trace_report_path = traces_dir.join(format!(
+            "{}.json",
+            sanitize_path_component(&replay_result.request_id)
+        ));
+        write_json_file(&trace_report_path, &trace_report).await?;
+        trace_report_paths.push((replay_result.request_id.clone(), trace_report_path));
+        trace_reports.insert(replay_result.request_id.clone(), trace_report);
+        replay_results.push(replay_result);
+    }
+
+    let usage = ledger.usage_report()?;
+    let usage_report_path = output_dir.join("usage-report.json");
+    write_json_file(&usage_report_path, &usage).await?;
+
+    let decisions = ledger.decisions_report()?;
+    let decisions_report_path = output_dir.join("decisions-report.json");
+    write_json_file(&decisions_report_path, &decisions).await?;
+
+    let featured_trace_id = decisions
+        .iter()
+        .find_map(|item| summary_value(&item.summary, "trace"));
+    let trace_report = featured_trace_id
+        .as_deref()
+        .map(|trace_id| ledger.trace_report(trace_id))
+        .transpose()?;
+    let observations = ledger.observations_report(None, featured_trace_id.as_deref())?;
+    let dashboard = render_dashboard(&usage, &decisions, trace_report.as_ref(), &observations);
+    evaluate_scenario_assertions(
+        &scenario,
+        &replay_results,
+        &usage,
+        &decisions,
+        &trace_reports,
+        &dashboard,
+    )?;
+    let dashboard_path = output_dir.join("noether-dashboard.html");
+    fs::write(&dashboard_path, dashboard).await?;
+
+    Ok(ScenarioArtifacts {
+        name: scenario_name,
+        output_dir,
+        db_path,
+        usage_report_path,
+        decisions_report_path,
+        dashboard_path,
+        trace_report_paths,
+    })
+}
+
+async fn load_scenario_file(path: &Path) -> Result<ScenarioFile, NoetError> {
+    let bytes = fs::read(path).await?;
+    let scenario: ScenarioFile = serde_yaml::from_slice(&bytes)?;
+    validate_scenario(&scenario)?;
+    Ok(scenario)
+}
+
+async fn load_simulation_file(path: &Path) -> Result<SimulationFile, NoetError> {
+    let bytes = fs::read(path).await?;
+    let simulation: SimulationFile = serde_yaml::from_slice(&bytes)?;
+    validate_simulation(&simulation)?;
+    Ok(simulation)
+}
+
+fn replay_scenario_request(
+    ledger: &mut BudgetLedger,
+    scenario: &ScenarioFile,
+    request: &ScenarioRequest,
+    session_id: &str,
+) -> Result<ScenarioReplayRequestResult, NoetError> {
+    let mut authorize = request.authorize.clone();
+    authorize.entities = merged_entities(&scenario.entities, &authorize.entities);
+
+    let metadata = &mut authorize.metadata;
+    metadata
+        .entry("request_id".to_owned())
+        .or_insert_with(|| Value::String(request.id.clone()));
+    metadata
+        .entry("trace_id".to_owned())
+        .or_insert_with(|| Value::String(request.id.clone()));
+    metadata
+        .entry("session_id".to_owned())
+        .or_insert_with(|| Value::String(session_id.to_owned()));
+    metadata
+        .entry("source".to_owned())
+        .or_insert_with(|| Value::String("scenario".to_owned()));
+
+    let trace_id = metadata
+        .get("trace_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| request.id.clone());
+    let decision = ledger.try_authorize(Some(&scenario.policy), &authorize)?;
+
+    if decision.outcome != crate::contract::DecisionOutcome::Deny {
+        if let Some(model_choice) = &request.model_choice {
+            let mut payload = BTreeMap::new();
+            if let Some(provider) = model_choice
+                .provider
+                .clone()
+                .or_else(|| authorize.provider.clone())
+            {
+                payload.insert("provider".to_owned(), Value::String(provider));
+            }
+            if let Some(model) = model_choice
+                .model
+                .clone()
+                .or_else(|| authorize.model.clone())
+            {
+                payload.insert("model".to_owned(), Value::String(model));
+            }
+            payload.insert("request_id".to_owned(), Value::String(request.id.clone()));
+            payload.insert("source".to_owned(), Value::String("scenario".to_owned()));
+            ledger.record_event(TraceEvent {
+                id: None,
+                trace_id: Some(trace_id.clone()),
+                occurred_at: None,
+                kind: "pi.provider_call.started".to_owned(),
+                payload: serde_json::to_value(payload)?,
+            })?;
+        }
+
+        for tool in &request.tool_activity {
+            let mut payload = serde_json::to_value(tool)?;
+            let payload_map = payload.as_object_mut().ok_or_else(|| {
+                NoetError::InvalidConfig("scenario tool payload must be an object".to_owned())
+            })?;
+            payload_map.insert("request_id".to_owned(), Value::String(request.id.clone()));
+            payload_map.insert("source".to_owned(), Value::String("scenario".to_owned()));
+            ledger.record_event(TraceEvent {
+                id: None,
+                trace_id: Some(trace_id.clone()),
+                occurred_at: None,
+                kind: "tool.observed".to_owned(),
+                payload,
+            })?;
+        }
+
+        if let Some(finalize) = &request.finalize
+            && let Some(reservation) = &decision.reservation
+        {
+            let payload = scenario_finalize_payload(request, finalize, &trace_id);
+            ledger.finalize(&reservation.id, &payload)?;
+        }
+    }
+
+    Ok(ScenarioReplayRequestResult {
+        request_id: request.id.clone(),
+        trace_id,
+        decision,
+    })
+}
+
+fn scenario_finalize_payload(
+    request: &ScenarioRequest,
+    finalize: &crate::scenario::ScenarioFinalizeStep,
+    trace_id: &str,
+) -> FinalizeReservation {
+    let mut usage = finalize.usage.clone();
+    if let Some(usage) = &mut usage
+        && let Some(model_choice) = &request.model_choice
+    {
+        if usage.provider.is_none() {
+            usage.provider = model_choice.provider.clone();
+        }
+        if usage.model.is_none() {
+            usage.model = model_choice.model.clone();
+        }
+    }
+
+    let mut metadata = finalize.metadata.clone();
+    metadata
+        .entry("request_id".to_owned())
+        .or_insert_with(|| Value::String(request.id.clone()));
+    metadata
+        .entry("trace_id".to_owned())
+        .or_insert_with(|| Value::String(trace_id.to_owned()));
+    metadata
+        .entry("source".to_owned())
+        .or_insert_with(|| Value::String("scenario".to_owned()));
+
+    FinalizeReservation {
+        reservation_id: None,
+        usage,
+        actual_cost_usd: finalize.actual_cost_usd,
+        metadata,
+    }
+}
+
+fn merged_entities(global: &[String], local: &[String]) -> Vec<String> {
+    let mut entities = Vec::new();
+    for entity in global.iter().chain(local) {
+        if !entities.contains(entity) {
+            entities.push(entity.clone());
+        }
+    }
+    entities
+}
+
+fn scenario_output_slug(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scenario");
+    let trimmed = file_name
+        .strip_suffix(".yaml")
+        .or_else(|| file_name.strip_suffix(".yml"))
+        .unwrap_or(file_name)
+        .strip_suffix(".noet")
+        .unwrap_or(file_name);
+    sanitize_path_component(trimmed)
+}
+
+fn simulation_output_slug(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("simulation");
+    let trimmed = file_name
+        .strip_suffix(".yaml")
+        .or_else(|| file_name.strip_suffix(".yml"))
+        .unwrap_or(file_name)
+        .strip_suffix(".noet")
+        .unwrap_or(file_name);
+    sanitize_path_component(trimmed)
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "scenario".to_owned()
+    } else {
+        sanitized.to_owned()
+    }
+}
+
+async fn write_json_file<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), NoetError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?).await?;
+    Ok(())
+}
+
+fn evaluate_scenario_assertions(
+    scenario: &ScenarioFile,
+    replay_results: &[ScenarioReplayRequestResult],
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+    trace_reports: &BTreeMap<String, TraceReport>,
+    dashboard: &str,
+) -> Result<(), NoetError> {
+    let decision_reports: BTreeMap<String, &TraceReportItem> = decisions
+        .iter()
+        .filter_map(|item| summary_value(&item.summary, "request").map(|request_id| (request_id, item)))
+        .collect();
+    let replay_by_request: BTreeMap<&str, &ScenarioReplayRequestResult> = replay_results
+        .iter()
+        .map(|result| (result.request_id.as_str(), result))
+        .collect();
+    let usage_json = serde_json::to_value(usage)?;
+    let decisions_json = serde_json::to_value(decisions)?;
+    let report_text = scenario_report_text(usage, decisions, trace_reports);
+    let mut failures = Vec::new();
+
+    for assertion in &scenario.assertions {
+        evaluate_scenario_assertion(
+            assertion,
+            None,
+            &decision_reports,
+            &usage_json,
+            &decisions_json,
+            trace_reports,
+            &report_text,
+            dashboard,
+            &mut failures,
+        );
+    }
+
+    for request in &scenario.requests {
+        if let Some(expectation) = &request.denial {
+            match replay_by_request.get(request.id.as_str()) {
+                Some(result) => {
+                    if result.decision.outcome != crate::contract::DecisionOutcome::Deny {
+                        failures.push(format!(
+                            "request {} expected denial but outcome was {:?}",
+                            request.id, result.decision.outcome
+                        ));
+                    }
+                    if let Some(rule_id) = expectation.rule_id.as_deref()
+                        && !result
+                            .decision
+                            .explanations
+                            .iter()
+                            .any(|explanation| explanation.rule_id == rule_id)
+                    {
+                        failures.push(format!(
+                            "request {} expected denial rule {rule_id}",
+                            request.id
+                        ));
+                    }
+                    if let Some(reason) = expectation.reason_contains.as_deref()
+                        && !result
+                            .decision
+                            .explanations
+                            .iter()
+                            .any(|explanation| explanation.reason.contains(reason))
+                    {
+                        failures.push(format!(
+                            "request {} expected denial reason containing {reason}",
+                            request.id
+                        ));
+                    }
+                }
+                None => failures.push(format!(
+                    "request {} is missing replay data for denial expectation",
+                    request.id
+                )),
+            }
+        }
+
+        if let Some(expectation) = &request.fallback {
+            evaluate_fallback_expectation(
+                request.id.as_str(),
+                expectation,
+                &decision_reports,
+                &mut failures,
+            );
+        }
+
+        for assertion in &request.assertions {
+            evaluate_scenario_assertion(
+                assertion,
+                Some(request.id.as_str()),
+                &decision_reports,
+                &usage_json,
+                &decisions_json,
+                trace_reports,
+                &report_text,
+                dashboard,
+                &mut failures,
+            );
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(NoetError::InvalidConfig(format!(
+            "scenario assertions failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+fn scenario_report_text(
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+    trace_reports: &BTreeMap<String, TraceReport>,
+) -> String {
+    let mut sections = vec![
+        render_usage_report_lines(usage).join("\n"),
+        render_items_lines(decisions).join("\n"),
+    ];
+    for trace in trace_reports.values() {
+        sections.push(render_trace_report_lines(trace).join("\n"));
+    }
+    sections.join("\n")
+}
+
+fn evaluate_scenario_assertion(
+    assertion: &ScenarioAssertion,
+    default_request_id: Option<&str>,
+    decision_reports: &BTreeMap<String, &TraceReportItem>,
+    usage_json: &Value,
+    decisions_json: &Value,
+    trace_reports: &BTreeMap<String, TraceReport>,
+    report_text: &str,
+    dashboard: &str,
+    failures: &mut Vec<String>,
+) {
+    match assertion {
+        ScenarioAssertion::DecisionOutcome {
+            request_id,
+            outcome,
+        } => match decision_reports.get(request_id.as_str()) {
+            Some(item) if decision_matches_outcome(item.kind.as_str(), *outcome) => {}
+            Some(item) => failures.push(format!(
+                "request {request_id} expected outcome {:?} but report kind was {}",
+                outcome, item.kind
+            )),
+            None => failures.push(format!("missing decision report for request {request_id}")),
+        },
+        ScenarioAssertion::SelectedBudget {
+            request_id,
+            budget_id,
+        } => match decision_reports.get(request_id.as_str()) {
+            Some(item)
+                if item
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.selected_budget_id.as_deref())
+                    == Some(budget_id.as_str()) => {}
+            Some(item) => failures.push(format!(
+                "request {request_id} expected selected budget {budget_id} but saw {:?}",
+                item.routing
+                    .as_ref()
+                    .and_then(|routing| routing.selected_budget_id.as_deref())
+            )),
+            None => failures.push(format!("missing decision report for request {request_id}")),
+        },
+        ScenarioAssertion::Denied { request_id } => match decision_reports.get(request_id.as_str()) {
+            Some(item)
+                if decision_matches_outcome(
+                    item.kind.as_str(),
+                    crate::contract::DecisionOutcome::Deny,
+                ) => {}
+            Some(item) => failures.push(format!(
+                "request {request_id} expected deny outcome but report kind was {}",
+                item.kind
+            )),
+            None => failures.push(format!("missing decision report for request {request_id}")),
+        },
+        ScenarioAssertion::TotalCostUsd { amount_usd } => {
+            if (usage_json["total_cost_usd"].as_f64().unwrap_or_default() - amount_usd).abs() > 1e-9
+            {
+                failures.push(format!(
+                    "expected total_cost_usd {:.6} but saw {:.6}",
+                    amount_usd,
+                    usage_json["total_cost_usd"].as_f64().unwrap_or_default()
+                ));
+            }
+        }
+        ScenarioAssertion::GuardHit {
+            request_id,
+            rule_id,
+        } => match decision_reports.get(request_id.as_str()) {
+            Some(item)
+                if item
+                    .guard_hits
+                    .as_ref()
+                    .is_some_and(|hits| hits.iter().any(|hit| hit.rule_id == *rule_id)) => {}
+            Some(_) => failures.push(format!(
+                "request {request_id} expected guard hit {rule_id}"
+            )),
+            None => failures.push(format!("missing decision report for request {request_id}")),
+        },
+        ScenarioAssertion::Fallback {
+            request_id,
+            requested_budget_id,
+            selected_budget_id,
+            matched_entity,
+        } => evaluate_fallback_assertion(
+            request_id,
+            requested_budget_id.as_deref(),
+            selected_budget_id.as_deref(),
+            matched_entity.as_deref(),
+            decision_reports,
+            failures,
+        ),
+        ScenarioAssertion::ReportJson {
+            report,
+            request_id,
+            pointer,
+            equals,
+        } => {
+            let actual = report_json_value(
+                *report,
+                request_id.as_deref().or(default_request_id),
+                pointer,
+                usage_json,
+                decisions_json,
+                trace_reports,
+            );
+            match actual {
+                Some(value) if value == *equals => {}
+                Some(value) => failures.push(format!(
+                    "report_json {:?} {} expected {} but saw {}",
+                    report, pointer, equals, value
+                )),
+                None => failures.push(format!(
+                    "report_json {:?} {} did not resolve",
+                    report, pointer
+                )),
+            }
+        }
+        ScenarioAssertion::ReportContains { text } => {
+            if !report_text.contains(text) {
+                failures.push(format!("report output missing {text}"));
+            }
+        }
+        ScenarioAssertion::DashboardContains { text } => {
+            if !dashboard.contains(text) {
+                failures.push(format!("dashboard output missing {text}"));
+            }
+        }
+    }
+}
+
+fn report_json_value(
+    report: ScenarioReportSource,
+    request_id: Option<&str>,
+    pointer: &str,
+    usage_json: &Value,
+    decisions_json: &Value,
+    trace_reports: &BTreeMap<String, TraceReport>,
+) -> Option<Value> {
+    match report {
+        ScenarioReportSource::Usage => usage_json.pointer(pointer).cloned(),
+        ScenarioReportSource::Decisions => decisions_json.pointer(pointer).cloned(),
+        ScenarioReportSource::Trace => request_id
+            .and_then(|request_id| trace_reports.get(request_id))
+            .and_then(|trace| serde_json::to_value(trace).ok())
+            .and_then(|trace_json| trace_json.pointer(pointer).cloned()),
+    }
+}
+
+fn evaluate_fallback_expectation(
+    request_id: &str,
+    expectation: &ScenarioFallbackExpectation,
+    decision_reports: &BTreeMap<String, &TraceReportItem>,
+    failures: &mut Vec<String>,
+) {
+    evaluate_fallback_assertion(
+        request_id,
+        expectation.requested_budget_id.as_deref(),
+        expectation.selected_budget_id.as_deref(),
+        expectation.matched_entity.as_deref(),
+        decision_reports,
+        failures,
+    );
+}
+
+fn evaluate_fallback_assertion(
+    request_id: &str,
+    requested_budget_id: Option<&str>,
+    selected_budget_id: Option<&str>,
+    matched_entity: Option<&str>,
+    decision_reports: &BTreeMap<String, &TraceReportItem>,
+    failures: &mut Vec<String>,
+) {
+    match decision_reports.get(request_id) {
+        Some(item) => {
+            let routing = item.routing.as_ref();
+            if let Some(expected) = requested_budget_id
+                && routing.and_then(|routing| routing.rejected_budget_id.as_deref()) != Some(expected)
+            {
+                failures.push(format!(
+                    "request {request_id} expected fallback from requested budget {expected} but saw {:?}",
+                    routing.and_then(|routing| routing.rejected_budget_id.as_deref())
+                ));
+            }
+            if let Some(expected) = selected_budget_id
+                && routing.and_then(|routing| routing.selected_budget_id.as_deref()) != Some(expected)
+            {
+                failures.push(format!(
+                    "request {request_id} expected fallback selected budget {expected} but saw {:?}",
+                    routing.and_then(|routing| routing.selected_budget_id.as_deref())
+                ));
+            }
+            if let Some(expected) = matched_entity
+                && routing.and_then(|routing| routing.matched_entity.as_deref()) != Some(expected)
+            {
+                failures.push(format!(
+                    "request {request_id} expected fallback matched entity {expected} but saw {:?}",
+                    routing.and_then(|routing| routing.matched_entity.as_deref())
+                ));
+            }
+        }
+        None => failures.push(format!("missing decision report for request {request_id}")),
+    }
+}
+
+fn decision_matches_outcome(kind: &str, outcome: crate::contract::DecisionOutcome) -> bool {
+    match outcome {
+        crate::contract::DecisionOutcome::Allow => kind.ends_with(".allow"),
+        crate::contract::DecisionOutcome::Warn => kind.ends_with(".warn"),
+        crate::contract::DecisionOutcome::Deny => kind.ends_with(".deny"),
+    }
 }
 
 fn render_usage_report_lines(report: &UsageReport) -> Vec<String> {
@@ -520,6 +1275,106 @@ fn render_dashboard(
     lifecycle_guardrails_panel(&mut html, trace);
     timeline_panel(&mut html, trace, observations);
 
+    html.push_str("</main></body></html>");
+    html
+}
+
+fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonReport) -> String {
+    let mut html = String::new();
+    html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    html.push_str("<title>Noether simulation dashboard</title>");
+    html.push_str(
+        "<style>
+        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --blue:#38bdf8; }
+        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:#0f172a; color:var(--text); }
+        main { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
+        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+        .card, .panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; }
+        .card { padding:18px; }
+        .panel { padding:18px; margin-top:16px; }
+        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .value { font-size:30px; font-weight:800; margin-top:6px; }
+        table { width:100%; border-collapse:collapse; }
+        th, td { text-align:left; padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
+        th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        code { color:var(--blue); }
+        </style>",
+    );
+    html.push_str("</head><body><main>");
+    let title = report.name.as_deref().unwrap_or("Simulation comparison");
+    let _ = write!(
+        html,
+        "<h1>{}</h1><p>Seed <code>{}</code> over {} simulated day(s).</p>",
+        escape_html(title),
+        report.seed,
+        report.horizon_days
+    );
+    html.push_str("<section class=\"grid\">");
+    metric_card(
+        &mut html,
+        "Strategies",
+        &report.strategies.len().to_string(),
+        "policy variants compared over identical demand",
+    );
+    metric_card(
+        &mut html,
+        "Total requests",
+        &compact_number(report.total_requests),
+        "synthetic authorize/finalize opportunities",
+    );
+    let highest_spend = report
+        .strategies
+        .iter()
+        .map(|strategy| strategy.total_cost_usd)
+        .fold(0.0_f64, f64::max);
+    metric_card(
+        &mut html,
+        "Highest spend",
+        &format_money(highest_spend),
+        "largest simulated finalized cost among strategies",
+    );
+    html.push_str("</section>");
+
+    html.push_str("<section class=\"panel\"><h2>Strategy comparison</h2><table><thead><tr><th>Strategy</th><th>Spend</th><th>Unused budget</th><th>Denied</th><th>Fallbacks</th><th>Guard hits</th><th>Blocked work</th><th>Runaway prevented</th><th>Adoption</th><th>Fairness</th><th>Carryover</th><th>Exhaustion</th></tr></thead><tbody>");
+    for strategy in &report.strategies {
+        let exhaustion = strategy
+            .exhaustion_day
+            .map(|day| day.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&strategy.id),
+            format_money(strategy.total_cost_usd),
+            format_money(strategy.unused_budget_usd),
+            strategy.denied_requests,
+            strategy.fallback_count,
+            strategy.guard_hit_count,
+            strategy.useful_work_blocked_score,
+            format_money(strategy.runaway_spend_prevented_usd),
+            strategy.adoption_coverage,
+            strategy.fairness_score,
+            format_money(strategy.carryover_liability_usd),
+            escape_html(&exhaustion)
+        );
+    }
+    html.push_str("</tbody></table></section>");
+
+    html.push_str("<section class=\"panel\"><h2>Model mix</h2><table><thead><tr><th>Strategy</th><th>Model</th><th>Requests</th><th>Cost</th></tr></thead><tbody>");
+    for strategy in &report.strategies {
+        for mix in &strategy.model_mix {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&strategy.id),
+                escape_html(&mix.model_id),
+                mix.requests,
+                format_money(mix.total_cost_usd)
+            );
+        }
+    }
+    html.push_str("</tbody></table></section>");
     html.push_str("</main></body></html>");
     html
 }
@@ -986,8 +1841,10 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::ledger::UsageReportRow;
     use chrono::Utc;
+    use tempfile::tempdir;
+
+    use crate::ledger::UsageReportRow;
 
     use super::*;
 
@@ -1342,5 +2199,375 @@ mod tests {
 
         assert_eq!(lines[0], "occurred_at\tkind\tsummary");
         assert!(lines[1].contains("\ttool.observed\tname=bash success=true"));
+    }
+
+    #[test]
+    fn serve_defaults_remain_local_first() {
+        let cli = Cli::try_parse_from(["noet", "serve"]).expect("serve args parse");
+
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.bind.to_string(), "127.0.0.1:4040");
+                assert_eq!(args.fixture_dir, PathBuf::from(".noet/fixtures"));
+                assert_eq!(args.db_path, PathBuf::from(".noet/noether.sqlite"));
+                assert!(args.upstream.is_none());
+                assert!(args.routes.is_none());
+                assert!(args.policy.is_none());
+                assert_eq!(args.decision_mode, DecisionMode::DryRun);
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scenario_run_replays_a_file_into_reports_and_dashboard() {
+        let tempdir = tempdir().expect("tempdir");
+        let scenario_path = tempdir.path().join("local-dev.noet.yaml");
+        let out_dir = tempdir.path().join("artifacts");
+        std::fs::write(
+            &scenario_path,
+            r#"
+version: 1
+name: local developer
+policy:
+  version: 0
+  budgets:
+    - id: project-noether
+      limit_usd: 10
+      eligible:
+        entities: [project:noether]
+entities: [project:noether, user:alice]
+requests:
+  - id: req-1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_tokens: 1200
+    model_choice:
+      provider: openai
+      model: gpt-4.1
+    tool_activity:
+      - name: bash
+        success: true
+        duration_ms: 42
+    finalize:
+      actual_cost_usd: 0.002
+      usage:
+        provider: openai
+        model: gpt-4.1
+        input_tokens: 700
+        output_tokens: 300
+        total_tokens: 1000
+        cost_usd: 0.002
+assertions:
+  - kind: decision_outcome
+    request_id: req-1
+    outcome: allow
+  - kind: selected_budget
+    request_id: req-1
+    budget_id: project-noether
+  - kind: total_cost_usd
+    amount_usd: 0.002
+  - kind: report_json
+    report: usage
+    pointer: /rows/0/model
+    equals: gpt-4.1
+  - kind: report_contains
+    text: selected_budget=project-noether
+  - kind: dashboard_contains
+    text: name=bash success=true
+"#,
+        )
+        .expect("write scenario");
+
+        run_scenario(ScenarioCommand {
+            command: ScenarioSubcommand::Run {
+                path: scenario_path.clone(),
+                out_dir: Some(out_dir.clone()),
+            },
+        })
+        .await
+        .expect("scenario run succeeds");
+
+        let usage_report_path = out_dir.join("usage-report.json");
+        let decisions_report_path = out_dir.join("decisions-report.json");
+        let dashboard_path = out_dir.join("noether-dashboard.html");
+        let trace_report_path = out_dir.join("traces").join("req-1.json");
+        assert!(usage_report_path.exists());
+        assert!(decisions_report_path.exists());
+        assert!(dashboard_path.exists());
+        assert!(trace_report_path.exists());
+
+        let usage_report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&usage_report_path).expect("read usage report"))
+                .expect("usage report json");
+        assert_eq!(usage_report["total_cost_usd"], 0.002);
+        assert_eq!(usage_report["rows"][0]["project"], "noether");
+        assert_eq!(usage_report["rows"][0]["provider"], "openai");
+        assert_eq!(usage_report["rows"][0]["model"], "gpt-4.1");
+
+        let decisions_report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&decisions_report_path).expect("read decisions report"),
+        )
+        .expect("decisions report json");
+        assert_eq!(decisions_report[0]["kind"], "decision.allow");
+        assert!(
+            decisions_report[0]["summary"]
+                .as_str()
+                .expect("decision summary")
+                .contains("selected_budget=project-noether")
+        );
+        assert!(
+            decisions_report[0]["summary"]
+                .as_str()
+                .expect("decision summary")
+                .contains("request=req-1")
+        );
+
+        let trace_report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&trace_report_path).expect("read trace report"))
+                .expect("trace report json");
+        let kinds: Vec<&str> = trace_report["items"]
+            .as_array()
+            .expect("trace items")
+            .iter()
+            .filter_map(|item| item["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"tool.observed"));
+        assert!(kinds.contains(&"usage.finalized"));
+
+        let dashboard = std::fs::read_to_string(&dashboard_path).expect("read dashboard");
+        assert!(dashboard.contains("Noether run dashboard"));
+        assert!(dashboard.contains("selected_budget=project-noether"));
+        assert!(dashboard.contains("name=bash success=true"));
+    }
+
+    #[tokio::test]
+    async fn scenario_run_fails_when_assertions_drift() {
+        let tempdir = tempdir().expect("tempdir");
+        let scenario_path = tempdir.path().join("assertion-drift.noet.yaml");
+        let out_dir = tempdir.path().join("artifacts");
+        std::fs::write(
+            &scenario_path,
+            r#"
+version: 1
+name: drift
+policy:
+  version: 0
+  budgets:
+    - id: project-noether
+      limit_usd: 10
+      eligible:
+        entities: [project:noether]
+requests:
+  - id: req-1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_tokens: 1200
+    finalize:
+      actual_cost_usd: 0.002
+      usage:
+        provider: openai
+        model: gpt-4.1
+        total_tokens: 1000
+        cost_usd: 0.002
+assertions:
+  - kind: report_contains
+    text: selected_budget=wrong-budget
+"#,
+        )
+        .expect("write scenario");
+
+        let error = run_scenario(ScenarioCommand {
+            command: ScenarioSubcommand::Run {
+                path: scenario_path,
+                out_dir: Some(out_dir),
+            },
+        })
+        .await
+        .expect_err("scenario run should fail");
+
+        assert!(error.to_string().contains("scenario assertions failed"));
+        assert!(error.to_string().contains("selected_budget=wrong-budget"));
+    }
+
+    #[tokio::test]
+    async fn scenario_run_supports_fallback_denial_and_guard_hit_assertions() {
+        let tempdir = tempdir().expect("tempdir");
+        let scenario_path = tempdir.path().join("routing-and-guards.noet.yaml");
+        let out_dir = tempdir.path().join("artifacts");
+        std::fs::write(
+            &scenario_path,
+            r#"
+version: 1
+name: routing and guards
+policy:
+  version: 0
+  budgets:
+    - id: project-budget
+      limit_usd: 10
+      eligible:
+        entities: [project:noether]
+    - id: team-budget
+      limit_usd: 20
+      eligible:
+        entities: [team:eng]
+    - id: guard-budget
+      limit_usd: 5
+      eligible:
+        entities: [project:guarded]
+      guards:
+        max_context_tokens:
+          max_tokens: 1000
+          effect: deny
+requests:
+  - id: req-fallback
+    authorize:
+      budget_id: missing-budget
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 0.25
+      entities: [project:noether, team:eng]
+    finalize:
+      actual_cost_usd: 0.25
+      usage:
+        provider: openai
+        model: gpt-4.1
+        total_tokens: 1000
+        cost_usd: 0.25
+    fallback:
+      requested_budget_id: missing-budget
+      selected_budget_id: project-budget
+      matched_entity: project:noether
+  - id: req-guard
+    authorize:
+      project: guarded
+      provider: openai
+      model: gpt-4.1
+      estimated_tokens: 1200
+      entities: [project:guarded]
+    denial:
+      rule_id: guard-budget.max_context_tokens
+      reason_contains: exceed enforced guard max 1000
+assertions:
+  - kind: fallback
+    request_id: req-fallback
+    requested_budget_id: missing-budget
+    selected_budget_id: project-budget
+    matched_entity: project:noether
+  - kind: denied
+    request_id: req-guard
+  - kind: guard_hit
+    request_id: req-guard
+    rule_id: guard-budget.max_context_tokens
+"#,
+        )
+        .expect("write scenario");
+
+        run_scenario(ScenarioCommand {
+            command: ScenarioSubcommand::Run {
+                path: scenario_path,
+                out_dir: Some(out_dir.clone()),
+            },
+        })
+        .await
+        .expect("scenario run succeeds");
+
+        let decisions_report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("decisions-report.json")).expect("read decisions report"),
+        )
+        .expect("decisions report json");
+        assert_eq!(decisions_report.as_array().expect("decision array").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn checked_in_scenario_examples_replay_successfully() {
+        let tempdir = tempdir().expect("tempdir");
+        for example in [
+            "examples/scenarios/local-developer.noet.yaml",
+            "examples/scenarios/team-pooled-budget.noet.yaml",
+            "examples/scenarios/project-budget-fallback.noet.yaml",
+            "examples/scenarios/model-denial-fallback.noet.yaml",
+            "examples/scenarios/runaway-agent-guard.noet.yaml",
+            "examples/scenarios/protected-adoption-pool.noet.yaml",
+        ] {
+            let scenario_path = PathBuf::from(example);
+            let out_dir = tempdir.path().join(
+                scenario_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("scenario"),
+            );
+
+            run_scenario(ScenarioCommand {
+                command: ScenarioSubcommand::Run {
+                    path: scenario_path.clone(),
+                    out_dir: Some(out_dir.clone()),
+                },
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{} should replay: {}", scenario_path.display(), error));
+
+            assert!(
+                out_dir.join("usage-report.json").exists(),
+                "{} missing usage report",
+                scenario_path.display()
+            );
+            assert!(
+                out_dir.join("decisions-report.json").exists(),
+                "{} missing decisions report",
+                scenario_path.display()
+            );
+            assert!(
+                out_dir.join("noether-dashboard.html").exists(),
+                "{} missing dashboard",
+                scenario_path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_command_compares_checked_in_strategies() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("simulation-output");
+
+        run_simulate(SimulateCommand {
+            path: PathBuf::from("examples/simulations/synthetic-company.noet.yaml"),
+            out_dir: Some(out_dir.clone()),
+        })
+        .await
+        .expect("simulation run succeeds");
+
+        let report_path = out_dir.join("simulation-report.json");
+        let dashboard_path = out_dir.join("simulation-dashboard.html");
+        assert!(report_path.exists());
+        assert!(dashboard_path.exists());
+        assert!(out_dir
+            .join("strategies/pooled-caps/noether-dashboard.html")
+            .exists());
+        assert!(out_dir
+            .join("strategies/protected-adoption/noether-dashboard.html")
+            .exists());
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("read report"))
+                .expect("report json");
+        assert!(report["total_requests"].as_u64().unwrap_or_default() > 0);
+        let strategies = report["strategies"].as_array().expect("strategies");
+        assert_eq!(strategies.len(), 2);
+        for strategy in strategies {
+            assert!(strategy.get("unused_budget_usd").is_some());
+            assert!(strategy.get("useful_work_blocked_score").is_some());
+            assert!(strategy.get("runaway_spend_prevented_usd").is_some());
+            assert!(strategy.get("adoption_coverage").is_some());
+            assert!(strategy.get("fairness_score").is_some());
+            assert!(strategy.get("model_mix").is_some());
+            assert!(strategy.get("carryover_liability_usd").is_some());
+            assert!(strategy.get("exhaustion_day").is_some());
+        }
     }
 }

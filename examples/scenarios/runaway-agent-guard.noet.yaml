@@ -1,0 +1,35 @@
+version: 1
+name: runaway agent guard
+policy:
+  version: 0
+  budgets:
+    - id: runaway-budget
+      limit_usd: 50
+      eligible:
+        entities: [project:runaway]
+      guards:
+        max_estimated_request_cost_usd:
+          max_usd: 1.0
+          effect: deny
+requests:
+  - id: req-1
+    authorize:
+      subject: user:loop
+      project: runaway
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 2.5
+      entities: [project:runaway, user:loop]
+    denial:
+      rule_id: runaway-budget.max_estimated_request_cost_usd
+      reason_contains: exceeds enforced guard max
+assertions:
+  - kind: denied
+    request_id: req-1
+  - kind: guard_hit
+    request_id: req-1
+    rule_id: runaway-budget.max_estimated_request_cost_usd
+  - kind: report_contains
+    text: guard_hits=runaway-budget.max_estimated_request_cost_usd
+  - kind: dashboard_contains
+    text: Risky runs

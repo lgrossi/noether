@@ -1,0 +1,76 @@
+version: 1
+name: team pooled budget
+policy:
+  version: 0
+  budgets:
+    - id: team-pooled-ai
+      limit_usd: 100
+      eligible:
+        entities: [team:platform]
+entities: [team:platform]
+requests:
+  - id: req-1
+    authorize:
+      subject: user:alice
+      project: service-a
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 0.0015
+      entities: [project:service-a, user:alice]
+    model_choice:
+      provider: openai
+      model: gpt-4.1
+    tool_activity:
+      - name: bash
+        success: true
+        duration_ms: 35
+    finalize:
+      actual_cost_usd: 0.0013
+      usage:
+        provider: openai
+        model: gpt-4.1
+        input_tokens: 500
+        output_tokens: 150
+        total_tokens: 650
+        cost_usd: 0.0013
+  - id: req-2
+    authorize:
+      subject: user:bob
+      project: service-b
+      provider: openai
+      model: gpt-4.1-mini
+      estimated_cost_usd: 0.0024
+      entities: [project:service-b, user:bob]
+    model_choice:
+      provider: openai
+      model: gpt-4.1-mini
+    tool_activity:
+      - name: rg
+        success: true
+        duration_ms: 18
+    finalize:
+      actual_cost_usd: 0.0022
+      usage:
+        provider: openai
+        model: gpt-4.1-mini
+        input_tokens: 800
+        output_tokens: 220
+        total_tokens: 1020
+        cost_usd: 0.0022
+assertions:
+  - kind: selected_budget
+    request_id: req-1
+    budget_id: team-pooled-ai
+  - kind: selected_budget
+    request_id: req-2
+    budget_id: team-pooled-ai
+  - kind: total_cost_usd
+    amount_usd: 0.0035
+  - kind: report_json
+    report: usage
+    pointer: /rows/0/project
+    equals: service-b
+  - kind: report_contains
+    text: selected_budget=team-pooled-ai
+  - kind: dashboard_contains
+    text: Where the spend went

@@ -88,6 +88,14 @@ pub struct ScenarioFallbackExpectation {
     pub matched_entity: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioReportSource {
+    Usage,
+    Decisions,
+    Trace,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScenarioAssertion {
@@ -102,6 +110,29 @@ pub enum ScenarioAssertion {
     Denied {
         request_id: String,
     },
+    TotalCostUsd {
+        amount_usd: f64,
+    },
+    GuardHit {
+        request_id: String,
+        rule_id: String,
+    },
+    Fallback {
+        request_id: String,
+        #[serde(default)]
+        requested_budget_id: Option<String>,
+        #[serde(default)]
+        selected_budget_id: Option<String>,
+        #[serde(default)]
+        matched_entity: Option<String>,
+    },
+    ReportJson {
+        report: ScenarioReportSource,
+        #[serde(default)]
+        request_id: Option<String>,
+        pointer: String,
+        equals: Value,
+    },
     ReportContains {
         text: String,
     },
@@ -112,13 +143,13 @@ pub enum ScenarioAssertion {
 
 pub fn validate_scenario(file: &ScenarioFile) -> Result<(), NoetError> {
     let mut errors = Vec::new();
+    let mut request_ids = BTreeSet::new();
     if file.version != 1 {
         errors.push(format!("scenario version must be 1, got {}", file.version));
     }
     if let Err(error) = validate_policy(&file.policy) {
         errors.push(format!("scenario policy invalid: {error}"));
     }
-    let mut request_ids = BTreeSet::new();
     for request in &file.requests {
         if request.id.trim().is_empty() {
             errors.push("scenario request id must not be empty".to_owned());
@@ -143,10 +174,85 @@ pub fn validate_scenario(file: &ScenarioFile) -> Result<(), NoetError> {
             let _ = tool;
         }
     }
+    for request in &file.requests {
+        validate_assertions(
+            &request.assertions,
+            Some(request.id.as_str()),
+            &request_ids,
+            &mut errors,
+        );
+    }
+    validate_assertions(&file.assertions, None, &request_ids, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
         Err(NoetError::InvalidConfig(errors.join("; ")))
+    }
+}
+
+fn validate_assertions(
+    assertions: &[ScenarioAssertion],
+    enclosing_request_id: Option<&str>,
+    request_ids: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    for assertion in assertions {
+        if let Some(request_id) = assertion_request_id(assertion)
+            && !request_ids.contains(request_id)
+        {
+            errors.push(format!(
+                "scenario assertion references unknown request id {request_id}"
+            ));
+        }
+        if let ScenarioAssertion::ReportJson {
+            report,
+            request_id,
+            pointer,
+            ..
+        } = assertion
+        {
+            if pointer.is_empty() || !pointer.starts_with('/') {
+                errors.push(format!(
+                    "scenario report_json pointer must start with /, got {pointer}"
+                ));
+            }
+            match report {
+                ScenarioReportSource::Trace => {
+                    if request_id.is_none() && enclosing_request_id.is_none() {
+                        errors.push(
+                            "scenario trace report_json assertion requires request_id".to_owned(),
+                        );
+                    }
+                }
+                ScenarioReportSource::Usage | ScenarioReportSource::Decisions => {
+                    if request_id.is_some() {
+                        errors.push(
+                            "scenario usage/decisions report_json assertions must not set request_id"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn assertion_request_id(assertion: &ScenarioAssertion) -> Option<&str> {
+    match assertion {
+        ScenarioAssertion::DecisionOutcome { request_id, .. }
+        | ScenarioAssertion::SelectedBudget { request_id, .. }
+        | ScenarioAssertion::Denied { request_id }
+        | ScenarioAssertion::GuardHit { request_id, .. }
+        | ScenarioAssertion::Fallback { request_id, .. } => Some(request_id.as_str()),
+        ScenarioAssertion::ReportJson {
+            report: ScenarioReportSource::Trace,
+            request_id,
+            ..
+        } => request_id.as_deref(),
+        ScenarioAssertion::TotalCostUsd { .. }
+        | ScenarioAssertion::ReportJson { .. }
+        | ScenarioAssertion::ReportContains { .. }
+        | ScenarioAssertion::DashboardContains { .. } => None,
     }
 }
 
@@ -192,6 +298,12 @@ requests:
       - kind: decision_outcome
         request_id: req-1
         outcome: allow
+      - kind: total_cost_usd
+        amount_usd: 0.002
+      - kind: report_json
+        report: usage
+        pointer: /rows/0/model
+        equals: gpt-4.1
       - kind: report_contains
         text: selected_budget=project-noether
 "#,
@@ -224,6 +336,14 @@ requests:
       project: noether
     tool_activity:
       - name: ""
+assertions:
+  - kind: selected_budget
+    request_id: missing
+    budget_id: project-noether
+  - kind: report_json
+    report: trace
+    pointer: /items/0/kind
+    equals: decision.allow
 "#,
         )
         .expect("scenario parses");
@@ -234,5 +354,7 @@ requests:
         assert!(message.contains("duplicate scenario request id req-1"));
         assert!(message.contains("cannot declare both denial and finalize"));
         assert!(message.contains("tool activity with empty name"));
+        assert!(message.contains("references unknown request id missing"));
+        assert!(message.contains("trace report_json assertion requires request_id"));
     }
 }
