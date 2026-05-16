@@ -10,6 +10,8 @@ const EXTENSION_NAME = "noether-pi";
 const DEFAULT_FAIL_MODE = "fail_open";
 const DEFAULT_AUTHORIZE_TIMEOUT_MS = 1_000;
 const DEFAULT_QUEUE_MAX_ITEMS = 100;
+const DEFAULT_DELIVERY_TIMEOUT_MS = 1_000;
+const DEFAULT_DELIVERY_MAX_ATTEMPTS = 3;
 
 type FailMode = "fail_open" | "fail_closed";
 
@@ -507,12 +509,7 @@ function buildTraceEvent(kind: string, payload: Record<string, unknown>, attribu
 }
 
 async function postEvent(noetherUrl: string, event: unknown, signal?: AbortSignal): Promise<void> {
-	await fetch(`${noetherUrl}/v1/events`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(event),
-		signal,
-	});
+	await postJsonWithRetry(`${noetherUrl}/v1/events`, event, DEFAULT_DELIVERY_TIMEOUT_MS, DEFAULT_DELIVERY_MAX_ATTEMPTS, signal);
 }
 
 async function finalizeReservation(
@@ -521,10 +518,9 @@ async function finalizeReservation(
 	usage: Usage,
 	activeRequest: ActiveRequest,
 ): Promise<void> {
-	await fetch(`${noetherUrl}/v1/reservations/${encodeURIComponent(reservationId)}/finalize`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
+	await postJsonWithRetry(
+		`${noetherUrl}/v1/reservations/${encodeURIComponent(reservationId)}/finalize`,
+		{
 			reservation_id: reservationId,
 			usage,
 			actual_cost_usd: usage.cost_usd,
@@ -544,8 +540,64 @@ async function finalizeReservation(
 					cache_write_cost_usd: usage.cache_write_cost_usd,
 				}),
 			},
-		}),
-	});
+		},
+		DEFAULT_DELIVERY_TIMEOUT_MS,
+		DEFAULT_DELIVERY_MAX_ATTEMPTS,
+	);
+}
+
+async function postJsonWithRetry(
+	url: string,
+	body: unknown,
+	timeoutMs: number,
+	maxAttempts: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			await postJson(url, body, timeoutMs, signal);
+			return;
+		} catch (error) {
+			lastError = error;
+			if (attempt < maxAttempts) {
+				await delay(25 * attempt);
+			}
+		}
+	}
+	throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function postJson(url: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+	const controller = new AbortController();
+	const abortFromParent = () => controller.abort(signal?.reason);
+	if (signal) {
+		if (signal.aborted) {
+			controller.abort(signal.reason);
+		} else {
+			signal.addEventListener("abort", abortFromParent, { once: true });
+		}
+	}
+	const timeout = setTimeout(
+		() => controller.abort(new Error(`Noether delivery timed out after ${timeoutMs}ms`)),
+		timeoutMs,
+	);
+	try {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			throw new Error(`Noether delivery returned ${response.status}`);
+		}
+	} finally {
+		clearTimeout(timeout);
+		if (signal) {
+			signal.removeEventListener("abort", abortFromParent);
+		}
+	}
 }
 
 export function extractUsage(message: unknown): Usage | undefined {
@@ -575,6 +627,10 @@ function makeTraceId(): string {
 		return globalThis.crypto.randomUUID();
 	}
 	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function delay(ms = 0): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 type QueuePriority = 1 | 2 | 3 | 4 | 5 | 6;
@@ -776,7 +832,30 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	): void {
 		attributionCounts[attribution.status] += 1;
 		const event = buildTraceEvent(kind, payload, attribution);
-		delivery.enqueue(priority, () => postEvent(config.noetherUrl, event));
+		delivery.enqueue(priority, async () => {
+			try {
+				await postEvent(config.noetherUrl, event);
+			} catch (error) {
+				if (kind === "pi.delivery_error") {
+					return;
+				}
+				try {
+					await postEvent(
+						config.noetherUrl,
+						buildTraceEvent(
+							"pi.delivery_error",
+							{
+								failed_kind: kind,
+								error: error instanceof Error ? error.message : String(error),
+							},
+							attribution,
+						),
+					);
+				} catch {
+					// Best-effort surfacing only.
+				}
+			}
+		});
 	}
 
 	function enqueueHookLog(

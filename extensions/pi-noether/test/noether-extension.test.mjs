@@ -437,6 +437,112 @@ async function waitFor(predicate, label) {
 
 {
 	const calls = [];
+	let authorizeCount = 0;
+	let authorizeEventAttempts = 0;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		const body = init.body && JSON.parse(init.body);
+		calls.push({ url: String(url), body });
+		if (String(url).endsWith("/v1/authorize")) {
+			authorizeCount += 1;
+			return Response.json({
+				decision_id: `dec_retry_${authorizeCount}`,
+				outcome: "allow",
+				reservation: { id: `res_retry_${authorizeCount}` },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		if (String(url).endsWith("/v1/events") && body.kind === "pi.authorize") {
+			authorizeEventAttempts += 1;
+			if (authorizeEventAttempts < 3) {
+				return new Response("{}", { status: 503, headers: { "content-type": "application/json" } });
+			}
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		let aborted = false;
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, false);
+		await waitFor(() => authorizeEventAttempts === 3, "bounded authorize event retries");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		const body = init.body && JSON.parse(init.body);
+		calls.push({ url: String(url), body });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_delivery_error",
+				outcome: "allow",
+				reservation: { id: "res_delivery_error" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		if (String(url).endsWith("/v1/events") && body.kind === "pi.authorize") {
+			return new Response("{}", { status: 503, headers: { "content-type": "application/json" } });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		let aborted = false;
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, false);
+		await waitFor(() => calls.some((call) => call.body.kind === "pi.delivery_error"), "delivery error event");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init) => {
 		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
