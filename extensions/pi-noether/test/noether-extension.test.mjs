@@ -222,6 +222,49 @@ async function waitFor(predicate, label) {
 
 {
 	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_allow_matrix",
+				outcome: "allow",
+				reservation: { id: "res_allow_matrix" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init) => {
 		if (String(url).endsWith("/v1/authorize")) {
 			return new Promise((_, reject) => {
@@ -307,6 +350,86 @@ async function waitFor(predicate, label) {
 
 		assert.equal(returned, true);
 		assert.equal(aborted, true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			throw new Error("sidecar unavailable");
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		let aborted = false;
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, false);
+		await waitFor(() => calls.some((call) => call.body.kind === "pi.authorize_error"), "authorize error event");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			throw new Error("sidecar unavailable");
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_closed",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		let aborted = false;
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, true);
+		await waitFor(() => calls.some((call) => call.body.kind === "pi.authorize_error"), "authorize error event");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
