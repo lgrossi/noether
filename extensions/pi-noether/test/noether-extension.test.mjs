@@ -64,6 +64,8 @@ async function waitFor(predicate, label) {
 
 	assert.equal(request.subject, "user@example.test");
 	assert.equal(request.project, "noether");
+	assert.equal(request.budget_id, undefined);
+	assert.equal(request.entities, undefined);
 	assert.equal(request.provider, "openai-codex");
 	assert.equal(request.model, "gpt-5.5");
 	assert.equal(request.estimated_tokens, 1234);
@@ -72,6 +74,21 @@ async function waitFor(predicate, label) {
 	assert.deepEqual(request.metadata.payload_summary.instructions, { type: "string", length: 21 });
 	assert.equal(JSON.stringify(request).includes("secret prompt"), false);
 	assert.equal(JSON.stringify(request).includes("private system prompt"), false);
+}
+
+{
+	const config = extension.extensionConfig({
+		NOET_URL: "http://127.0.0.1:4040/",
+		NOET_PI_PROJECT: "noether",
+		NOET_PI_SUBJECT: "user:alice",
+		NOET_PI_BUDGET_ID: "project-noether",
+		NOET_PI_ENTITIES: " project:noether, user:alice, ,",
+	});
+	const request = extension.buildAuthorizeRequest({ payload: { model: "local" } }, fakeContext(), config);
+
+	assert.equal(config.noetherUrl, "http://127.0.0.1:4040");
+	assert.equal(request.budget_id, "project-noether");
+	assert.deepEqual(request.entities, ["project:noether", "user:alice"]);
 }
 
 {

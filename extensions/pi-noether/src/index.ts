@@ -29,6 +29,8 @@ type NoetherConfig = {
 	noetherUrl: string;
 	project?: string;
 	subject?: string;
+	budgetId?: string;
+	entities?: string[];
 	failMode: FailMode;
 	includeBody: boolean;
 	version: string;
@@ -100,6 +102,8 @@ export function extensionConfig(env: Record<string, string | undefined> = proces
 		noetherUrl: stripTrailingSlash(env.NOET_URL || DEFAULT_NOETHER_URL),
 		project: emptyToUndefined(env.NOET_PI_PROJECT),
 		subject: emptyToUndefined(env.NOET_PI_SUBJECT),
+		budgetId: emptyToUndefined(env.NOET_PI_BUDGET_ID),
+		entities: parseEntities(env.NOET_PI_ENTITIES),
 		failMode: env.NOET_PI_FAIL_MODE === "fail_closed" ? "fail_closed" : DEFAULT_FAIL_MODE,
 		includeBody: env.NOET_PI_INCLUDE_BODY === "1" || env.NOET_PI_INCLUDE_BODY === "true",
 		version: env.NOET_PI_EXTENSION_VERSION || "dev",
@@ -124,6 +128,17 @@ function positiveInteger(value: string | undefined): number | undefined {
 	}
 	const parsed = Number.parseInt(value, 10);
 	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function parseEntities(value: string | undefined): string[] | undefined {
+	if (!value) {
+		return undefined;
+	}
+	const entities = value
+		.split(",")
+		.map((entity) => entity.trim())
+		.filter((entity) => entity.length > 0);
+	return entities.length > 0 ? entities : undefined;
 }
 
 export function buildAuthorizeRequest(
@@ -156,6 +171,8 @@ export function buildAuthorizeRequest(
 	};
 
 	return {
+		budget_id: config.budgetId,
+		entities: config.entities && config.entities.length > 0 ? config.entities : undefined,
 		subject: config.subject,
 		project: config.project,
 		provider,

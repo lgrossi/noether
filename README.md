@@ -159,6 +159,8 @@ Run Pi with the extension:
 NOET_URL=http://127.0.0.1:4040 \
 NOET_PI_PROJECT=noether \
 NOET_PI_SUBJECT=user:local \
+NOET_PI_BUDGET_ID=project-noether \
+NOET_PI_ENTITIES=project:noether,user:local \
 NOET_PI_FAIL_MODE=fail_open \
 pi --extension "$PWD/extensions/pi-noether"
 ```

@@ -136,6 +136,8 @@ Noether authorization request:
 
 ```json
 {
+  "budget_id": "project-noether",
+  "entities": ["project:noether", "user:demo"],
   "subject": "user:demo",
   "project": "noether",
   "provider": "openai-codex",
@@ -375,6 +377,8 @@ Configure the extension with environment variables:
 | `NOET_URL` | `http://127.0.0.1:4040` | Local Noether API URL. |
 | `NOET_PI_PROJECT` | unset | Project metadata sent to `/v1/authorize`. |
 | `NOET_PI_SUBJECT` | unset | Subject/user metadata sent to `/v1/authorize`. |
+| `NOET_PI_BUDGET_ID` | unset | Explicit budget id sent to `/v1/authorize`. |
+| `NOET_PI_ENTITIES` | unset | Comma-separated trusted entities such as `project:noether,user:local`. |
 | `NOET_PI_FAIL_MODE` | `fail_open` | Use `fail_closed` to abort provider sends when Noether is unavailable. |
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |

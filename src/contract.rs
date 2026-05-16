@@ -15,6 +15,10 @@ pub enum DecisionMode {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuthorizeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
@@ -214,4 +218,63 @@ fn default_warn_at_fraction() -> f64 {
 
 fn default_window_seconds() -> i64 {
     86_400
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_request_accepts_legacy_shape_without_budget_or_entities() {
+        let request: AuthorizeRequest = serde_json::from_value(serde_json::json!({
+            "subject": "user:alice",
+            "project": "noether",
+            "provider": "openai",
+            "model": "gpt-example",
+            "estimated_cost_usd": 0.01,
+            "metadata": { "trace_id": "trace-1" }
+        }))
+        .expect("legacy request");
+
+        assert_eq!(request.budget_id, None);
+        assert!(request.entities.is_empty());
+        assert_eq!(request.project.as_deref(), Some("noether"));
+    }
+
+    #[test]
+    fn authorize_request_accepts_budget_and_entities() {
+        let request: AuthorizeRequest = serde_json::from_value(serde_json::json!({
+            "budget_id": "project-noether",
+            "entities": ["project:noether", "user:alice"],
+            "metadata": { "trace_id": "trace-1" }
+        }))
+        .expect("request with attribution");
+
+        assert_eq!(request.budget_id.as_deref(), Some("project-noether"));
+        assert_eq!(request.entities, vec!["project:noether", "user:alice"]);
+    }
+
+    #[test]
+    fn authorize_request_rejects_malformed_entities_field() {
+        let error = serde_json::from_value::<AuthorizeRequest>(serde_json::json!({
+            "entities": "project:noether"
+        }))
+        .expect_err("malformed entities should fail closed");
+
+        assert!(error.to_string().contains("invalid type"));
+    }
+
+    #[test]
+    fn malformed_metadata_entities_do_not_populate_contract_entities() {
+        let request: AuthorizeRequest = serde_json::from_value(serde_json::json!({
+            "metadata": { "entities": "project:noether" }
+        }))
+        .expect("metadata remains opaque");
+
+        assert!(request.entities.is_empty());
+        assert_eq!(
+            request.metadata.get("entities"),
+            Some(&Value::String("project:noether".to_owned()))
+        );
+    }
 }

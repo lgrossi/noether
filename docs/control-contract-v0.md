@@ -10,6 +10,8 @@ Request:
 
 ```json
 {
+  "budget_id": "project-noether",
+  "entities": ["project:noether", "user:alice"],
   "subject": "user:alice",
   "project": "noether",
   "provider": "openai",
@@ -19,6 +21,10 @@ Request:
   "metadata": { "session": "local-dev" }
 }
 ```
+
+`budget_id` and `entities` are optional trusted attribution inputs. Older clients can omit them.
+Malformed top-level `entities` values fail request decoding; malformed attribution-like values
+inside `metadata` remain opaque metadata and do not affect routing.
 
 Response:
 

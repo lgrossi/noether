@@ -384,6 +384,19 @@ fn authorize_request_from_capture(request: &CapturedRequest) -> AuthorizeRequest
         .unwrap_or_default();
 
     AuthorizeRequest {
+        budget_id: request
+            .headers
+            .get("x-noet-budget-id")
+            .cloned()
+            .or_else(|| string_at(body, &["budget_id"]))
+            .or_else(|| string_at(body, &["metadata", "budget_id"])),
+        entities: request
+            .headers
+            .get("x-noet-entities")
+            .map(|value| split_entities(value))
+            .or_else(|| entities_at(body, &["entities"]))
+            .or_else(|| entities_at(body, &["metadata", "entities"]))
+            .unwrap_or_default(),
         subject: request
             .headers
             .get("x-noet-subject")
@@ -406,6 +419,31 @@ fn authorize_request_from_capture(request: &CapturedRequest) -> AuthorizeRequest
         estimated_cost_usd: f64_at(body, &["estimated_cost_usd"]),
         metadata,
     }
+}
+
+fn split_entities(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entity| !entity.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn entities_at(value: Option<&Value>, path: &[&str]) -> Option<Vec<String>> {
+    value
+        .and_then(|value| {
+            path.iter()
+                .try_fold(value, |current, key| current.get(*key))
+        })
+        .and_then(Value::as_array)
+        .map(|entities| {
+            entities
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
 fn string_at(value: Option<&Value>, path: &[&str]) -> Option<String> {

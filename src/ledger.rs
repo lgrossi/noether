@@ -1284,6 +1284,8 @@ mod tests {
 
     fn request(cost: f64) -> AuthorizeRequest {
         AuthorizeRequest {
+            budget_id: None,
+            entities: Vec::new(),
             project: Some("noether".to_owned()),
             estimated_cost_usd: Some(cost),
             subject: None,
