@@ -15,9 +15,9 @@ This is different from Noether's normal proxy scenario. For normal app/proxy int
 
 ## Evidence inspected
 
-Pi docs:
+Pi docs from the locally installed `@earendil-works/pi-coding-agent` package:
 
-- `/home/lgrossi/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/README.md`
+- `README.md`
 - `docs/extensions.md`
 - `docs/sdk.md`
 - `docs/models.md`
