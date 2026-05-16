@@ -29,6 +29,8 @@ budgets:
     limit_usd: 1.00
     warn_at_fraction: 0.8
     window_seconds: 86400
+    eligible:
+      entities: [project:noether]
     match:
       project: noether
 policies:
@@ -43,7 +45,11 @@ policies:
 
 The v0 evaluator is an in-memory fixed-window budget:
 
-- matching rules compare optional `subject`, `project`, `provider`, and `model`;
+- `eligible.entities` can match trusted request entities such as `project:noether`,
+  `user:alice`, `team:core`, `org:example`, or `global`;
+- when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
+  `provider`, and `model`;
+- `project` and `subject` fields are also treated as legacy entity sources for compatibility;
 - estimated cost uses `estimated_cost_usd` when present;
 - otherwise estimated cost falls back to `estimated_tokens * 0.000001`;
 - `allow` creates a reservation;

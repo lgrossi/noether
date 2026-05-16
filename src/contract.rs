@@ -171,8 +171,16 @@ pub struct BudgetRule {
     pub warn_at_fraction: f64,
     #[serde(default = "default_window_seconds")]
     pub window_seconds: i64,
+    #[serde(default)]
+    pub eligible: BudgetEligibility,
     #[serde(default, rename = "match")]
     pub rule_match: RuleMatch,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BudgetEligibility {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

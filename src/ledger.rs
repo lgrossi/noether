@@ -13,7 +13,7 @@ use crate::contract::{
     ReservationStatus, ToolEvent, TraceEvent, UsageObservation,
 };
 use crate::error::NoetError;
-use crate::policy::{PolicyFile, matching_policy_explanations, rule_match_matches};
+use crate::policy::{PolicyFile, budget_rule_matches, matching_policy_explanations};
 
 #[derive(Debug, Default)]
 pub struct BudgetLedger {
@@ -457,7 +457,7 @@ impl BudgetLedger {
         let matching_rules: Vec<&BudgetRule> = policy
             .budgets
             .iter()
-            .filter(|rule| rule_match_matches(&rule.rule_match, request))
+            .filter(|rule| budget_rule_matches(rule, request))
             .collect();
 
         if matching_rules.is_empty() {
@@ -510,7 +510,7 @@ impl BudgetLedger {
                 policy
                     .budgets
                     .iter()
-                    .filter(|rule| rule_match_matches(&rule.rule_match, request))
+                    .filter(|rule| budget_rule_matches(rule, request))
                     .collect()
             })
             .unwrap_or_default();
@@ -1273,6 +1273,7 @@ mod tests {
                 limit_usd,
                 warn_at_fraction,
                 window_seconds: 60,
+                eligible: Default::default(),
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
                     ..RuleMatch::default()
