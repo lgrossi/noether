@@ -476,10 +476,35 @@ fn render_dashboard(
         &agent_count.to_string(),
         "provider, message, turn, and agent lifecycle events",
     );
+    if let Some(adoption) = &usage.protected_adoption {
+        metric_card(
+            &mut html,
+            "Protected opportunity",
+            &format_money(adoption.unused_protected_opportunity_usd),
+            "remaining current protected grant this window",
+        );
+        metric_card(
+            &mut html,
+            "Carryover liability",
+            &format_money(adoption.carryover_liability_usd),
+            "carryover reserved for future protected use",
+        );
+        metric_card(
+            &mut html,
+            "Adoption health",
+            &format!(
+                "{} low / {} high",
+                adoption.low_adopters.len(),
+                adoption.high_adopters.len()
+            ),
+            "simple view of underuse versus heavy protected-budget use",
+        );
+    }
     html.push_str("</section>");
 
     token_mix_panel(&mut html, &totals);
     usage_rows_panel(&mut html, usage);
+    protected_adoption_panel(&mut html, usage);
     tools_panel(&mut html, &activity);
     agent_activity_panel(&mut html, &activity);
     skill_context_panel(&mut html, &activity);
@@ -584,6 +609,64 @@ fn usage_rows_panel(html: &mut String, usage: &UsageReport) {
         );
     }
     html.push_str("</tbody></table></section>");
+}
+
+fn protected_adoption_panel(html: &mut String, usage: &UsageReport) {
+    let Some(adoption) = &usage.protected_adoption else {
+        return;
+    };
+    html.push_str("<section class=\"panel\"><h2>Adoption health</h2>");
+    let _ = write!(
+        html,
+        "<div class=\"legend\"><span>Protected opportunity {}</span><span>Carryover liability {}</span><span>Low adopters {}</span><span>Top consumers {}</span></div>",
+        format_money(adoption.unused_protected_opportunity_usd),
+        format_money(adoption.carryover_liability_usd),
+        adoption.low_adopters.len(),
+        adoption.high_adopters.len()
+    );
+
+    html.push_str("<h3>Low adopters</h3>");
+    if adoption.low_adopters.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No low adopters were detected in the protected adoption buckets.</div>",
+        );
+    } else {
+        html.push_str("<table><thead><tr><th>Budget</th><th>Entity</th><th>Protected opportunity</th><th>Carryover</th><th>Current usage</th></tr></thead><tbody>");
+        for entity in &adoption.low_adopters {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&entity.budget_id),
+                escape_html(&entity.entity_key),
+                format_money(entity.current_grant_usd),
+                format_money(entity.carryover_usd),
+                format_money(entity.used_current_grant_usd)
+            );
+        }
+        html.push_str("</tbody></table>");
+    }
+
+    html.push_str("<h3>Top consumers</h3>");
+    if adoption.high_adopters.is_empty() {
+        html.push_str(
+            "<div class=\"empty\">No high protected-budget consumers were detected yet.</div>",
+        );
+    } else {
+        html.push_str("<table><thead><tr><th>Budget</th><th>Entity</th><th>Used current grant</th><th>Carryover</th><th>Protected amount</th></tr></thead><tbody>");
+        for entity in &adoption.high_adopters {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&entity.budget_id),
+                escape_html(&entity.entity_key),
+                format_money(entity.used_current_grant_usd),
+                format_money(entity.carryover_usd),
+                format_money(entity.protected_amount_usd)
+            );
+        }
+        html.push_str("</tbody></table>");
+    }
+    html.push_str("</section>");
 }
 
 fn tools_panel(html: &mut String, activity: &[&TraceReportItem]) {
@@ -890,5 +973,41 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("user:alice")));
         assert!(lines.iter().any(|line| line.contains("user:bob")));
+    }
+
+    #[test]
+    fn dashboard_renders_protected_adoption_sections() {
+        let usage = UsageReport {
+            total_cost_usd: 30.0,
+            rows: Vec::new(),
+            protected_adoption: Some(crate::ledger::ProtectedAdoptionReport {
+                unused_protected_opportunity_usd: 25.0,
+                carryover_liability_usd: 5.0,
+                low_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:alice".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 24.0,
+                    carryover_usd: 0.0,
+                    used_current_grant_usd: 1.0,
+                }],
+                high_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:bob".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 1.0,
+                    carryover_usd: 5.0,
+                    used_current_grant_usd: 24.0,
+                }],
+            }),
+        };
+
+        let html = render_dashboard(&usage, &[], None, &[]);
+
+        assert!(html.contains("Protected opportunity"));
+        assert!(html.contains("Carryover liability"));
+        assert!(html.contains("Low adopters"));
+        assert!(html.contains("Top consumers"));
+        assert!(html.contains("Adoption health"));
     }
 }
