@@ -4,6 +4,7 @@ pub mod contract;
 pub mod error;
 pub mod fixture;
 pub mod ledger;
+pub mod live_dashboard;
 pub mod mock;
 pub mod policy;
 pub mod proxy;

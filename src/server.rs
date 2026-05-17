@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -20,6 +21,7 @@ use crate::contract::{
 };
 use crate::error::NoetError;
 use crate::ledger::BudgetLedger;
+use crate::live_dashboard;
 use crate::policy::PolicyFile;
 use crate::proxy::ProxyRoute;
 use crate::reporting;
@@ -98,6 +100,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/reports/observations", get(report_observations))
         .route("/v1/reports/dashboard-data", get(report_dashboard_data))
         .route("/v1/reports/dashboard", get(report_dashboard_html))
+        .route("/dashboard", get(live_dashboard_html))
+        .route("/dashboard/app.js", get(live_dashboard_js))
+        .route("/dashboard/app.css", get(live_dashboard_css))
         .route("/v1/chat/completions", any(capture))
         .route("/v1/messages", any(capture))
         .route("/v1/responses", any(capture))
@@ -205,6 +210,26 @@ async fn report_dashboard_html(
     let ledger = state.ledger.lock().await;
     let report = reporting::dashboard_report(&ledger, query.trace.as_deref())?;
     Ok(Html(render_dashboard_artifact(&report)))
+}
+
+async fn live_dashboard_html(Query(query): Query<ReportQuery>) -> Result<Html<String>, NoetError> {
+    Ok(Html(live_dashboard::dashboard_shell(
+        query.trace.as_deref(),
+    )))
+}
+
+async fn live_dashboard_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        live_dashboard::dashboard_js(),
+    )
+}
+
+async fn live_dashboard_css() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        live_dashboard::dashboard_css(),
+    )
 }
 
 fn render_dashboard_artifact(report: &reporting::DashboardReportData) -> String {
@@ -1244,6 +1269,75 @@ mod tests {
         ] {
             assert!(html.contains(marker), "missing dashboard marker: {marker}");
         }
+    }
+
+    #[tokio::test]
+    async fn live_dashboard_shell_serves_bootstrapped_trace_picker() {
+        let app = build_router(test_state(None));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard?trace=trace-beta")
+                    .body(Body::empty())
+                    .expect("dashboard shell request"),
+            )
+            .await
+            .expect("dashboard shell response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard shell body");
+        let html = String::from_utf8(body.to_vec()).expect("dashboard shell html");
+        for marker in [
+            "Noether live dashboard",
+            "dashboard-trace-select",
+            "/dashboard/app.js",
+            "/dashboard/app.css",
+            "trace-beta",
+        ] {
+            assert!(html.contains(marker), "missing live shell marker: {marker}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_dashboard_assets_reference_reporting_api() {
+        let app = build_router(test_state(None));
+
+        let js_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/app.js")
+                    .body(Body::empty())
+                    .expect("js request"),
+            )
+            .await
+            .expect("js response");
+        assert_eq!(js_response.status(), StatusCode::OK);
+        let js_body = to_bytes(js_response.into_body(), usize::MAX)
+            .await
+            .expect("js body");
+        let js = String::from_utf8(js_body.to_vec()).expect("dashboard js");
+        assert!(js.contains("/v1/reports/dashboard-data"));
+        assert!(!js.contains("<html"));
+
+        let css_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/app.css")
+                    .body(Body::empty())
+                    .expect("css request"),
+            )
+            .await
+            .expect("css response");
+        assert_eq!(css_response.status(), StatusCode::OK);
+        let css_body = to_bytes(css_response.into_body(), usize::MAX)
+            .await
+            .expect("css body");
+        let css = String::from_utf8(css_body.to_vec()).expect("dashboard css");
+        assert!(css.contains(".overview"));
+        assert!(css.contains(".panel-block"));
     }
 
     #[tokio::test]
