@@ -1370,7 +1370,45 @@ fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonR
     );
     html.push_str("</section>");
 
-    html.push_str("<section class=\"panel\"><h2>Strategy comparison</h2><table><thead><tr><th>Strategy</th><th>Spend</th><th>Unused budget</th><th>Denied</th><th>Fallbacks</th><th>Guard hits</th><th>Blocked work</th><th>Runaway prevented</th><th>Adoption</th><th>Fairness</th><th>Carryover</th><th>Exhaustion</th></tr></thead><tbody>");
+    let mut showcase_notes = Vec::new();
+    for strategy in &report.strategies {
+        if let Some(day) = strategy.exhaustion_day {
+            showcase_notes.push(format!(
+                "{} exhausted shared budget on day {}.",
+                strategy.id, day
+            ));
+        }
+        if strategy.guard_hit_count > 0 {
+            showcase_notes.push(format!(
+                "{} blocked {} guarded requests, prevented {}, and left {} unused.",
+                strategy.id,
+                strategy.guard_hit_count,
+                format_money(strategy.runaway_spend_prevented_usd),
+                format_money(strategy.unused_budget_usd)
+            ));
+        }
+        if strategy.unused_protected_opportunity_usd > 0.0
+            || strategy.low_adopter_count > 0
+            || strategy.high_adopter_count > 0
+        {
+            showcase_notes.push(format!(
+                "{} surfaced {} of unused protected opportunity across {} low adopters and {} high adopters.",
+                strategy.id,
+                format_money(strategy.unused_protected_opportunity_usd),
+                strategy.low_adopter_count,
+                strategy.high_adopter_count
+            ));
+        }
+    }
+    if !showcase_notes.is_empty() {
+        html.push_str("<section class=\"panel\"><h2>Showcase evidence</h2><ul>");
+        for note in showcase_notes {
+            let _ = write!(html, "<li>{}</li>", escape_html(&note));
+        }
+        html.push_str("</ul></section>");
+    }
+
+    html.push_str("<section class=\"panel\"><h2>Strategy comparison</h2><table><thead><tr><th>Strategy</th><th>Spend</th><th>Unused budget</th><th>Denied</th><th>Fallbacks</th><th>Guard hits</th><th>Blocked work</th><th>Runaway prevented</th><th>Coverage</th><th>Fairness</th><th>Protected opportunity</th><th>Low adopters</th><th>High adopters</th><th>Carryover</th><th>Exhaustion</th></tr></thead><tbody>");
     for strategy in &report.strategies {
         let exhaustion = strategy
             .exhaustion_day
@@ -1378,7 +1416,7 @@ fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonR
             .unwrap_or_else(|| "-".to_owned());
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape_html(&strategy.id),
             format_money(strategy.total_cost_usd),
             format_money(strategy.unused_budget_usd),
@@ -1389,6 +1427,9 @@ fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonR
             format_money(strategy.runaway_spend_prevented_usd),
             strategy.adoption_coverage,
             strategy.fairness_score,
+            format_money(strategy.unused_protected_opportunity_usd),
+            strategy.low_adopter_count,
+            strategy.high_adopter_count,
             format_money(strategy.carryover_liability_usd),
             escape_html(&exhaustion)
         );
@@ -1876,11 +1917,25 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use std::path::Path;
     use tempfile::tempdir;
 
     use crate::ledger::UsageReportRow;
 
     use super::*;
+
+    fn compare_checked_in_simulation(
+        path: &str,
+    ) -> crate::simulation::SimulationComparisonReport {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let content = std::fs::read_to_string(manifest_dir.join(path))
+            .expect("checked-in simulation example is readable");
+        let simulation: crate::simulation::SimulationFile =
+            serde_yaml::from_str(&content).expect("checked-in simulation example parses");
+        let tempdir = tempdir().expect("tempdir");
+        crate::simulation::compare_strategies(&simulation, tempdir.path())
+            .expect("checked-in simulation comparison succeeds")
+    }
 
     #[test]
     fn dashboard_renders_budget_routing_explanation_markers() {
@@ -2114,6 +2169,28 @@ mod tests {
         ] {
             assert!(html.contains(marker), "missing dashboard marker: {marker}");
         }
+    }
+
+    #[test]
+    fn simulation_dashboard_renders_showcase_tradeoff_markers() {
+        let runaway_report = compare_checked_in_simulation(
+            "examples/simulations/runaway-pressure.noet.yaml",
+        );
+        let runaway_html = render_simulation_dashboard(&runaway_report);
+        assert!(runaway_html.contains("Showcase evidence"));
+        assert!(runaway_html.contains("guarded team budget blocked 107 guarded requests"));
+        assert!(runaway_html.contains("pooled without guard exhausted shared budget on day 3."));
+
+        let adoption_report = compare_checked_in_simulation(
+            "examples/simulations/adoption-pressure.noet.yaml",
+        );
+        let adoption_html = render_simulation_dashboard(&adoption_report);
+        assert!(adoption_html.contains("Protected opportunity"));
+        assert!(adoption_html.contains("Low adopters"));
+        assert!(adoption_html.contains("High adopters"));
+        assert!(adoption_html.contains(
+            "protected adoption surfaced $1.11 of unused protected opportunity across 3 low adopters and 5 high adopters."
+        ));
     }
 
     #[test]
@@ -2685,7 +2762,12 @@ requests:
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&report_path).expect("read report"))
                 .expect("report json");
+        let dashboard = std::fs::read_to_string(&dashboard_path).expect("read dashboard");
         assert_eq!(report["total_requests"], 337);
+        assert!(dashboard.contains("Strategy comparison"));
+        assert!(dashboard.contains("Protected opportunity"));
+        assert!(dashboard.contains("Low adopters"));
+        assert!(dashboard.contains("High adopters"));
         let strategies = report["strategies"].as_array().expect("strategies");
         assert_eq!(strategies.len(), 2);
         let pooled = strategies
@@ -2721,5 +2803,14 @@ requests:
             assert_eq!(model_mix[1]["requests"], 95);
             assert_eq!(model_mix[1]["total_cost_usd"], 1.106696);
         }
+        assert_eq!(pooled["unused_protected_opportunity_usd"], 0.0);
+        assert_eq!(pooled["low_adopter_count"], 0);
+        assert_eq!(pooled["high_adopter_count"], 0);
+        let adoption_unused = adoption["unused_protected_opportunity_usd"]
+            .as_f64()
+            .expect("protected opportunity as f64");
+        assert!((adoption_unused - 51.475908).abs() < 1e-9);
+        assert_eq!(adoption["low_adopter_count"], 2);
+        assert_eq!(adoption["high_adopter_count"], 1);
     }
 }

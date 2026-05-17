@@ -1,0 +1,89 @@
+version: 1
+name: adoption pressure
+seed: 13
+horizon_days: 14
+company:
+  id: startup
+  teams:
+    - id: eng
+      name: Engineering
+  projects:
+    - id: core
+      team_id: eng
+      name: Core product
+    - id: docs
+      team_id: eng
+      name: Docs and enablement
+  users:
+    - id: a1
+      team_id: eng
+      project_ids: [core]
+      profile: power_user
+    - id: a2
+      team_id: eng
+      project_ids: [core]
+      profile: power_user
+    - id: a3
+      team_id: eng
+      project_ids: [core]
+      profile: power_user
+    - id: a4
+      team_id: eng
+      project_ids: [core]
+      profile: power_user
+    - id: a5
+      team_id: eng
+      project_ids: [core]
+      profile: power_user
+    - id: b1
+      team_id: eng
+      project_ids: [docs]
+      profile: low_adopter
+    - id: b2
+      team_id: eng
+      project_ids: [docs]
+      profile: low_adopter
+    - id: b3
+      team_id: eng
+      project_ids: [docs]
+      profile: low_adopter
+    - id: b4
+      team_id: eng
+      project_ids: [docs]
+      profile: low_adopter
+models:
+  - id: flagship
+    provider: openai
+    model: gpt-4.1
+    cost_per_1k_tokens_usd: 0.05
+  - id: fast
+    provider: openai
+    model: gpt-4.1-mini
+    cost_per_1k_tokens_usd: 0.01
+strategies:
+  - id: pooled cap
+    description: Heavy users spend from one shared cap, and underuse is invisible.
+    policy:
+      version: 0
+      budgets:
+        - id: eng-pooled
+          limit_usd: 4
+          eligible:
+            entities: [team:eng]
+  - id: protected adoption
+    description: Protected per-user budget surfaces low adopters and preserves explicit opportunity.
+    policy:
+      version: 0
+      budgets:
+        - id: eng-adoption
+          limit_usd: 4
+          eligible:
+            entities: [team:eng]
+          allocation:
+            standard: protected_adoption_pool
+            by: user
+            protected_amount_usd: 0.4
+            window: monthly
+            carryover:
+              percent: 0
+              cap_usd: 0

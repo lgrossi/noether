@@ -1,0 +1,62 @@
+version: 1
+name: runaway pressure
+seed: 11
+horizon_days: 14
+company:
+  id: startup
+  teams:
+    - id: eng
+      name: Engineering
+  projects:
+    - id: product
+      team_id: eng
+      name: Product
+    - id: infra
+      team_id: eng
+      name: Infra
+  users:
+    - id: rhea
+      team_id: eng
+      project_ids: [product]
+      profile: loop_risk
+    - id: sol
+      team_id: eng
+      project_ids: [infra]
+      profile: power_user
+    - id: teo
+      team_id: eng
+      project_ids: [product]
+      profile: steady_user
+models:
+  - id: flagship
+    provider: openai
+    model: gpt-4.1
+    cost_per_1k_tokens_usd: 0.04
+  - id: fast
+    provider: openai
+    model: gpt-4.1-mini
+    cost_per_1k_tokens_usd: 0.008
+strategies:
+  - id: pooled without guard
+    description: One loop-risk agent can spend until the shared budget is exhausted.
+    policy:
+      version: 0
+      budgets:
+        - id: eng-pooled
+          limit_usd: 12
+          eligible:
+            entities: [team:eng]
+  - id: guarded team budget
+    description: A short spend window denies bursty runaway requests before they consume the month.
+    policy:
+      version: 0
+      budgets:
+        - id: eng-guarded
+          limit_usd: 12
+          eligible:
+            entities: [team:eng]
+          guards:
+            spend_windows:
+              - window: 5h
+                max_usd: 1.2
+                effect: deny

@@ -128,6 +128,9 @@ pub struct SimulationStrategyReport {
     pub runaway_spend_prevented_usd: f64,
     pub adoption_coverage: f64,
     pub fairness_score: f64,
+    pub unused_protected_opportunity_usd: f64,
+    pub low_adopter_count: u64,
+    pub high_adopter_count: u64,
     pub model_mix: Vec<SimulationModelMixEntry>,
     pub carryover_liability_usd: f64,
     pub exhaustion_day: Option<u32>,
@@ -358,6 +361,9 @@ pub fn compare_strategies(
             runaway_spend_prevented_usd: 0.0,
             adoption_coverage: 0.0,
             fairness_score: 0.0,
+            unused_protected_opportunity_usd: 0.0,
+            low_adopter_count: 0,
+            high_adopter_count: 0,
             model_mix: Vec::new(),
             carryover_liability_usd: 0.0,
             exhaustion_day: None,
@@ -493,6 +499,21 @@ pub fn compare_strategies(
             .protected_adoption
             .as_ref()
             .map(|adoption| adoption.carryover_liability_usd)
+            .unwrap_or_default();
+        report.unused_protected_opportunity_usd = usage
+            .protected_adoption
+            .as_ref()
+            .map(|adoption| adoption.unused_protected_opportunity_usd)
+            .unwrap_or_default();
+        report.low_adopter_count = usage
+            .protected_adoption
+            .as_ref()
+            .map(|adoption| adoption.low_adopters.len() as u64)
+            .unwrap_or_default();
+        report.high_adopter_count = usage
+            .protected_adoption
+            .as_ref()
+            .map(|adoption| adoption.high_adopters.len() as u64)
             .unwrap_or_default();
         std::fs::write(
             &report.usage_report_path,
@@ -747,6 +768,21 @@ fn fairness_score(users: &[SyntheticUser], user_spend: &BTreeMap<String, f64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn parse_checked_in_simulation(path: &str) -> SimulationFile {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let content = std::fs::read_to_string(manifest_dir.join(path))
+            .expect("checked-in simulation example is readable");
+        serde_yaml::from_str(&content).expect("checked-in simulation example parses")
+    }
+
+    fn compare_checked_in_simulation(path: &str) -> SimulationComparisonReport {
+        let simulation = parse_checked_in_simulation(path);
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        compare_strategies(&simulation, tempdir.path())
+            .expect("checked-in simulation comparison succeeds")
+    }
 
     #[test]
     fn parses_and_validates_simulation_schema_v1() {
@@ -848,14 +884,74 @@ strategies:
     }
 
     #[test]
-    fn checked_in_simulation_example_validates() {
-        let simulation: SimulationFile = serde_yaml::from_str(include_str!(
-            "../examples/simulations/synthetic-company.noet.yaml"
-        ))
-        .expect("example simulation parses");
+    fn checked_in_simulation_examples_validate() {
+        for (path, expected_strategies) in [
+            ("examples/simulations/synthetic-company.noet.yaml", 2),
+            ("examples/simulations/runaway-pressure.noet.yaml", 2),
+            ("examples/simulations/adoption-pressure.noet.yaml", 2),
+        ] {
+            let simulation = parse_checked_in_simulation(path);
 
-        validate_simulation(&simulation).expect("example simulation is valid");
-        assert_eq!(simulation.strategies.len(), 2);
+            validate_simulation(&simulation).expect("example simulation is valid");
+            assert_eq!(simulation.strategies.len(), expected_strategies);
+        }
+    }
+
+    #[test]
+    fn runaway_pressure_example_locks_guard_tradeoff() {
+        let report = compare_checked_in_simulation(
+            "examples/simulations/runaway-pressure.noet.yaml",
+        );
+
+        assert_eq!(report.total_requests, 115);
+        let pooled = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.id == "pooled without guard")
+            .expect("pooled strategy");
+        let guarded = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.id == "guarded team budget")
+            .expect("guarded strategy");
+
+        assert_eq!(pooled.exhaustion_day, Some(3));
+        assert_eq!(guarded.exhaustion_day, None);
+        assert_eq!(guarded.guard_hit_count, guarded.denied_requests);
+        assert!(guarded.denied_requests > pooled.denied_requests);
+        assert!(guarded.total_cost_usd < pooled.total_cost_usd);
+        assert!(guarded.unused_budget_usd > pooled.unused_budget_usd);
+        assert!(guarded.runaway_spend_prevented_usd > pooled.runaway_spend_prevented_usd);
+        assert!(guarded.fairness_score > pooled.fairness_score);
+    }
+
+    #[test]
+    fn adoption_pressure_example_locks_protected_adoption_tradeoff() {
+        let report = compare_checked_in_simulation(
+            "examples/simulations/adoption-pressure.noet.yaml",
+        );
+
+        assert_eq!(report.total_requests, 293);
+        let pooled = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.id == "pooled cap")
+            .expect("pooled strategy");
+        let protected = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.id == "protected adoption")
+            .expect("protected adoption strategy");
+
+        assert_eq!(pooled.low_adopter_count, 0);
+        assert_eq!(pooled.high_adopter_count, 0);
+        assert_eq!(protected.low_adopter_count, 3);
+        assert_eq!(protected.high_adopter_count, 5);
+        assert!(protected.unused_protected_opportunity_usd > 1.0);
+        assert_eq!(protected.total_cost_usd, pooled.total_cost_usd);
+        assert_eq!(protected.denied_requests, pooled.denied_requests);
+        assert!(protected.allowed_requests > pooled.allowed_requests);
+        assert!(protected.fallback_count < pooled.fallback_count);
     }
 
     #[test]
