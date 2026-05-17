@@ -16,6 +16,14 @@ and dashboards.
 Noether is not another chat UI, prompt warehouse, or generic provider router. It is the missing
 layer between AI usage and AI accountability.
 
+## Who Noether is for
+
+- **Teams using coding agents and AI-heavy workflows** that need visibility before spend becomes
+  confusing
+- **AI/platform teams introducing guardrails** without forcing everyone into one gateway or one UI
+- **Organizations that want adoption, not only cost control** and need a way to preserve useful
+  usage while blocking runaway behavior
+
 ## Why another AI tool?
 
 Most AI tooling solves one of two problems:
