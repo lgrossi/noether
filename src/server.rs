@@ -2,11 +2,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{any, post};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -21,6 +22,7 @@ use crate::error::NoetError;
 use crate::ledger::BudgetLedger;
 use crate::policy::PolicyFile;
 use crate::proxy::ProxyRoute;
+use crate::reporting;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -90,6 +92,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/authorize", post(authorize))
         .route("/v1/reservations/{id}/finalize", post(finalize_reservation))
         .route("/v1/events", post(record_event))
+        .route("/v1/reports/usage", get(report_usage))
+        .route("/v1/reports/decisions", get(report_decisions))
+        .route("/v1/reports/traces/{trace_id}", get(report_trace))
+        .route("/v1/reports/observations", get(report_observations))
+        .route("/v1/reports/dashboard-data", get(report_dashboard_data))
+        .route("/v1/reports/dashboard", get(report_dashboard_html))
         .route("/v1/chat/completions", any(capture))
         .route("/v1/messages", any(capture))
         .route("/v1/responses", any(capture))
@@ -133,6 +141,224 @@ async fn record_event(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": true })),
     ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReportQuery {
+    kind: Option<String>,
+    trace: Option<String>,
+}
+
+async fn report_usage(State(state): State<AppState>) -> Result<Json<serde_json::Value>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    Ok(Json(serde_json::to_value(reporting::usage_report(
+        &ledger,
+    )?)?))
+}
+
+async fn report_decisions(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    Ok(Json(serde_json::to_value(reporting::decisions_report(
+        &ledger,
+    )?)?))
+}
+
+async fn report_trace(
+    State(state): State<AppState>,
+    AxumPath(trace_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    Ok(Json(serde_json::to_value(reporting::trace_report(
+        &ledger, &trace_id,
+    )?)?))
+}
+
+async fn report_observations(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Json<serde_json::Value>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    Ok(Json(serde_json::to_value(reporting::observations_report(
+        &ledger,
+        query.kind.as_deref(),
+        query.trace.as_deref(),
+    )?)?))
+}
+
+async fn report_dashboard_data(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Json<serde_json::Value>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    Ok(Json(serde_json::to_value(reporting::dashboard_report(
+        &ledger,
+        query.trace.as_deref(),
+    )?)?))
+}
+
+async fn report_dashboard_html(
+    State(state): State<AppState>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Html<String>, NoetError> {
+    let ledger = state.ledger.lock().await;
+    let report = reporting::dashboard_report(&ledger, query.trace.as_deref())?;
+    Ok(Html(render_dashboard_artifact(&report)))
+}
+
+fn render_dashboard_artifact(report: &reporting::DashboardReportData) -> String {
+    let featured_trace = report.featured_trace_id.as_deref().unwrap_or("latest");
+    let decision_total = report.summary.decisions.total();
+    let tool_count = report.summary.activity.tools;
+    let agent_count = report.summary.activity.agent;
+    let context_count = report.summary.activity.skill_context;
+    let mut html = String::new();
+    html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    html.push_str("<title>Noether reporting dashboard</title>");
+    html.push_str(
+        "<style>
+        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --blue:#38bdf8; }
+        * { box-sizing: border-box; }
+        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:radial-gradient(circle at top left,#172554,#0f172a 42%); color:var(--text); }
+        main { max-width:1100px; margin:0 auto; padding:32px 20px 48px; }
+        h1,h2 { margin:0; letter-spacing:-0.03em; }
+        h1 { font-size:34px; margin-bottom:6px; }
+        h2 { font-size:22px; margin-bottom:12px; }
+        .sub,.muted { color:var(--muted); }
+        .hero,.panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 55px rgba(0,0,0,.22); padding:20px; margin-top:16px; }
+        .hero { margin-top:0; }
+        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:16px; }
+        .card { background:rgba(15,23,42,.55); border:1px solid rgba(148,163,184,.14); border-radius:16px; padding:16px; }
+        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .value { font-size:28px; font-weight:800; margin-top:6px; }
+        ul { margin:12px 0 0 18px; padding:0; }
+        li { margin:6px 0; }
+        .entry { border-top:1px solid var(--line); padding:12px 0; }
+        .entry:first-child { border-top:0; padding-top:0; }
+        .pill { display:inline-block; padding:4px 9px; border-radius:999px; background:#1e293b; border:1px solid var(--line); font-size:12px; margin-right:8px; }
+        code { color:var(--blue); }
+        </style>",
+    );
+    html.push_str("</head><body><main>");
+    html.push_str("<h1>Noether reporting dashboard</h1>");
+    html.push_str("<div class=\"sub\">HTTP-served reporting artifact backed by the same ledger read model as CLI export.</div>");
+    html.push_str("<section class=\"hero\">");
+    html.push_str("<div class=\"label\">Featured trace</div>");
+    html.push_str(&format!(
+        "<div class=\"value\"><code>{}</code></div>",
+        escape_html(featured_trace)
+    ));
+    html.push_str("<p class=\"muted\">This artifact summarizes the latest reporting state without depending on the live dashboard UI.</p>");
+    html.push_str("</section>");
+
+    html.push_str("<section class=\"grid\">");
+    metric_card_html(
+        &mut html,
+        "Finalized spend",
+        &format_money(report.usage.total_cost_usd),
+        "finalized cost in the ledger",
+    );
+    metric_card_html(
+        &mut html,
+        "Decisions",
+        &decision_total.to_string(),
+        "authorize outcomes captured in the report set",
+    );
+    metric_card_html(
+        &mut html,
+        "Tokens",
+        &report.summary.usage.total_tokens.to_string(),
+        "finalized tokens across the selected report set",
+    );
+    metric_card_html(
+        &mut html,
+        "Evidence",
+        &format!("{tool_count} tools · {agent_count} agent · {context_count} context"),
+        "observed activity attached to the selected trace",
+    );
+    html.push_str("</section>");
+
+    html.push_str("<section class=\"panel\"><h2>Policy decisions</h2>");
+    if report.decisions.is_empty() {
+        html.push_str("<p class=\"muted\">No authorization decisions have been recorded yet.</p>");
+    } else {
+        for item in report.decisions.iter().take(8) {
+            html.push_str("<div class=\"entry\">");
+            html.push_str(&format!(
+                "<div><span class=\"pill\">{}</span><strong>{}</strong></div>",
+                escape_html(&item.kind),
+                escape_html(&item.summary)
+            ));
+            html.push_str("</div>");
+        }
+    }
+    html.push_str("</section>");
+
+    html.push_str("<section class=\"panel\"><h2>Available traces</h2>");
+    if report.available_traces.is_empty() {
+        html.push_str("<p class=\"muted\">No trace-backed decisions are available yet.</p>");
+    } else {
+        html.push_str("<ul>");
+        for trace in &report.available_traces {
+            html.push_str(&format!(
+                "<li><code>{}</code> · {} · {}</li>",
+                escape_html(&trace.trace_id),
+                escape_html(trace.latest_decision_kind.as_deref().unwrap_or("decision")),
+                escape_html(&trace.latest_decision_summary)
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</section>");
+
+    html.push_str("<section class=\"panel\"><h2>Recent observations</h2>");
+    if report.observations.is_empty() {
+        html.push_str("<p class=\"muted\">No observations matched the selected trace yet.</p>");
+    } else {
+        for item in report.observations.iter().take(8) {
+            html.push_str(&format!(
+                "<div class=\"entry\"><span class=\"pill\">{}</span>{}</div>",
+                escape_html(&item.kind),
+                escape_html(&item.summary)
+            ));
+        }
+    }
+    html.push_str("</section>");
+
+    html.push_str("</main></body></html>");
+    html
+}
+
+fn metric_card_html(html: &mut String, label: &str, value: &str, hint: &str) {
+    html.push_str("<article class=\"card\">");
+    html.push_str(&format!(
+        "<div class=\"label\">{}</div><div class=\"value\">{}</div><div class=\"muted\">{}</div>",
+        escape_html(label),
+        escape_html(value),
+        escape_html(hint)
+    ));
+    html.push_str("</article>");
+}
+
+fn format_money(value: f64) -> String {
+    if value == 0.0 {
+        "$0".to_owned()
+    } else if value < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -201,6 +427,113 @@ mod tests {
                 upstream_base_url,
             }],
         }
+    }
+
+    fn report_request(
+        trace_id: &str,
+        request_id: &str,
+        model: &str,
+        estimated_cost_usd: f64,
+    ) -> AuthorizeRequest {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("trace_id".to_owned(), json!(trace_id));
+        metadata.insert("request_id".to_owned(), json!(request_id));
+        AuthorizeRequest {
+            budget_id: None,
+            entities: vec!["project:noether".to_owned()],
+            subject: Some("user:local".to_owned()),
+            project: Some("noether".to_owned()),
+            provider: Some("openai".to_owned()),
+            model: Some(model.to_owned()),
+            estimated_tokens: Some((estimated_cost_usd * 1_000_000.0) as u64),
+            estimated_cost_usd: Some(estimated_cost_usd),
+            metadata,
+        }
+    }
+
+    fn finalize_payload(
+        trace_id: &str,
+        model: &str,
+        actual_cost_usd: f64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> FinalizeReservation {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("trace_id".to_owned(), json!(trace_id));
+        FinalizeReservation {
+            reservation_id: None,
+            usage: Some(crate::contract::UsageObservation {
+                provider: Some("openai".to_owned()),
+                model: Some(model.to_owned()),
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                total_tokens: Some(input_tokens + output_tokens),
+                cost_usd: Some(actual_cost_usd),
+                latency_ms: None,
+                stop_reason: None,
+            }),
+            actual_cost_usd: Some(actual_cost_usd),
+            metadata,
+        }
+    }
+
+    async fn seed_reporting_data(state: &AppState) {
+        let mut ledger = state.ledger.lock().await;
+
+        let alpha = ledger
+            .try_authorize(
+                None,
+                &report_request("trace-alpha", "req-alpha", "gpt-4.1", 1.25),
+            )
+            .expect("authorize alpha");
+        let alpha_reservation = alpha.reservation.expect("alpha reservation");
+        ledger
+            .finalize(
+                &alpha_reservation.id,
+                &finalize_payload("trace-alpha", "gpt-4.1", 1.25, 1_000, 250),
+            )
+            .expect("finalize alpha");
+        ledger
+            .record_event(TraceEvent {
+                id: Some("evt-alpha-tool".to_owned()),
+                trace_id: Some("trace-alpha".to_owned()),
+                occurred_at: None,
+                kind: "tool.observed".to_owned(),
+                payload: json!({"name":"bash","success":true}),
+            })
+            .expect("record alpha tool");
+
+        let beta = ledger
+            .try_authorize(
+                None,
+                &report_request("trace-beta", "req-beta", "gpt-4.1-mini", 0.75),
+            )
+            .expect("authorize beta");
+        let beta_reservation = beta.reservation.expect("beta reservation");
+        ledger
+            .finalize(
+                &beta_reservation.id,
+                &finalize_payload("trace-beta", "gpt-4.1-mini", 0.75, 400, 120),
+            )
+            .expect("finalize beta");
+        ledger
+            .record_event(TraceEvent {
+                id: Some("evt-beta-agent".to_owned()),
+                trace_id: Some("trace-beta".to_owned()),
+                occurred_at: None,
+                kind: "pi.agent_context".to_owned(),
+                payload: json!({"skill":"research"}),
+            })
+            .expect("record beta context");
+        ledger
+            .record_event(TraceEvent {
+                id: Some("evt-beta-tool".to_owned()),
+                trace_id: Some("trace-beta".to_owned()),
+                occurred_at: None,
+                kind: "tool.observed".to_owned(),
+                payload: json!({"name":"rg","success":true}),
+            })
+            .expect("record beta tool");
     }
 
     fn strict_policy() -> PolicyFile {
@@ -752,6 +1085,165 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn reporting_endpoints_match_shared_reporting_domain() {
+        let state = test_state(None);
+        seed_reporting_data(&state).await;
+
+        let expected_usage = {
+            let ledger = state.ledger.lock().await;
+            serde_json::to_value(reporting::usage_report(&ledger).expect("usage report"))
+                .expect("usage json")
+        };
+        let expected_decisions = {
+            let ledger = state.ledger.lock().await;
+            serde_json::to_value(reporting::decisions_report(&ledger).expect("decisions report"))
+                .expect("decisions json")
+        };
+        let expected_trace = {
+            let ledger = state.ledger.lock().await;
+            serde_json::to_value(reporting::trace_report(&ledger, "trace-beta").expect("trace"))
+                .expect("trace json")
+        };
+        let expected_observations = {
+            let ledger = state.ledger.lock().await;
+            serde_json::to_value(
+                reporting::observations_report(&ledger, Some("tool"), Some("trace-beta"))
+                    .expect("observations"),
+            )
+            .expect("observations json")
+        };
+        let expected_dashboard = {
+            let ledger = state.ledger.lock().await;
+            serde_json::to_value(
+                reporting::dashboard_report(&ledger, Some("trace-beta")).expect("dashboard data"),
+            )
+            .expect("dashboard json")
+        };
+
+        let app = build_router(state);
+
+        let usage_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/usage")
+                    .body(Body::empty())
+                    .expect("usage request"),
+            )
+            .await
+            .expect("usage response");
+        assert_eq!(usage_response.status(), StatusCode::OK);
+        let usage_body = to_bytes(usage_response.into_body(), usize::MAX)
+            .await
+            .expect("usage body");
+        let usage_json: Value = serde_json::from_slice(&usage_body).expect("usage value");
+        assert_eq!(usage_json, expected_usage);
+
+        let decisions_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/decisions")
+                    .body(Body::empty())
+                    .expect("decisions request"),
+            )
+            .await
+            .expect("decisions response");
+        assert_eq!(decisions_response.status(), StatusCode::OK);
+        let decisions_body = to_bytes(decisions_response.into_body(), usize::MAX)
+            .await
+            .expect("decisions body");
+        let decisions_json: Value =
+            serde_json::from_slice(&decisions_body).expect("decisions value");
+        assert_eq!(decisions_json, expected_decisions);
+
+        let trace_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/traces/trace-beta")
+                    .body(Body::empty())
+                    .expect("trace request"),
+            )
+            .await
+            .expect("trace response");
+        assert_eq!(trace_response.status(), StatusCode::OK);
+        let trace_body = to_bytes(trace_response.into_body(), usize::MAX)
+            .await
+            .expect("trace body");
+        let trace_json: Value = serde_json::from_slice(&trace_body).expect("trace value");
+        assert_eq!(trace_json, expected_trace);
+
+        let observations_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/observations?kind=tool&trace=trace-beta")
+                    .body(Body::empty())
+                    .expect("observations request"),
+            )
+            .await
+            .expect("observations response");
+        assert_eq!(observations_response.status(), StatusCode::OK);
+        let observations_body = to_bytes(observations_response.into_body(), usize::MAX)
+            .await
+            .expect("observations body");
+        let observations_json: Value =
+            serde_json::from_slice(&observations_body).expect("observations value");
+        assert_eq!(observations_json, expected_observations);
+
+        let dashboard_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/dashboard-data?trace=trace-beta")
+                    .body(Body::empty())
+                    .expect("dashboard data request"),
+            )
+            .await
+            .expect("dashboard data response");
+        assert_eq!(dashboard_response.status(), StatusCode::OK);
+        let dashboard_body = to_bytes(dashboard_response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard data body");
+        let dashboard_json: Value =
+            serde_json::from_slice(&dashboard_body).expect("dashboard value");
+        assert_eq!(dashboard_json, expected_dashboard);
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_endpoint_renders_report_artifact_markers() {
+        let state = test_state(None);
+        seed_reporting_data(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/dashboard?trace=trace-beta")
+                    .body(Body::empty())
+                    .expect("dashboard request"),
+            )
+            .await
+            .expect("dashboard response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard body");
+        let html = String::from_utf8(body.to_vec()).expect("dashboard html");
+        for marker in [
+            "Noether reporting dashboard",
+            "Featured trace",
+            "trace-beta",
+            "Policy decisions",
+            "Available traces",
+            "Recent observations",
+        ] {
+            assert!(html.contains(marker), "missing dashboard marker: {marker}");
+        }
     }
 
     #[tokio::test]
