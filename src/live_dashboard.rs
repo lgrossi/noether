@@ -468,6 +468,28 @@ function currentTrace() {
   return el("dashboard-trace-select").value || bootstrap.selectedTrace || "";
 }
 
+let refreshTimer = null;
+let eventSource = null;
+
+function scheduleRefresh() {
+  window.clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(() => loadDashboard(currentTrace()), 150);
+}
+
+function startLiveUpdates() {
+  if (eventSource) {
+    eventSource.close();
+  }
+  eventSource = new EventSource("/v1/reports/updates");
+  eventSource.addEventListener("report-update", () => {
+    scheduleRefresh();
+  });
+  eventSource.onerror = () => {
+    const status = el("dashboard-status");
+    status.textContent = `${status.textContent} · waiting for live updates`;
+  };
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   el("dashboard-refresh").addEventListener("click", () => loadDashboard(currentTrace()));
   el("dashboard-trace-select").addEventListener("change", (event) => {
@@ -479,6 +501,7 @@ document.addEventListener("DOMContentLoaded", () => {
     bootstrap.selectedTrace = trace || null;
     loadDashboard(trace);
   });
+  startLiveUpdates();
   loadDashboard(bootstrap.selectedTrace || "");
 });
 "#

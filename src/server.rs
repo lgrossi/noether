@@ -1,17 +1,22 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::fs;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -35,6 +40,7 @@ pub struct AppState {
     pub policy: Option<Arc<PolicyFile>>,
     pub decision_mode: DecisionMode,
     pub ledger: Arc<Mutex<BudgetLedger>>,
+    pub report_updates: broadcast::Sender<ReportUpdate>,
 }
 
 impl AppState {
@@ -44,6 +50,7 @@ impl AppState {
         policy: Option<PolicyFile>,
         decision_mode: DecisionMode,
     ) -> Self {
+        let (report_updates, _) = broadcast::channel(64);
         Self {
             fixture_dir,
             upstream,
@@ -52,8 +59,15 @@ impl AppState {
             policy: policy.map(Arc::new),
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
+            report_updates,
         }
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReportUpdate {
+    pub kind: &'static str,
+    pub trace_id: Option<String>,
 }
 
 pub struct ServeConfig {
@@ -100,6 +114,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/reports/observations", get(report_observations))
         .route("/v1/reports/dashboard-data", get(report_dashboard_data))
         .route("/v1/reports/dashboard", get(report_dashboard_html))
+        .route("/v1/reports/updates", get(report_updates_stream))
         .route("/dashboard", get(live_dashboard_html))
         .route("/dashboard/app.js", get(live_dashboard_js))
         .route("/dashboard/app.css", get(live_dashboard_css))
@@ -125,6 +140,7 @@ async fn authorize(
         .lock()
         .await
         .try_authorize(state.policy.as_deref(), &request)?;
+    publish_report_update(&state, "authorize", request_trace_id(&request));
     Ok(Json(decision))
 }
 
@@ -134,6 +150,7 @@ async fn finalize_reservation(
     Json(payload): Json<FinalizeReservation>,
 ) -> Result<Json<Reservation>, NoetError> {
     let reservation = state.ledger.lock().await.finalize(&id, &payload)?;
+    publish_report_update(&state, "finalize", finalize_trace_id(&payload));
     Ok(Json(reservation))
 }
 
@@ -141,7 +158,9 @@ async fn record_event(
     State(state): State<AppState>,
     Json(event): Json<TraceEvent>,
 ) -> Result<impl IntoResponse, NoetError> {
+    let trace_id = event.trace_id.clone();
     state.ledger.lock().await.record_event(event)?;
+    publish_report_update(&state, "event", trace_id);
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "accepted": true })),
@@ -210,6 +229,24 @@ async fn report_dashboard_html(
     let ledger = state.ledger.lock().await;
     let report = reporting::dashboard_report(&ledger, query.trace.as_deref())?;
     Ok(Html(render_dashboard_artifact(&report)))
+}
+
+async fn report_updates_stream(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.report_updates.subscribe()).filter_map(|message| {
+        let update = match message {
+            Ok(update) => update,
+            Err(_) => return None,
+        };
+        let data = serde_json::to_string(&update).ok()?;
+        Some(Ok(Event::default().event("report-update").data(data)))
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 async fn live_dashboard_html(Query(query): Query<ReportQuery>) -> Result<Html<String>, NoetError> {
@@ -384,6 +421,26 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('\"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn publish_report_update(state: &AppState, kind: &'static str, trace_id: Option<String>) {
+    let _ = state.report_updates.send(ReportUpdate { kind, trace_id });
+}
+
+fn request_trace_id(request: &AuthorizeRequest) -> Option<String> {
+    request
+        .metadata
+        .get("trace_id")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn finalize_trace_id(payload: &FinalizeReservation) -> Option<String> {
+    payload
+        .metadata
+        .get("trace_id")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -1338,6 +1395,127 @@ mod tests {
         let css = String::from_utf8(css_body.to_vec()).expect("dashboard css");
         assert!(css.contains(".overview"));
         assert!(css.contains(".panel-block"));
+    }
+
+    #[tokio::test]
+    async fn report_update_stream_emits_after_authorize_finalize_and_event() {
+        let app = build_router(test_state(None));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/reports/updates")
+                    .body(Body::empty())
+                    .expect("updates request"),
+            )
+            .await
+            .expect("updates response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let authorize_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&report_request(
+                            "trace-live",
+                            "req-live",
+                            "gpt-4.1",
+                            1.25,
+                        ))
+                        .expect("authorize json"),
+                    ))
+                    .expect("authorize request"),
+            )
+            .await
+            .expect("authorize response");
+        assert_eq!(authorize_response.status(), StatusCode::OK);
+        let authorize_body = to_bytes(authorize_response.into_body(), usize::MAX)
+            .await
+            .expect("authorize body");
+        let authorize_json: Value =
+            serde_json::from_slice(&authorize_body).expect("authorize value");
+        let reservation_id = authorize_json["reservation"]["id"]
+            .as_str()
+            .expect("reservation id")
+            .to_owned();
+
+        let authorize_chunk = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("authorize stream event")
+            .expect("authorize chunk present")
+            .expect("authorize chunk ok");
+        let authorize_text = String::from_utf8(authorize_chunk.to_vec()).expect("authorize text");
+        assert!(authorize_text.contains("\"kind\":\"authorize\""));
+        assert!(authorize_text.contains("trace-live"));
+
+        let finalize_response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/reservations/{reservation_id}/finalize"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&finalize_payload(
+                            "trace-live",
+                            "gpt-4.1",
+                            1.25,
+                            1_000,
+                            250,
+                        ))
+                        .expect("finalize json"),
+                    ))
+                    .expect("finalize request"),
+            )
+            .await
+            .expect("finalize response");
+        assert_eq!(finalize_response.status(), StatusCode::OK);
+
+        let finalize_chunk = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("finalize stream event")
+            .expect("finalize chunk present")
+            .expect("finalize chunk ok");
+        let finalize_text = String::from_utf8(finalize_chunk.to_vec()).expect("finalize text");
+        assert!(finalize_text.contains("\"kind\":\"finalize\""));
+        assert!(finalize_text.contains("trace-live"));
+
+        let event_response = app
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "trace_id":"trace-live",
+                            "kind":"tool.observed",
+                            "payload":{"name":"bash","success":true}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("event request"),
+            )
+            .await
+            .expect("event response");
+        assert_eq!(event_response.status(), StatusCode::ACCEPTED);
+
+        let event_chunk = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("event stream event")
+            .expect("event chunk present")
+            .expect("event chunk ok");
+        let event_text = String::from_utf8(event_chunk.to_vec()).expect("event text");
+        assert!(event_text.contains("\"kind\":\"event\""));
+        assert!(event_text.contains("trace-live"));
     }
 
     #[tokio::test]
