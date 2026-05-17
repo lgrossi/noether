@@ -15,6 +15,7 @@ use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
 use crate::policy::load_policy;
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
+use crate::reporting;
 use crate::scenario::{
     ScenarioAssertion, ScenarioFallbackExpectation, ScenarioFile, ScenarioReportSource,
     ScenarioRequest, validate_scenario,
@@ -257,7 +258,7 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
     let ledger = BudgetLedger::open_sqlite(&command.db_path)?;
     match command.command {
         ReportSubcommand::Usage => {
-            let report = ledger.usage_report()?;
+            let report = reporting::usage_report(&ledger)?;
             if command.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -267,10 +268,10 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
             }
         }
         ReportSubcommand::Decisions => {
-            print_items(ledger.decisions_report()?, command.json)?;
+            print_items(reporting::decisions_report(&ledger)?, command.json)?;
         }
         ReportSubcommand::Trace { trace_id } => {
-            let report = ledger.trace_report(&trace_id)?;
+            let report = reporting::trace_report(&ledger, &trace_id)?;
             if command.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -280,31 +281,19 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
             }
         }
         ReportSubcommand::Observations { kind, trace } => {
-            let prefix = match kind.as_deref() {
-                Some("tool") => Some("tool."),
-                Some("eval") => Some("eval."),
-                Some(value) => Some(value),
-                None => None,
-            };
             print_items(
-                ledger.observations_report(prefix, trace.as_deref())?,
+                reporting::observations_report(&ledger, kind.as_deref(), trace.as_deref())?,
                 command.json,
             )?;
         }
         ReportSubcommand::Dashboard { out, trace } => {
-            let usage = ledger.usage_report()?;
-            let decisions = ledger.decisions_report()?;
-            let trace_id = trace.or_else(|| {
-                decisions
-                    .iter()
-                    .find_map(|item| summary_value(&item.summary, "trace"))
-            });
-            let trace_report = trace_id
-                .as_deref()
-                .map(|trace_id| ledger.trace_report(trace_id))
-                .transpose()?;
-            let observations = ledger.observations_report(None, trace_id.as_deref())?;
-            let html = render_dashboard(&usage, &decisions, trace_report.as_ref(), &observations);
+            let report = reporting::dashboard_report(&ledger, trace.as_deref())?;
+            let html = render_dashboard(
+                &report.usage,
+                &report.decisions,
+                report.trace.as_ref(),
+                &report.observations,
+            );
             if let Some(parent) = out.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -312,7 +301,7 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
             }
             fs::write(&out, html).await?;
             println!("dashboard\t{}", out.display());
-            if let Some(trace_id) = trace_id {
+            if let Some(trace_id) = report.featured_trace_id {
                 println!("featured_trace\t{trace_id}");
             }
         }
@@ -2177,7 +2166,8 @@ mod tests {
             "examples/simulations/runaway-pressure.noet.yaml",
         );
         let runaway_html = render_simulation_dashboard(&runaway_report);
-        assert!(runaway_html.contains("Showcase evidence"));
+        assert!(runaway_html.contains("Comparison summary"));
+        assert!(runaway_html.contains("Guardrails changed the budget story"));
         assert!(runaway_html.contains("guarded team budget blocked 107 guarded requests"));
         assert!(runaway_html.contains("pooled without guard exhausted shared budget on day 3."));
 
@@ -2185,9 +2175,9 @@ mod tests {
             "examples/simulations/adoption-pressure.noet.yaml",
         );
         let adoption_html = render_simulation_dashboard(&adoption_report);
+        assert!(adoption_html.contains("Comparison summary"));
+        assert!(adoption_html.contains("Adoption policy changed what the team could see"));
         assert!(adoption_html.contains("Protected opportunity"));
-        assert!(adoption_html.contains("Low adopters"));
-        assert!(adoption_html.contains("High adopters"));
         assert!(adoption_html.contains(
             "protected adoption surfaced $1.11 of unused protected opportunity across 3 low adopters and 5 high adopters."
         ));
@@ -2764,10 +2754,12 @@ requests:
                 .expect("report json");
         let dashboard = std::fs::read_to_string(&dashboard_path).expect("read dashboard");
         assert_eq!(report["total_requests"], 337);
-        assert!(dashboard.contains("Strategy comparison"));
+        assert!(dashboard.contains("Comparison summary"));
         assert!(dashboard.contains("Protected opportunity"));
-        assert!(dashboard.contains("Low adopters"));
-        assert!(dashboard.contains("High adopters"));
+        assert!(dashboard.contains("Adoption policy changed what the team could see"));
+        assert!(dashboard.contains(
+            "protected-adoption surfaced $51.48 of unused protected opportunity across 2 low adopters and 1 high adopters."
+        ));
         let strategies = report["strategies"].as_array().expect("strategies");
         assert_eq!(strategies.len(), 2);
         let pooled = strategies
