@@ -11,7 +11,7 @@ Noether helps a team answer the questions that show up right after AI usage beco
 
 It sits beside the tools a team already uses, makes a decision before spend when possible, ingests
 usage and lifecycle evidence afterward, and turns the result into an explainable ledger, reports,
-and dashboards.
+and static export dashboards.
 
 Noether is not another chat UI, prompt warehouse, or generic provider router. It is the missing
 layer between AI usage and AI accountability.
@@ -49,7 +49,7 @@ AI agent / app / gateway
    allow / warn / deny   trace ingest
           \             /
            \           /
-      budget + policy + ledger + dashboard
+      budget + policy + ledger + static export dashboard
 ```
 
 ## What value it gives a team
@@ -77,7 +77,7 @@ That means Noether can help a team:
 ./examples/vertical-mvp-demo.sh
 ```
 
-Then generate a visual dashboard:
+Then generate a visual static export dashboard:
 
 ```bash
 cargo run --bin noet -- report \
@@ -98,7 +98,7 @@ xdg-open .noet/noether-dashboard.html
 cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-guard.noet.yaml
 ```
 
-This generates a local ledger, JSON reports, traces, and an HTML dashboard under:
+This generates a local ledger, JSON reports, traces, and an HTML static export dashboard under:
 
 ```text
 .noet/scenarios/runaway-agent-guard/
@@ -110,7 +110,7 @@ This generates a local ledger, JSON reports, traces, and an HTML dashboard under
 cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
 ```
 
-This writes a top-level simulation dashboard plus per-strategy dashboards under:
+This writes a top-level simulation static export dashboard plus per-strategy dashboards under:
 
 ```text
 .noet/simulations/adoption-pressure/
@@ -150,8 +150,8 @@ These are not marketing mockups. They come from deterministic examples in this r
   guarded budget before a team adopts a policy.
 - **Adoption visibility:** the simulation dashboard exposes low-adopter and high-adopter behavior,
   not only spend totals.
-- **Explainable decisions:** the run dashboard shows the exact deny outcome and guard hit that
-  stopped a risky request before spend.
+- **Explainable decisions:** the run static export dashboard shows the exact deny outcome and guard
+  hit that stopped a risky request before spend.
 
 ## What Noether does
 
@@ -168,7 +168,7 @@ Make AI work visible before controlling it.
 - tool and agent activity
 - eval/annotation events
 - local SQLite ledger
-- static HTML dashboard
+- static export dashboard HTML
 
 ### Attribute
 
@@ -209,7 +209,7 @@ Prove product claims with executable scenarios.
 
 - native end-to-end examples for common use cases
 - synthetic company simulations with user profiles and strategy comparisons
-- report/dashboard assertions for CI
+- report and static export dashboard assertions for CI
 - reproducible examples that require no live provider credentials
 
 ## What works today
@@ -242,8 +242,8 @@ cargo run --bin noet -- scenario run examples/scenarios/local-developer.noet.yam
 cargo run --bin noet -- scenario run examples/scenarios/team-pooled-budget.noet.yaml
 ```
 
-Each run writes a fresh SQLite ledger, JSON reports, per-request traces, and an HTML dashboard
-under `.noet/scenarios/<scenario-name>/`.
+Each run writes a fresh SQLite ledger, JSON reports, per-request traces, and an HTML static export
+dashboard under `.noet/scenarios/<scenario-name>/`.
 
 Additional checked-in scenarios cover:
 
@@ -262,8 +262,8 @@ cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
 cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
 ```
 
-Each simulation writes a comparison report, a top-level simulation dashboard, and per-strategy
-dashboards under `.noet/simulations/<simulation-name>/`.
+Each simulation writes a comparison report, a top-level simulation static export dashboard, and
+per-strategy dashboards under `.noet/simulations/<simulation-name>/`.
 
 - `synthetic-company.noet.yaml` compares pooled caps against protected adoption for a mixed team.
 - `runaway-pressure.noet.yaml` shows how a spend-window guard preserves budget under loop-risk load.

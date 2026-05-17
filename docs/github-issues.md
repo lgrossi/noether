@@ -12,8 +12,8 @@ Acceptance:
 - A real integration can call `POST /v1/authorize`.
 - Usage and lifecycle events can be finalized/ingested.
 - Reports show usage, decisions, trace stories, and observations.
-- Dashboard gives a non-table view of spend, tokens, decisions, tools, agent activity, and trace
-  timeline.
+- Static export dashboard gives a non-table view of spend, tokens, decisions, tools, agent
+  activity, and trace timeline.
 - Normal mode does not store prompt/body content by default.
 
 ## 2. First excellent integration
@@ -27,7 +27,7 @@ Acceptance:
 - Lifecycle and usage delivery is asynchronous and does not degrade Pi UX.
 - Fail-open/fail-closed behavior is documented.
 - Real-hook findings are represented in tests.
-- Reports and dashboard explain a Pi run without raw hook logs.
+- Reports and the static export dashboard explain a Pi run without raw hook logs.
 
 ## 3. Attribution and model control
 
@@ -54,7 +54,7 @@ Acceptance:
 - Guards can enforce or warn on context size.
 - Spend windows such as 5h and 7d can catch fast burn.
 - Tool-call, retry, and agent-step guards are represented once lifecycle data supports them.
-- Dashboard/reporting highlights guard hits and risky runs.
+- Static export dashboard and reporting highlight guard hits and risky runs.
 
 ## 5. Adoption governance
 
@@ -78,7 +78,8 @@ Acceptance:
 - Scenario files can describe budgets, entities, requests, model choices, tool activity, usage,
   denials, fallbacks, and finalization.
 - `noet scenario run <file>` replays the scenario through public contract surfaces.
-- Generated reports/dashboard show the expected story without live provider traffic.
+- Generated reports and the static export dashboard show the expected story without live provider
+  traffic.
 - Initial scenarios cover individual local developer, team pooled budget, project budget fallback,
   model-denial/fallback, runaway agent guard, and protected adoption pool.
 - Scenario assertions can fail CI when behavior or report output drifts.
@@ -97,7 +98,7 @@ Acceptance:
   reserved/shared budgets, and future standards.
 - Output compares budget usage, unused budget, denied requests, useful work blocked, runaway spend
   prevented, adoption coverage, fairness, model mix, carryover liability, and exhaustion timing.
-- Simulation output can generate a dashboard/report for human review.
+- Simulation output can generate a static export dashboard and report for human review.
 
 ## 8. Team deployment
 
@@ -108,5 +109,5 @@ Acceptance:
 - Shared server deployment path is documented.
 - Storage can move beyond local SQLite when needed.
 - Auth/trusted-upstream story is explicit.
-- Export/reporting API exists for dashboards and external analysis.
+- Reporting HTTP API and live dashboard remain future work in this slice until implemented.
 - Existing local-first behavior remains available.
