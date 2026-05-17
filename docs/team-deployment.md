@@ -1,8 +1,8 @@
 # Team deployment
 
 Noether remains local-first by default. Team deployment is an opt-in operating mode built from the
-same `noet serve` process, the same control contract, and a CLI/SQLite reporting flow that remains
-local-only until dedicated reporting HTTP endpoints ship.
+same `noet serve` process, the same control contract, and the same reporting surfaces now served
+from that process.
 
 ## Shared server path
 
@@ -23,8 +23,8 @@ Recommended shared-server shape:
 - terminate TLS and service authentication in front of Noether;
 - expose `/v1/authorize`, `/v1/reservations/{id}/finalize`, and `/v1/events` only to trusted
   callers;
-- treat report/export access as CLI/SQLite-only today; do not route `/v1/reports/*` or a live
-  browser dashboard to `noet serve` until dedicated reporting/UI endpoints exist;
+- expose `/v1/reports/*`, `/v1/reports/updates`, and `/dashboard` only behind the same trusted
+  auth/network boundary as the control contract;
 - keep `--decision-mode enforce` explicit for shared deployments;
 - store the policy file outside the application checkout and deploy it like other config;
 - treat fixture capture as a controlled debug path, not a default central retention path.
@@ -65,7 +65,7 @@ Recommended migration path:
 
 1. extract a repository/storage trait for decisions, reservations, usage observations, budget
    windows, allocation buckets, and events;
-2. keep the HTTP contract and CLI JSON output unchanged while introducing a Postgres-backed
+2. keep the reporting HTTP contract and CLI JSON output unchanged while introducing a Postgres-backed
    implementation;
 3. preserve backend-independent tests at the authorization/finalization/report level before
    swapping storage in deployment;
@@ -96,6 +96,7 @@ Security assumptions for shared deployment:
 - only trusted upstreams may call Noether directly;
 - service-to-service auth, mTLS, or an authenticated reverse proxy sits in front of Noether;
 - callers are responsible for truthful attribution metadata;
+- the served live dashboard should also sit behind that trusted reverse proxy boundary;
 - untrusted browser/mobile clients should not call Noether directly until a stronger auth and
   tenancy story exists.
 

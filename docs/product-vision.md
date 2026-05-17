@@ -38,7 +38,7 @@ Harness / app / proxy / SDK
 Hot-path decision     Trace/usage ingest
         \              /
          \            /
-          Policy + budget ledger + dashboard
+          Policy + budget ledger + reporting API + dashboards
 ```
 
 ## Adoption thesis
@@ -65,7 +65,7 @@ Make AI work visible:
 - trace timelines;
 - tool and agent activity;
 - eval and annotation events;
-- local ledger and dashboard.
+- local ledger, reporting API, and dashboards.
 
 ### Attribute
 
@@ -108,7 +108,7 @@ Noether should include:
 
 1. **Native end-to-end scenarios**
    - 5-6 curated examples that demonstrate realistic use cases from authorization through reports
-     and dashboard.
+     and the static export dashboard.
 
 2. **Strategy simulations**
    - synthetic companies with many users, teams, projects, usage profiles, and allocation/control
@@ -121,7 +121,7 @@ validate claims such as:
 - model allowlists deny or fallback correctly;
 - spend windows catch runaway burn;
 - protected adoption pools carry over correctly;
-- reports and dashboards explain the scenario in human terms.
+- reports, the live dashboard, and static export dashboards explain the scenario in human terms.
 
 ## Target users
 

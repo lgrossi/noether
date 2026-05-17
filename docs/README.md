@@ -7,7 +7,7 @@ This directory holds Noether's north-star product and architecture notes.
 - [Roadmap](./roadmap.md): near-term slices that keep the project pointed at the product thesis.
 - [Team deployment](./team-deployment.md): shared-server path, storage evolution, trust boundary,
   and local-first compatibility notes.
-- [Export and reporting API contract](./export-reporting-api.md): proposed HTTP export shapes based
-  on the existing CLI JSON contract.
+- [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
+  live-dashboard data/update surfaces, and the CLI/HTTP contract shape they share.
 
 These docs are intentionally higher-level than implementation tickets. They should change when the product thesis or architectural boundaries change, not for every small code edit.

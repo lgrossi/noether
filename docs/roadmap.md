@@ -115,7 +115,8 @@ Acceptance:
 - Shared server deployment path is documented.
 - Storage can move beyond local SQLite when needed.
 - Auth/trusted-upstream story is explicit.
-- Reporting HTTP API and live dashboard are future work in this slice, not shipped capability.
+- Reporting HTTP API and live dashboard are served by `noet serve` for dashboards and external
+  analysis.
 - Existing local-first behavior remains available.
 
 ## Later
