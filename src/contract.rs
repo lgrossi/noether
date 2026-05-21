@@ -50,6 +50,7 @@ impl AuthorizeRequest {
 pub struct AuthorizeDecision {
     pub decision_id: String,
     pub outcome: DecisionOutcome,
+    pub action: PolicyAction,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<Reservation>,
     pub explanations: Vec<DecisionExplanation>,
@@ -173,12 +174,16 @@ pub struct BudgetRule {
     pub warn_at_fraction: f64,
     #[serde(default = "default_window_seconds")]
     pub window_seconds: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_mode: Option<BudgetWindowMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_anchor: Option<WindowAnchorPolicy>,
     #[serde(default)]
     pub eligible: BudgetEligibility,
     #[serde(default)]
     pub models: BudgetModelPolicy,
     #[serde(default)]
-    pub guards: BudgetGuardPolicy,
+    pub limits: BudgetLimitPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation: Option<BudgetAllocationPolicy>,
     #[serde(default, rename = "match")]
@@ -198,41 +203,71 @@ pub struct BudgetModelPolicy {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct BudgetGuardPolicy {
+pub struct BudgetLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_estimated_request_cost_usd: Option<MaxEstimatedRequestCostGuard>,
+    pub request_cost: Option<RequestCostLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_context_tokens: Option<MaxContextTokensGuard>,
+    pub context_tokens: Option<ContextTokenLimit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub spend_windows: Vec<SpendWindowGuard>,
+    pub spend: Vec<SpendWindowLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<u64>,
+    pub tool_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_agent_steps: Option<u64>,
+    pub agent_steps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_retries: Option<u64>,
+    pub retries: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MaxEstimatedRequestCostGuard {
+pub struct RequestCostLimit {
     pub max_usd: f64,
-    #[serde(default = "default_guard_effect")]
-    pub effect: PolicyEffect,
+    #[serde(default = "default_limit_action")]
+    pub action: PolicyAction,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MaxContextTokensGuard {
+pub struct ContextTokenLimit {
     pub max_tokens: u64,
-    #[serde(default = "default_guard_effect")]
-    pub effect: PolicyEffect,
+    #[serde(default = "default_limit_action")]
+    pub action: PolicyAction,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SpendWindowGuard {
+pub struct SpendWindowLimit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub window: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SpendWindowMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<WindowAnchorPolicy>,
     pub max_usd: f64,
-    #[serde(default = "default_guard_effect")]
-    pub effect: PolicyEffect,
+    #[serde(default = "default_limit_action")]
+    pub action: PolicyAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetWindowMode {
+    Tumbling,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpendWindowMode {
+    Tumbling,
+    Rolling,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowAnchorPolicy {
+    pub kind: WindowAnchorKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowAnchorKind {
+    FirstSeen,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -271,7 +306,7 @@ pub struct RuleMatch {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PolicyRule {
     pub id: String,
-    pub effect: PolicyEffect,
+    pub action: PolicyAction,
     pub reason: String,
     #[serde(default)]
     pub when: PolicyCondition,
@@ -279,10 +314,33 @@ pub struct PolicyRule {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PolicyEffect {
+pub enum PolicyAction {
     Allow,
     Warn,
-    Deny,
+    Block,
+    Ask,
+}
+
+impl PolicyAction {
+    pub fn decision_outcome(self) -> DecisionOutcome {
+        match self {
+            Self::Allow => DecisionOutcome::Allow,
+            Self::Warn => DecisionOutcome::Warn,
+            Self::Block | Self::Ask => DecisionOutcome::Deny,
+        }
+    }
+
+    pub fn decision_severity(self) -> DecisionSeverity {
+        match self {
+            Self::Allow => DecisionSeverity::Info,
+            Self::Warn => DecisionSeverity::Warn,
+            Self::Block | Self::Ask => DecisionSeverity::Deny,
+        }
+    }
+
+    pub fn halts_request(self) -> bool {
+        matches!(self, Self::Block | Self::Ask)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -301,8 +359,8 @@ fn default_window_seconds() -> i64 {
     86_400
 }
 
-fn default_guard_effect() -> PolicyEffect {
-    PolicyEffect::Deny
+fn default_limit_action() -> PolicyAction {
+    PolicyAction::Block
 }
 
 #[cfg(test)]
@@ -360,6 +418,72 @@ mod tests {
         assert_eq!(
             request.metadata.get("entities"),
             Some(&Value::String("project:noether".to_owned()))
+        );
+    }
+
+    #[test]
+    fn budget_rule_contract_preserves_legacy_window_shape() {
+        let rule: BudgetRule = serde_yaml::from_str(
+            r#"
+id: legacy-budget
+limit_usd: 10
+window_seconds: 3600
+"#,
+        )
+        .expect("legacy rule parses");
+
+        let encoded = serde_yaml::to_string(&rule).expect("legacy rule serializes");
+        assert!(!encoded.contains("window_mode:"));
+        assert!(!encoded.contains("window_anchor:"));
+        assert_eq!(rule.window_mode, None);
+        assert_eq!(rule.window_anchor, None);
+    }
+
+    #[test]
+    fn budget_rule_contract_round_trips_explicit_window_shape() {
+        let rule: BudgetRule = serde_yaml::from_str(
+            r#"
+id: explicit-budget
+limit_usd: 10
+window_seconds: 3600
+window_mode: tumbling
+window_anchor:
+  kind: first_seen
+limits:
+  spend:
+    - id: daily-cap
+      window: 1d
+      mode: tumbling
+      anchor:
+        kind: first_seen
+      max_usd: 2
+      action: warn
+"#,
+        )
+        .expect("explicit rule parses");
+
+        assert_eq!(rule.window_mode, Some(BudgetWindowMode::Tumbling));
+        assert_eq!(
+            rule.window_anchor,
+            Some(WindowAnchorPolicy {
+                kind: WindowAnchorKind::FirstSeen,
+            })
+        );
+        assert_eq!(rule.limits.spend[0].id.as_deref(), Some("daily-cap"));
+        assert_eq!(rule.limits.spend[0].mode, Some(SpendWindowMode::Tumbling));
+        assert_eq!(
+            rule.limits.spend[0].anchor,
+            Some(WindowAnchorPolicy {
+                kind: WindowAnchorKind::FirstSeen,
+            })
+        );
+
+        let encoded = serde_yaml::to_string(&rule).expect("explicit rule serializes");
+        let decoded: BudgetRule = serde_yaml::from_str(&encoded).expect("explicit rule re-parses");
+        assert_eq!(decoded.window_mode, Some(BudgetWindowMode::Tumbling));
+        assert_eq!(
+            decoded.limits.spend[0].mode,
+            Some(SpendWindowMode::Tumbling)
         );
     }
 }

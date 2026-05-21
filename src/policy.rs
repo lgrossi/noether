@@ -1,11 +1,12 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionSeverity, PolicyEffect, PolicyRule,
-    RuleMatch,
+    AuthorizeRequest, BudgetRule, BudgetWindowMode, DecisionExplanation, DecisionSeverity,
+    PolicyAction, PolicyRule, RuleMatch, SpendWindowLimit, SpendWindowMode,
 };
 use crate::error::NoetError;
 
@@ -39,7 +40,11 @@ impl Default for RoutingPolicy {
 
 pub async fn load_policy(path: &Path) -> Result<PolicyFile, NoetError> {
     let bytes = fs::read(path).await?;
-    let policy: PolicyFile = serde_yaml::from_slice(&bytes)?;
+    parse_policy_bytes(&bytes)
+}
+
+pub fn parse_policy_bytes(bytes: &[u8]) -> Result<PolicyFile, NoetError> {
+    let policy: PolicyFile = serde_yaml::from_slice(bytes)?;
     validate_policy(&policy)?;
     Ok(policy)
 }
@@ -75,6 +80,17 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 budget.id
             ));
         }
+        match (budget.window_mode, budget.window_anchor.as_ref()) {
+            (Some(BudgetWindowMode::Tumbling), None) => errors.push(format!(
+                "budget {} window_anchor is required when window_mode is tumbling",
+                budget.id
+            )),
+            (None, Some(_)) => errors.push(format!(
+                "budget {} window_anchor requires window_mode tumbling",
+                budget.id
+            )),
+            _ => {}
+        }
         for entity in &budget.eligible.entities {
             if entity.trim().is_empty() {
                 errors.push(format!(
@@ -91,69 +107,96 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
         }
-        if let Some(guard) = &budget.guards.max_estimated_request_cost_usd {
-            if !guard.max_usd.is_finite() || guard.max_usd <= 0.0 {
+        if let Some(limit) = &budget.limits.request_cost {
+            if !limit.max_usd.is_finite() || limit.max_usd <= 0.0 {
                 errors.push(format!(
-                    "budget {} guards.max_estimated_request_cost_usd.max_usd must be positive",
+                    "budget {} limits.request_cost.max_usd must be positive",
                     budget.id
                 ));
             }
-            if !guard_effect_is_supported(guard.effect) {
+            if !limit_action_is_supported(limit.action) {
                 errors.push(format!(
-                    "budget {} guards.max_estimated_request_cost_usd.effect must be warn or deny",
-                    budget.id
-                ));
-            }
-        }
-        if let Some(guard) = &budget.guards.max_context_tokens {
-            if guard.max_tokens == 0 {
-                errors.push(format!(
-                    "budget {} guards.max_context_tokens.max_tokens must be positive",
-                    budget.id
-                ));
-            }
-            if !guard_effect_is_supported(guard.effect) {
-                errors.push(format!(
-                    "budget {} guards.max_context_tokens.effect must be warn or deny",
+                    "budget {} limits.request_cost.action must be warn, ask, or block",
                     budget.id
                 ));
             }
         }
-        for guard in &budget.guards.spend_windows {
-            if parse_guard_window(&guard.window).is_none() {
+        if let Some(limit) = &budget.limits.context_tokens {
+            if limit.max_tokens == 0 {
                 errors.push(format!(
-                    "budget {} guards.spend_windows.window must use <number><s|m|h|d>, got {}",
-                    budget.id, guard.window
-                ));
-            }
-            if !guard.max_usd.is_finite() || guard.max_usd <= 0.0 {
-                errors.push(format!(
-                    "budget {} guards.spend_windows.max_usd must be positive",
+                    "budget {} limits.context_tokens.max_tokens must be positive",
                     budget.id
                 ));
             }
-            if !guard_effect_is_supported(guard.effect) {
+            if !limit_action_is_supported(limit.action) {
                 errors.push(format!(
-                    "budget {} guards.spend_windows.effect must be warn or deny",
+                    "budget {} limits.context_tokens.action must be warn, ask, or block",
                     budget.id
                 ));
             }
         }
-        if budget.guards.max_tool_calls == Some(0) {
+        let mut spend_window_ids = BTreeSet::new();
+        for limit in &budget.limits.spend {
+            if parse_limit_window(&limit.window).is_none() {
+                errors.push(format!(
+                    "budget {} limits.spend.window must use <number><s|m|h|d>, got {}",
+                    budget.id, limit.window
+                ));
+            }
+            if !limit.max_usd.is_finite() || limit.max_usd <= 0.0 {
+                errors.push(format!(
+                    "budget {} limits.spend.max_usd must be positive",
+                    budget.id
+                ));
+            }
+            if !limit_action_is_supported(limit.action) {
+                errors.push(format!(
+                    "budget {} limits.spend.action must be warn, ask, or block",
+                    budget.id
+                ));
+            }
+            if let Some(id) = limit.id.as_deref() {
+                if id.trim().is_empty() {
+                    errors.push(format!(
+                        "budget {} limits.spend.id must not be empty",
+                        budget.id
+                    ));
+                } else if !spend_window_ids.insert(id.to_owned()) {
+                    errors.push(format!(
+                        "budget {} limits.spend ids must be unique, found duplicate id {}",
+                        budget.id, id
+                    ));
+                }
+            }
+            match (limit.mode, limit.anchor.as_ref()) {
+                (Some(SpendWindowMode::Tumbling), None) => errors.push(format!(
+                    "budget {} limits.spend[{}].anchor is required when mode is tumbling",
+                    budget.id,
+                    spend_window_label(limit)
+                )),
+                (Some(SpendWindowMode::Rolling) | None, Some(_)) => errors.push(format!(
+                    "budget {} limits.spend[{}].anchor requires mode tumbling",
+                    budget.id,
+                    spend_window_label(limit)
+                )),
+                _ => {}
+            }
+        }
+        if budget.limits.tool_calls == Some(0) {
             errors.push(format!(
-                "budget {} guards.max_tool_calls must be positive",
+                "budget {} limits.tool_calls must be positive",
                 budget.id
             ));
         }
-        if budget.guards.max_agent_steps == Some(0) {
+        if budget.limits.agent_steps == Some(0) {
             errors.push(format!(
-                "budget {} guards.max_agent_steps must be positive",
+                "budget {} limits.agent_steps must be positive",
                 budget.id
             ));
         }
-        if budget.guards.max_retries == Some(0) {
+        if budget.limits.retries == Some(0) {
             errors.push(format!(
-                "budget {} guards.max_retries must be positive",
+                "budget {} limits.retries must be positive",
                 budget.id
             ));
         }
@@ -228,22 +271,43 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
     }
 }
 
+pub fn policy_validation_warnings(policy: &PolicyFile) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for budget in &policy.budgets {
+        if budget.window_mode.is_none() && budget.window_anchor.is_none() {
+            warnings.push(format!(
+                "budget {} uses implicit legacy window semantics; set window_mode/window_anchor explicitly",
+                budget.id
+            ));
+        }
+
+        for limit in &budget.limits.spend {
+            if limit.mode.is_none() && limit.anchor.is_none() {
+                warnings.push(format!(
+                    "budget {} limits.spend[{}] uses implicit legacy rolling semantics; set id/mode/anchor explicitly",
+                    budget.id,
+                    spend_window_label(limit)
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
 pub fn matching_policy_explanations(
     policy: &PolicyFile,
     request: &AuthorizeRequest,
-) -> Vec<(PolicyEffect, DecisionExplanation)> {
+) -> Vec<(PolicyAction, DecisionExplanation)> {
     policy
         .policies
         .iter()
         .filter(|rule| policy_rule_matches(rule, request))
         .map(|rule| {
-            let severity = match rule.effect {
-                PolicyEffect::Allow => DecisionSeverity::Info,
-                PolicyEffect::Warn => DecisionSeverity::Warn,
-                PolicyEffect::Deny => DecisionSeverity::Deny,
-            };
+            let severity = rule.action.decision_severity();
             (
-                rule.effect,
+                rule.action,
                 DecisionExplanation {
                     rule_id: rule.id.clone(),
                     reason: rule.reason.clone(),
@@ -380,11 +444,18 @@ fn default_specificity() -> Vec<String> {
         .collect()
 }
 
-fn guard_effect_is_supported(effect: PolicyEffect) -> bool {
-    matches!(effect, PolicyEffect::Warn | PolicyEffect::Deny)
+fn limit_action_is_supported(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::Warn | PolicyAction::Ask | PolicyAction::Block
+    )
 }
 
-pub fn parse_guard_window(value: &str) -> Option<chrono::Duration> {
+fn spend_window_label(limit: &SpendWindowLimit) -> &str {
+    limit.id.as_deref().unwrap_or(limit.window.as_str())
+}
+
+pub fn parse_limit_window(value: &str) -> Option<chrono::Duration> {
     let trimmed = value.trim();
     let (amount, unit) = trimmed.split_at(trimmed.len().checked_sub(1)?);
     let amount: i64 = amount.parse().ok()?;
@@ -414,22 +485,22 @@ budgets:
     limit_usd: 1.0
     warn_at_fraction: 0.5
     window_seconds: 60
-    guards:
-      max_estimated_request_cost_usd:
+    limits:
+      request_cost:
         max_usd: 0.25
-        effect: warn
-      max_context_tokens:
+        action: warn
+      context_tokens:
         max_tokens: 120000
-        effect: deny
-      spend_windows:
+        action: block
+      spend:
         - window: 5h
           max_usd: 10
-          effect: warn
+          action: warn
     match:
       project: noether
 policies:
   - id: require-project
-    effect: deny
+    action: block
     reason: project is required
     when:
       missing: project
@@ -443,76 +514,172 @@ policies:
     }
 
     #[test]
-    fn rejects_invalid_guard_policy() {
+    fn rejects_invalid_limit_policy() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
 version: 0
 budgets:
   - id: dev-daily
     limit_usd: 1.0
-    guards:
-      max_estimated_request_cost_usd:
+    limits:
+      request_cost:
         max_usd: 0
-        effect: allow
-      max_context_tokens:
+        action: allow
+      context_tokens:
         max_tokens: 0
-        effect: allow
+        action: allow
 "#,
         )
         .expect("policy parses");
 
-        let error = validate_policy(&policy).expect_err("guard policy should be invalid");
+        let error = validate_policy(&policy).expect_err("limit policy should be invalid");
         let message = error.to_string();
         assert!(message.contains("max_usd must be positive"));
-        assert!(message.contains("effect must be warn or deny"));
+        assert!(message.contains("action must be warn, ask, or block"));
         assert!(message.contains("max_tokens must be positive"));
     }
 
     #[test]
-    fn rejects_invalid_spend_window_guard_policy() {
+    fn rejects_invalid_spend_window_limit_policy() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
 version: 0
 budgets:
   - id: dev-daily
     limit_usd: 1.0
-    guards:
-      spend_windows:
+    limits:
+      spend:
         - window: 5x
           max_usd: 0
-          effect: allow
+          action: allow
 "#,
         )
         .expect("policy parses");
 
-        let error = validate_policy(&policy).expect_err("spend window guard should be invalid");
+        let error = validate_policy(&policy).expect_err("spend window limit should be invalid");
         let message = error.to_string();
-        assert!(message.contains("guards.spend_windows.window must use <number><s|m|h|d>"));
-        assert!(message.contains("guards.spend_windows.max_usd must be positive"));
-        assert!(message.contains("guards.spend_windows.effect must be warn or deny"));
+        assert!(message.contains("limits.spend.window must use <number><s|m|h|d>"));
+        assert!(message.contains("limits.spend.max_usd must be positive"));
+        assert!(message.contains("limits.spend.action must be warn, ask, or block"));
     }
 
     #[test]
-    fn rejects_invalid_lifecycle_guard_policy() {
+    fn rejects_invalid_explicit_window_mode_anchor_combinations() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: explicit-budget
+    limit_usd: 1.0
+    window_mode: tumbling
+    limits:
+      spend:
+        - id: rolling-with-anchor
+          window: 5h
+          mode: rolling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: warn
+        - id: tumbling-without-anchor
+          window: 1d
+          mode: tumbling
+          max_usd: 2
+          action: block
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("mode/anchor mismatch should be invalid");
+        let message = error.to_string();
+        assert!(message.contains(
+            "budget explicit-budget window_anchor is required when window_mode is tumbling"
+        ));
+        assert!(message.contains(
+            "budget explicit-budget limits.spend[rolling-with-anchor].anchor requires mode tumbling"
+        ));
+        assert!(message.contains("budget explicit-budget limits.spend[tumbling-without-anchor].anchor is required when mode is tumbling"));
+    }
+
+    #[test]
+    fn rejects_duplicate_spend_window_ids_within_a_budget() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: duplicate-limits
+    limit_usd: 1.0
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          max_usd: 1
+          action: warn
+        - id: daily-cap
+          window: 5h
+          max_usd: 2
+          action: block
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("duplicate limit ids should be invalid");
+        assert!(error.to_string().contains(
+            "budget duplicate-limits limits.spend ids must be unique, found duplicate id daily-cap"
+        ));
+    }
+
+    #[test]
+    fn reports_legacy_window_warnings_for_implicit_budget_and_limit_semantics() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: legacy-budget
+    limit_usd: 1.0
+    limits:
+      spend:
+        - window: 1d
+          max_usd: 1
+          action: warn
+"#,
+        )
+        .expect("policy parses");
+
+        validate_policy(&policy).expect("legacy policy still validates");
+        let warnings = policy_validation_warnings(&policy);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("budget legacy-budget uses implicit legacy window semantics")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.contains(
+                "budget legacy-budget limits.spend[1d] uses implicit legacy rolling semantics",
+            )
+        }));
+    }
+
+    #[test]
+    fn rejects_invalid_lifecycle_limit_policy() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
 version: 0
 budgets:
   - id: dev-daily
     limit_usd: 1.0
-    guards:
-      max_tool_calls: 0
-      max_agent_steps: 0
-      max_retries: 0
+    limits:
+      tool_calls: 0
+      agent_steps: 0
+      retries: 0
 "#,
         )
         .expect("policy parses");
 
-        let error = validate_policy(&policy).expect_err("lifecycle guard policy should be invalid");
+        let error = validate_policy(&policy).expect_err("lifecycle limit policy should be invalid");
         let message = error.to_string();
-        assert!(message.contains("guards.max_tool_calls must be positive"));
-        assert!(message.contains("guards.max_agent_steps must be positive"));
-        assert!(message.contains("guards.max_retries must be positive"));
+        assert!(message.contains("limits.tool_calls must be positive"));
+        assert!(message.contains("limits.agent_steps must be positive"));
+        assert!(message.contains("limits.retries must be positive"));
     }
 
     #[test]

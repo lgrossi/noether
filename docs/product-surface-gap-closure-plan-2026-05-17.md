@@ -1,5 +1,8 @@
 # Product surface gap closure plan — 2026-05-17
 
+> Historical note: this plan predates the artifact-backed simulation HTTP/browser surfaces shipped
+> on 2026-05-18. Use `docs/export-reporting-api.md` for the current surface contract.
+
 ## Goal
 
 Close the audited gap between:
@@ -342,4 +345,3 @@ These gaps are closed only when all are true:
 3. the live UI is backed by reporting data, not by CLI snapshot HTML reuse.
 4. docs no longer describe proposed-only capabilities as existing.
 5. static export and live UI are described as different product surfaces.
-

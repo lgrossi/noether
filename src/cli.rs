@@ -12,7 +12,8 @@ use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, Trac
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
 use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
-use crate::policy::load_policy;
+use crate::local::{DEFAULT_LOCAL_BIND, ensure_local_runtime_layout};
+use crate::policy::{load_policy, policy_validation_warnings};
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
 use crate::reporting;
@@ -35,6 +36,8 @@ struct Cli {
 enum Command {
     /// Run the local capture and decision server.
     Serve(ServeArgs),
+    /// Run Noether with the standard local `.noether/` runtime layout.
+    Local(LocalCommand),
     /// Validate and inspect policy files.
     Policy(PolicyCommand),
     /// Inspect captured fixture files.
@@ -57,6 +60,10 @@ struct ServeArgs {
     #[arg(long, default_value = ".noet/fixtures")]
     fixture_dir: PathBuf,
 
+    /// Directory where generated simulation artifacts are read for browser/API surfaces.
+    #[arg(long, default_value = ".noet/simulations")]
+    simulation_dir: PathBuf,
+
     /// SQLite ledger path for durable local state.
     #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
@@ -75,6 +82,41 @@ struct ServeArgs {
 
     /// Decision mode for capture proxy requests when a policy is configured.
     #[arg(long, value_enum, default_value_t = DecisionMode::DryRun)]
+    decision_mode: DecisionMode,
+}
+
+#[derive(Parser)]
+struct LocalCommand {
+    #[command(subcommand)]
+    command: LocalSubcommand,
+}
+
+#[derive(Subcommand)]
+enum LocalSubcommand {
+    /// Start the local sidecar with repo-local `.noether/` defaults.
+    Up(LocalUpArgs),
+}
+
+#[derive(Parser)]
+struct LocalUpArgs {
+    /// Repo root that should contain the `.noether/` runtime home.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+
+    /// Address to bind for the local sidecar.
+    #[arg(long, default_value = DEFAULT_LOCAL_BIND)]
+    bind: SocketAddr,
+
+    /// Optional upstream base URL. When omitted, Noether returns mock responses.
+    #[arg(long)]
+    upstream: Option<url::Url>,
+
+    /// Optional transparent proxy route config YAML.
+    #[arg(long)]
+    routes: Option<PathBuf>,
+
+    /// Decision mode for the local sidecar.
+    #[arg(long, value_enum, default_value_t = DecisionMode::Enforce)]
     decision_mode: DecisionMode,
 }
 
@@ -181,8 +223,9 @@ pub async fn run() -> Result<(), NoetError> {
 
     match cli.command {
         Command::Serve(args) => {
-            let policy = match args.policy {
-                Some(path) => Some(load_policy(&path).await?),
+            let policy_path = args.policy.clone();
+            let policy = match policy_path.as_ref() {
+                Some(path) => Some(load_policy(path).await?),
                 None => None,
             };
             let routes = match args.routes {
@@ -192,14 +235,17 @@ pub async fn run() -> Result<(), NoetError> {
             serve(ServeConfig {
                 bind: args.bind,
                 fixture_dir: args.fixture_dir,
+                simulation_dir: args.simulation_dir,
                 db_path: args.db_path,
                 upstream: args.upstream,
                 routes,
+                policy_path,
                 policy,
                 decision_mode: args.decision_mode,
             })
             .await
         }
+        Command::Local(command) => run_local(command).await,
         Command::Policy(command) => run_policy(command).await,
         Command::Fixtures(command) => run_fixtures(command).await,
         Command::Report(command) => run_report(command).await,
@@ -208,10 +254,38 @@ pub async fn run() -> Result<(), NoetError> {
     }
 }
 
+async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
+    match command.command {
+        LocalSubcommand::Up(args) => {
+            let layout = ensure_local_runtime_layout(&args.root).await?;
+            let policy = load_policy(&layout.policy_path).await?;
+            let routes = match args.routes {
+                Some(path) => load_proxy_routes(&path).await?.routes,
+                None => Vec::new(),
+            };
+            serve(ServeConfig {
+                bind: args.bind,
+                fixture_dir: layout.fixture_dir,
+                simulation_dir: layout.simulation_dir,
+                db_path: layout.db_path,
+                upstream: args.upstream,
+                routes,
+                policy_path: Some(layout.policy_path),
+                policy: Some(policy),
+                decision_mode: args.decision_mode,
+            })
+            .await
+        }
+    }
+}
+
 async fn run_policy(command: PolicyCommand) -> Result<(), NoetError> {
     match command.command {
         PolicySubcommand::Check { path } => {
             let policy = load_policy(&path).await?;
+            for warning in policy_validation_warnings(&policy) {
+                println!("warning: {warning}");
+            }
             println!(
                 "policy ok: version={}, budgets={}, policies={}",
                 policy.version,
@@ -356,12 +430,14 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         simulation_dashboard_path.display()
     );
     for strategy in &report.strategies {
-        let strategy_dashboard_path = strategy
-            .db_path
+        let strategy_db_path = out_dir.join(&strategy.db_path);
+        let strategy_usage_report_path = out_dir.join(&strategy.usage_report_path);
+        let strategy_decisions_report_path = out_dir.join(&strategy.decisions_report_path);
+        let strategy_dashboard_path = strategy_db_path
             .parent()
             .unwrap_or(&out_dir)
             .join("noether-dashboard.html");
-        let ledger = BudgetLedger::open_sqlite(&strategy.db_path)?;
+        let ledger = BudgetLedger::open_sqlite(&strategy_db_path)?;
         let usage = ledger.usage_report()?;
         let decisions = ledger.decisions_report()?;
         fs::write(
@@ -370,11 +446,11 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         )
         .await?;
         println!("strategy\t{}", strategy.id);
-        println!("db_path\t{}", strategy.db_path.display());
-        println!("usage_report\t{}", strategy.usage_report_path.display());
+        println!("db_path\t{}", strategy_db_path.display());
+        println!("usage_report\t{}", strategy_usage_report_path.display());
         println!(
             "decisions_report\t{}",
-            strategy.decisions_report_path.display()
+            strategy_decisions_report_path.display()
         );
         println!("dashboard\t{}", strategy_dashboard_path.display());
     }
@@ -862,16 +938,16 @@ fn evaluate_scenario_assertion(
                 ));
             }
         }
-        ScenarioAssertion::GuardHit {
+        ScenarioAssertion::LimitHit {
             request_id,
             rule_id,
         } => match decision_reports.get(request_id.as_str()) {
             Some(item)
                 if item
-                    .guard_hits
+                    .limit_hits
                     .as_ref()
                     .is_some_and(|hits| hits.iter().any(|hit| hit.rule_id == *rule_id)) => {}
-            Some(_) => failures.push(format!("request {request_id} expected guard hit {rule_id}")),
+            Some(_) => failures.push(format!("request {request_id} expected limit hit {rule_id}")),
             None => failures.push(format!("missing decision report for request {request_id}")),
         },
         ScenarioAssertion::Fallback {
@@ -1161,6 +1237,7 @@ fn render_dashboard(
     let totals = usage_totals(usage);
     let latest_decision = decisions.first();
     let activity = dashboard_activity(trace, observations);
+    let decision_stats = decision_stats(decisions);
     let tool_count = activity
         .iter()
         .filter(|item| is_tool_kind(&item.kind))
@@ -1169,75 +1246,68 @@ fn render_dashboard(
         .iter()
         .filter(|item| is_agent_kind(&item.kind))
         .count();
+    let skill_context_count = activity
+        .iter()
+        .filter(|item| is_skill_context_kind(&item.kind))
+        .count();
+    let lifecycle_limits = trace
+        .map(|trace| {
+            trace
+                .items
+                .iter()
+                .filter(|item| item.kind.starts_with("limit.report_only."))
+                .count()
+        })
+        .unwrap_or_default();
+    let token_hint = token_hint(&totals);
+    let latest_decision_hint = latest_decision
+        .map(latest_decision_hint)
+        .unwrap_or_else(|| "no authorization decisions yet".to_owned());
+    let (story_title, story_lead, story_points) = run_story(
+        usage,
+        decisions,
+        &decision_stats,
+        &activity,
+        latest_decision,
+    );
+
     let mut html = String::new();
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     html.push_str("<title>Noether dashboard</title>");
-    html.push_str(
-        "<style>
-        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --blue:#38bdf8; --violet:#a78bfa; }
-        * { box-sizing: border-box; }
-        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:radial-gradient(circle at top left,#172554,#0f172a 42%); color:var(--text); }
-        main { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
-        h1 { margin:0 0 4px; font-size:34px; letter-spacing:-0.04em; }
-        h2 { margin:28px 0 12px; font-size:20px; }
-        .sub { color:var(--muted); margin-bottom:24px; }
-        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); }
-        .card, .panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 55px rgba(0,0,0,.22); }
-        .card { padding:18px; }
-        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-        .value { font-size:30px; font-weight:800; margin-top:6px; letter-spacing:-0.03em; }
-        .hint { color:var(--muted); margin-top:4px; }
-        .panel { padding:18px; margin-top:14px; overflow:hidden; }
-        .bar { height:12px; display:flex; overflow:hidden; border-radius:999px; background:#1e293b; margin:10px 0; }
-        .in { background:var(--blue); }
-        .out { background:var(--violet); }
-        .cache { background:var(--warn); }
-        .legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
-        .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
-        .timeline { list-style:none; margin:0; padding:0; }
-        .event { display:grid; grid-template-columns:165px 210px 1fr; gap:12px; padding:13px 0; border-top:1px solid var(--line); align-items:start; }
-        .event:first-child { border-top:0; }
-        .time, .summary { color:var(--muted); }
-        .kind { font-weight:700; }
-        .pill { display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; background:#1e293b; border:1px solid var(--line); font-size:13px; }
-        .ok { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-        table { width:100%; border-collapse:collapse; }
-        th, td { text-align:left; padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
-        th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-        .empty { color:var(--muted); padding:18px; border:1px dashed var(--line); border-radius:14px; }
-        @media (max-width:760px) { .event { grid-template-columns:1fr; gap:2px; } h1 { font-size:28px; } }
-        </style>",
-    );
+    html.push_str(dashboard_styles());
     html.push_str("</head><body><main>");
     html.push_str("<h1>Noether run dashboard</h1>");
     html.push_str("<div class=\"sub\">Readable local view of decisions, cost, usage, and trace events. Raw hook logs are not needed here.</div>");
 
-    html.push_str("<section class=\"grid\">");
+    html.push_str("<section class=\"overview\">");
+    let _ = write!(
+        html,
+        "<article class=\"panel story\"><div class=\"eyebrow\">Outcome summary</div><h2>{}</h2><p class=\"lead\">{}</p>",
+        escape_html(&story_title),
+        escape_html(&story_lead)
+    );
+    if !story_points.is_empty() {
+        html.push_str("<ul class=\"insight-list\">");
+        for point in story_points {
+            let _ = write!(html, "<li>{}</li>", escape_html(&point));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</article>");
+
+    html.push_str("<section class=\"metric-grid\">");
     metric_card(
         &mut html,
-        "Spend",
+        "Finalized spend",
         &format_money(usage.total_cost_usd),
-        "finalized local ledger cost",
+        "what actually landed in the local ledger",
     );
     metric_card(
         &mut html,
         "Tokens",
         &compact_number(totals.total_tokens),
-        &format!(
-            "{} input / {} output",
-            compact_number(totals.input_tokens),
-            compact_number(totals.output_tokens)
-        ),
-    );
-    metric_card(
-        &mut html,
-        "Reservations",
-        &totals.reservations.to_string(),
-        &format!(
-            "{} finalized, {} active",
-            totals.finalized_reservations, totals.active_reservations
-        ),
+        &token_hint,
     );
     metric_card(
         &mut html,
@@ -1245,34 +1315,41 @@ fn render_dashboard(
         latest_decision
             .map(|item| decision_label(&item.kind))
             .unwrap_or("none"),
-        latest_decision
-            .map(|item| item.summary.as_str())
-            .unwrap_or("no authorization decisions yet"),
+        &latest_decision_hint,
     );
     metric_card(
         &mut html,
-        "Tools",
-        &tool_count.to_string(),
-        "tool calls/results observed for the featured run",
+        "Decision mix",
+        &format!(
+            "{} allow · {} warn · {} deny",
+            decision_stats.allow, decision_stats.warn, decision_stats.deny
+        ),
+        "how often policy allowed, warned, or blocked work",
     );
-    metric_card(
-        &mut html,
-        "Agent activity",
-        &agent_count.to_string(),
-        "provider, message, turn, and agent lifecycle events",
-    );
+    if tool_count > 0 || agent_count > 0 || skill_context_count > 0 {
+        metric_card(
+            &mut html,
+            "Run evidence",
+            &format!(
+                "{} tools · {} agent · {} context",
+                tool_count, agent_count, skill_context_count
+            ),
+            "activity surfaced alongside decisions and budget outcomes",
+        );
+    } else {
+        metric_card(
+            &mut html,
+            "Visible spend rows",
+            &usage.rows.len().to_string(),
+            "finalized usage rows that explain where cost landed",
+        );
+    }
     if let Some(adoption) = &usage.protected_adoption {
         metric_card(
             &mut html,
             "Protected opportunity",
             &format_money(adoption.unused_protected_opportunity_usd),
-            "remaining current protected grant this window",
-        );
-        metric_card(
-            &mut html,
-            "Carryover liability",
-            &format_money(adoption.carryover_liability_usd),
-            "carryover reserved for future protected use",
+            "unused current protected grant this window",
         );
         metric_card(
             &mut html,
@@ -1284,55 +1361,224 @@ fn render_dashboard(
             ),
             "simple view of underuse versus heavy protected-budget use",
         );
+    } else {
+        metric_card(
+            &mut html,
+            "Limit hits",
+            &decision_stats.limit_hits.to_string(),
+            "budget limits that fired across recent decisions",
+        );
     }
     html.push_str("</section>");
+    html.push_str("</section>");
 
-    token_mix_panel(&mut html, &totals);
-    usage_rows_panel(&mut html, usage);
-    protected_adoption_panel(&mut html, usage);
-    tools_panel(&mut html, &activity);
-    agent_activity_panel(&mut html, &activity);
-    skill_context_panel(&mut html, &activity);
-    decisions_panel(&mut html, decisions);
-    risky_runs_panel(&mut html, decisions);
-    lifecycle_guardrails_panel(&mut html, trace);
-    timeline_panel(&mut html, trace, observations);
+    let has_policy_story =
+        !decisions.is_empty() || decision_stats.limit_hits > 0 || lifecycle_limits > 0;
+    let has_spend_breakdown = usage.rows.iter().any(|row| row.total_cost_usd > 0.0);
+    let has_spend_story = has_spend_breakdown
+        || totals.total_tokens > 0
+        || !usage.rows.is_empty()
+        || usage.protected_adoption.is_some();
+    let has_run_evidence = trace.is_some()
+        || !observations.is_empty()
+        || tool_count > 0
+        || agent_count > 0
+        || skill_context_count > 0;
+
+    if has_policy_story {
+        html.push_str("<section class=\"section-block\">");
+        section_header(
+            &mut html,
+            "Policy",
+            "Policy decisions",
+            "This section shows how Noether routed work, what it blocked, and the policy evidence behind each outcome.",
+        );
+        if !decisions.is_empty() {
+            html.push_str("<section class=\"split\">");
+            decision_flow_panel(&mut html, &decision_stats);
+            decisions_panel(&mut html, decisions);
+            html.push_str("</section>");
+            budget_routing_panel(&mut html, decisions);
+        }
+        if decision_stats.limit_hits > 0 || lifecycle_limits > 0 {
+            html.push_str("<section class=\"split\">");
+            if decision_stats.limit_hits > 0 {
+                risky_runs_panel(&mut html, decisions);
+            }
+            if lifecycle_limits > 0 {
+                lifecycle_limits_panel(&mut html, trace);
+            }
+            html.push_str("</section>");
+        }
+        html.push_str("</section>");
+    }
+
+    if has_spend_story {
+        html.push_str("<section class=\"section-block\">");
+        section_header(
+            &mut html,
+            "Spend",
+            "Spend and adoption",
+            "Visual-first cost and adoption views show where finalized usage landed and who still has room to use protected budget.",
+        );
+        if has_spend_breakdown || totals.total_tokens > 0 {
+            html.push_str("<section class=\"split\">");
+            if has_spend_breakdown {
+                spend_breakdown_panel(&mut html, usage);
+            }
+            if totals.total_tokens > 0 {
+                token_mix_panel(&mut html, &totals);
+            }
+            html.push_str("</section>");
+        }
+        if usage.protected_adoption.is_some() {
+            adoption_snapshot_panel(&mut html, usage);
+            protected_adoption_panel(&mut html, usage);
+        }
+        if !usage.rows.is_empty() {
+            usage_rows_panel(&mut html, usage);
+        }
+        html.push_str("</section>");
+    }
+
+    if has_run_evidence {
+        html.push_str("<section class=\"section-block\">");
+        section_header(
+            &mut html,
+            "Evidence",
+            "Run evidence",
+            "Trace events, tool activity, and agent lifecycle signals explain how the run unfolded without exposing raw prompt logs.",
+        );
+        html.push_str("<section class=\"split\">");
+        if trace.is_some() || !observations.is_empty() {
+            timeline_panel(&mut html, trace, observations);
+        }
+        if tool_count > 0 || agent_count > 0 || skill_context_count > 0 {
+            html.push_str("<div class=\"stack-panels\">");
+            if tool_count > 0 {
+                tools_panel(&mut html, &activity);
+            }
+            if agent_count > 0 {
+                agent_activity_panel(&mut html, &activity);
+            }
+            if skill_context_count > 0 {
+                skill_context_panel(&mut html, &activity);
+            }
+            html.push_str("</div>");
+        }
+        html.push_str("</section>");
+        html.push_str("</section>");
+    }
 
     html.push_str("</main></body></html>");
     html
 }
 
 fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonReport) -> String {
+    let title = report.name.as_deref().unwrap_or("Simulation comparison");
+    let (story_title, story_lead, story_points) = simulation_story(report);
+    let spend_values: Vec<(String, f64, String)> = report
+        .strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.id.clone(),
+                strategy.total_cost_usd,
+                format_money(strategy.total_cost_usd),
+            )
+        })
+        .collect();
+    let denied_values: Vec<(String, f64, String)> = report
+        .strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.id.clone(),
+                strategy.denied_requests as f64,
+                compact_number(strategy.denied_requests),
+            )
+        })
+        .collect();
+    let runaway_values: Vec<(String, f64, String)> = report
+        .strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.id.clone(),
+                strategy.runaway_spend_prevented_usd,
+                format_money(strategy.runaway_spend_prevented_usd),
+            )
+        })
+        .collect();
+    let adoption_values: Vec<(String, f64, String)> = report
+        .strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.id.clone(),
+                strategy.unused_protected_opportunity_usd,
+                format_money(strategy.unused_protected_opportunity_usd),
+            )
+        })
+        .collect();
+    let fairness_values: Vec<(String, f64, String)> = report
+        .strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.id.clone(),
+                strategy.fairness_score,
+                format!("{:.2}", strategy.fairness_score),
+            )
+        })
+        .collect();
+    let highest_spend = report
+        .strategies
+        .iter()
+        .map(|strategy| strategy.total_cost_usd)
+        .fold(0.0_f64, f64::max);
+    let max_runaway_prevented = report
+        .strategies
+        .iter()
+        .map(|strategy| strategy.runaway_spend_prevented_usd)
+        .fold(0.0_f64, f64::max);
+    let max_protected_opportunity = report
+        .strategies
+        .iter()
+        .map(|strategy| strategy.unused_protected_opportunity_usd)
+        .fold(0.0_f64, f64::max);
+
     let mut html = String::new();
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-    html.push_str("<title>Noether simulation dashboard</title>");
-    html.push_str(
-        "<style>
-        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --blue:#38bdf8; }
-        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:#0f172a; color:var(--text); }
-        main { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
-        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-        .card, .panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; }
-        .card { padding:18px; }
-        .panel { padding:18px; margin-top:16px; }
-        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-        .value { font-size:30px; font-weight:800; margin-top:6px; }
-        table { width:100%; border-collapse:collapse; }
-        th, td { text-align:left; padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
-        th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-        code { color:var(--blue); }
-        </style>",
-    );
+    html.push_str("<title>Noether dashboard</title>");
+    html.push_str(dashboard_styles());
     html.push_str("</head><body><main>");
-    let title = report.name.as_deref().unwrap_or("Simulation comparison");
+    html.push_str("<h1>Noether dashboard</h1>");
     let _ = write!(
         html,
-        "<h1>{}</h1><p>Seed <code>{}</code> over {} simulated day(s).</p>",
+        "<div class=\"sub\">Comparison view · {} · seed <code>{}</code> over {} simulated day(s).</div>",
         escape_html(title),
         report.seed,
         report.horizon_days
     );
+
+    html.push_str("<section class=\"hero\">");
+    let _ = write!(
+        html,
+        "<article class=\"panel story\"><div class=\"eyebrow\">Comparison summary</div><h2>{}</h2><p class=\"lead\">{}</p>",
+        escape_html(&story_title),
+        escape_html(&story_lead)
+    );
+    if !story_points.is_empty() {
+        html.push_str("<ul class=\"insight-list\">");
+        for point in story_points {
+            let _ = write!(html, "<li>{}</li>", escape_html(&point));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</article>");
+
     html.push_str("<section class=\"grid\">");
     metric_card(
         &mut html,
@@ -1346,86 +1592,90 @@ fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonR
         &compact_number(report.total_requests),
         "synthetic authorize/finalize opportunities",
     );
-    let highest_spend = report
-        .strategies
-        .iter()
-        .map(|strategy| strategy.total_cost_usd)
-        .fold(0.0_f64, f64::max);
     metric_card(
         &mut html,
         "Highest spend",
         &format_money(highest_spend),
         "largest simulated finalized cost among strategies",
     );
-    html.push_str("</section>");
-
-    let mut showcase_notes = Vec::new();
-    for strategy in &report.strategies {
-        if let Some(day) = strategy.exhaustion_day {
-            showcase_notes.push(format!(
-                "{} exhausted shared budget on day {}.",
-                strategy.id, day
-            ));
-        }
-        if strategy.guard_hit_count > 0 {
-            showcase_notes.push(format!(
-                "{} blocked {} guarded requests, prevented {}, and left {} unused.",
-                strategy.id,
-                strategy.guard_hit_count,
-                format_money(strategy.runaway_spend_prevented_usd),
-                format_money(strategy.unused_budget_usd)
-            ));
-        }
-        if strategy.unused_protected_opportunity_usd > 0.0
-            || strategy.low_adopter_count > 0
-            || strategy.high_adopter_count > 0
-        {
-            showcase_notes.push(format!(
-                "{} surfaced {} of unused protected opportunity across {} low adopters and {} high adopters.",
-                strategy.id,
-                format_money(strategy.unused_protected_opportunity_usd),
-                strategy.low_adopter_count,
-                strategy.high_adopter_count
-            ));
-        }
-    }
-    if !showcase_notes.is_empty() {
-        html.push_str("<section class=\"panel\"><h2>Showcase evidence</h2><ul>");
-        for note in showcase_notes {
-            let _ = write!(html, "<li>{}</li>", escape_html(&note));
-        }
-        html.push_str("</ul></section>");
-    }
-
-    html.push_str("<section class=\"panel\"><h2>Strategy comparison</h2><table><thead><tr><th>Strategy</th><th>Spend</th><th>Unused budget</th><th>Denied</th><th>Fallbacks</th><th>Guard hits</th><th>Blocked work</th><th>Runaway prevented</th><th>Coverage</th><th>Fairness</th><th>Protected opportunity</th><th>Low adopters</th><th>High adopters</th><th>Carryover</th><th>Exhaustion</th></tr></thead><tbody>");
-    for strategy in &report.strategies {
-        let exhaustion = strategy
-            .exhaustion_day
-            .map(|day| day.to_string())
-            .unwrap_or_else(|| "-".to_owned());
-        let _ = write!(
-            html,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape_html(&strategy.id),
-            format_money(strategy.total_cost_usd),
-            format_money(strategy.unused_budget_usd),
-            strategy.denied_requests,
-            strategy.fallback_count,
-            strategy.guard_hit_count,
-            strategy.useful_work_blocked_score,
-            format_money(strategy.runaway_spend_prevented_usd),
-            strategy.adoption_coverage,
-            strategy.fairness_score,
-            format_money(strategy.unused_protected_opportunity_usd),
-            strategy.low_adopter_count,
-            strategy.high_adopter_count,
-            format_money(strategy.carryover_liability_usd),
-            escape_html(&exhaustion)
+    if max_runaway_prevented > 0.0 {
+        metric_card(
+            &mut html,
+            "Runaway prevented",
+            &format_money(max_runaway_prevented),
+            "best budget-limit outcome across compared strategies",
+        );
+    } else if max_protected_opportunity > 0.0 {
+        metric_card(
+            &mut html,
+            "Protected opportunity",
+            &format_money(max_protected_opportunity),
+            "unused adoption budget surfaced by the strongest strategy",
+        );
+    } else {
+        metric_card(
+            &mut html,
+            "Best fairness",
+            &format!(
+                "{:.2}",
+                report
+                    .strategies
+                    .iter()
+                    .map(|strategy| strategy.fairness_score)
+                    .fold(0.0_f64, f64::max)
+            ),
+            "highest fairness score across compared strategies",
         );
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</section>");
+    html.push_str("</section>");
 
-    html.push_str("<section class=\"panel\"><h2>Model mix</h2><table><thead><tr><th>Strategy</th><th>Model</th><th>Requests</th><th>Cost</th></tr></thead><tbody>");
+    strategy_scorecards_panel(&mut html, report);
+
+    html.push_str("<section class=\"panel\"><h2>Strategy comparison</h2><p class=\"summary\">These comparisons use the same simulated demand. The bars make the tradeoffs visible before the evidence table.</p>");
+    metric_compare_block(
+        &mut html,
+        "Finalized spend",
+        "How much budget actually landed.",
+        &spend_values,
+        ComparisonEmphasis::Neutral,
+    );
+    metric_compare_block(
+        &mut html,
+        "Denied requests",
+        "How restrictive each strategy became.",
+        &denied_values,
+        ComparisonEmphasis::Neutral,
+    );
+    if runaway_values.iter().any(|(_, value, _)| *value > 0.0) {
+        metric_compare_block(
+            &mut html,
+            "Runaway prevented",
+            "Higher means the strategy intercepted more risky spend before it landed.",
+            &runaway_values,
+            ComparisonEmphasis::HigherBetter,
+        );
+    }
+    if adoption_values.iter().any(|(_, value, _)| *value > 0.0) {
+        metric_compare_block(
+            &mut html,
+            "Protected opportunity",
+            "Higher means the strategy surfaced more explicit room for low adopters.",
+            &adoption_values,
+            ComparisonEmphasis::HigherBetter,
+        );
+    }
+    metric_compare_block(
+        &mut html,
+        "Fairness score",
+        "Higher means spend was distributed more evenly across the simulated users.",
+        &fairness_values,
+        ComparisonEmphasis::HigherBetter,
+    );
+    html.push_str("</section>");
+
+    simulation_evidence_table(&mut html, report);
+    html.push_str("<section class=\"panel\"><h2>Model mix</h2><div class=\"table-wrap\"><table><thead><tr><th>Strategy</th><th>Model</th><th>Requests</th><th>Cost</th></tr></thead><tbody>");
     for strategy in &report.strategies {
         for mix in &strategy.model_mix {
             let _ = write!(
@@ -1438,7 +1688,7 @@ fn render_simulation_dashboard(report: &crate::simulation::SimulationComparisonR
             );
         }
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</tbody></table></div></section>");
     html.push_str("</main></body></html>");
     html
 }
@@ -1479,6 +1729,304 @@ fn dashboard_activity<'a>(
         .unwrap_or_else(|| observations.iter().collect())
 }
 
+#[derive(Default)]
+struct DecisionStats {
+    allow: u64,
+    warn: u64,
+    deny: u64,
+    limit_hits: u64,
+}
+
+impl DecisionStats {
+    fn total(&self) -> u64 {
+        self.allow + self.warn + self.deny
+    }
+}
+
+enum ComparisonEmphasis {
+    Neutral,
+    HigherBetter,
+}
+
+fn dashboard_styles() -> &'static str {
+    r#"<style>
+        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --blue:#38bdf8; --violet:#a78bfa; --slate:#64748b; }
+        * { box-sizing: border-box; }
+        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:radial-gradient(circle at top left,#172554,#0f172a 42%); color:var(--text); }
+        main { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
+        h1 { margin:0 0 4px; font-size:34px; letter-spacing:-0.04em; }
+        h2 { margin:0 0 12px; font-size:24px; letter-spacing:-0.03em; }
+        h3 { margin:20px 0 10px; font-size:16px; }
+        code { color:var(--blue); }
+        .sub, .summary, .hint { color:var(--muted); }
+        .sub { margin-bottom:24px; }
+        .overview { display:grid; gap:14px; grid-template-columns:1fr; align-items:start; margin-bottom:14px; }
+        .metric-grid { display:grid; gap:14px; grid-template-columns:repeat(3,minmax(0,1fr)); align-content:start; }
+        .split { display:grid; gap:14px; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:start; }
+        .stack-panels { display:grid; gap:14px; }
+        .section-block { margin-top:28px; }
+        .section-header { margin:0 0 14px; }
+        .section-name { font-size:24px; font-weight:800; letter-spacing:-0.03em; color:#f8fbff; }
+        .section-header .summary { margin:4px 0 0; max-width:72ch; }
+        .story { padding:22px; }
+        .eyebrow, .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .lead { font-size:18px; margin:0; color:#dbe7f4; }
+        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); }
+        .card, .panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 55px rgba(0,0,0,.22); }
+        .card { padding:18px; }
+        .panel { padding:18px; margin-top:14px; overflow:hidden; }
+        .overview > .panel, .overview > .metric-grid > .card, .overview > .metric-grid > .panel, .split > .panel, .split > .stack-panels { margin-top:0; }
+        .value { font-size:30px; font-weight:800; margin-top:6px; letter-spacing:-0.03em; }
+        .value.small { font-size:24px; }
+        .insight-list { margin:14px 0 0 18px; padding:0; }
+        .insight-list li { margin:6px 0; }
+        .bar { height:12px; display:flex; overflow:hidden; border-radius:999px; background:#1e293b; margin:10px 0; }
+        .track { height:12px; width:100%; border-radius:999px; background:#1e293b; overflow:hidden; }
+        .fill { height:100%; border-radius:999px; }
+        .fill.good, .dot.good, .segment.good { background:var(--good); }
+        .fill.warn, .dot.warn, .segment.warn { background:var(--warn); }
+        .fill.bad, .dot.bad, .segment.bad { background:var(--bad); }
+        .fill.blue, .dot.blue, .segment.blue, .in { background:var(--blue); }
+        .fill.violet, .dot.violet, .segment.violet, .out { background:var(--violet); }
+        .fill.slate, .dot.slate, .segment.slate, .cache { background:var(--slate); }
+        .legend { display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
+        .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+        .table-wrap { overflow:auto; }
+        table { width:100%; border-collapse:collapse; }
+        th, td { text-align:left; padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
+        th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+        .pill { display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; background:#1e293b; border:1px solid var(--line); font-size:13px; }
+        .meta-pill { display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:4px 10px; background:rgba(30,41,59,.8); border:1px solid rgba(148,163,184,.18); color:#dbe7f4; font-size:12px; }
+        .ok { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+        .compare-group { margin-top:18px; }
+        .compare-title { margin-bottom:4px; font-weight:700; }
+        .compare-row { display:grid; grid-template-columns:minmax(0,220px) minmax(0,1fr) auto; gap:12px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+        .compare-row:first-of-type { border-top:0; }
+        .compare-label strong { display:block; }
+        .metric-value { font-weight:700; white-space:nowrap; }
+        .score-grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); }
+        .score-list { list-style:none; margin:12px 0 0; padding:0; }
+        .score-list li { margin:6px 0; color:var(--muted); }
+        .section-intro { margin-top:4px; color:var(--muted); }
+        details.evidence { margin-top:8px; }
+        details.evidence summary { cursor:pointer; color:var(--muted); }
+        .entry-list { display:grid; gap:12px; }
+        .entry-card { padding:16px; border-radius:16px; border:1px solid rgba(148,163,184,.15); background:rgba(15,23,42,.45); }
+        .entry-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap; }
+        .entry-title { margin-top:8px; font-size:18px; font-weight:700; color:#eef6ff; letter-spacing:-0.02em; }
+        .meta-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+        .fact-grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); margin-top:12px; }
+        .fact { padding:10px 12px; border-radius:12px; border:1px solid rgba(148,163,184,.12); background:rgba(30,41,59,.45); }
+        .fact-label { display:block; margin-bottom:3px; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+        .fact-value { color:#f8fbff; font-weight:700; }
+        .entity-grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); }
+        .entity-card { padding:18px; border-radius:16px; border:1px solid rgba(148,163,184,.15); background:rgba(15,23,42,.45); }
+        .entity-card.accent-good { box-shadow:inset 0 0 0 1px rgba(34,197,94,.18); }
+        .entity-card.accent-violet { box-shadow:inset 0 0 0 1px rgba(167,139,250,.18); }
+        .inline-stats { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; color:var(--muted); font-size:13px; }
+        .timeline { list-style:none; margin:0; padding:0; }
+        .event { display:grid; grid-template-columns:165px 210px 1fr; gap:12px; padding:13px 0; border-top:1px solid var(--line); align-items:start; }
+        .event:first-child { border-top:0; }
+        .time { color:var(--muted); }
+        .kind { font-weight:700; }
+        .stack { height:14px; display:flex; border-radius:999px; overflow:hidden; background:#1e293b; margin:12px 0; }
+        @media (max-width:1100px) { .metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+        @media (max-width:900px) { .overview, .split, .metric-grid { grid-template-columns:1fr; } }
+        @media (max-width:760px) { .event, .compare-row { grid-template-columns:1fr; gap:6px; } h1 { font-size:28px; } .section-name { font-size:22px; } }
+        </style>"#
+}
+
+fn section_header(html: &mut String, eyebrow: &str, title: &str, summary: &str) {
+    let _ = write!(
+        html,
+        "<div class=\"section-header\"><div class=\"eyebrow\">{}</div><div class=\"section-name\">{}</div><p class=\"summary\">{}</p></div>",
+        escape_html(eyebrow),
+        escape_html(title),
+        escape_html(summary)
+    );
+}
+
+fn fact_block(html: &mut String, label: &str, value: &str) {
+    let _ = write!(
+        html,
+        "<div class=\"fact\"><span class=\"fact-label\">{}</span><span class=\"fact-value\">{}</span></div>",
+        escape_html(label),
+        escape_html(value)
+    );
+}
+
+fn decision_stats(decisions: &[TraceReportItem]) -> DecisionStats {
+    let mut stats = DecisionStats::default();
+    for item in decisions {
+        if item.kind.ends_with(".deny") {
+            stats.deny += 1;
+        } else if item.kind.ends_with(".warn") {
+            stats.warn += 1;
+        } else if item.kind.ends_with(".allow") {
+            stats.allow += 1;
+        }
+        stats.limit_hits += item
+            .limit_hits
+            .as_ref()
+            .map(|hits| hits.len() as u64)
+            .unwrap_or(0);
+    }
+    stats
+}
+
+fn run_story(
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+    stats: &DecisionStats,
+    activity: &[&TraceReportItem],
+    latest_decision: Option<&TraceReportItem>,
+) -> (String, String, Vec<String>) {
+    let title = if stats.deny > 0 && stats.limit_hits > 0 {
+        "Risky spend was blocked before it landed".to_owned()
+    } else if usage.total_cost_usd > 0.0 {
+        format!("This run finalized {}", format_money(usage.total_cost_usd))
+    } else if stats.allow + stats.warn > 0 {
+        "Work was authorized, but no finalized spend landed yet".to_owned()
+    } else {
+        "Noether is waiting for meaningful run evidence".to_owned()
+    };
+    let lead = if stats.deny > 0 && stats.limit_hits > 0 {
+        format!(
+            "{} request(s) were denied and {} limit hit(s) fired. Finalized spend stayed at {}.",
+            stats.deny,
+            stats.limit_hits,
+            format_money(usage.total_cost_usd)
+        )
+    } else if usage.total_cost_usd > 0.0 {
+        format!(
+            "{} decision(s) produced {} finalized reservation(s) across {} visible spend row(s).",
+            stats.total(),
+            usage
+                .rows
+                .iter()
+                .map(|row| row.finalized_reservations)
+                .sum::<u64>(),
+            usage.rows.len()
+        )
+    } else if let Some(item) = latest_decision {
+        format!("Latest decision: {}.", item.summary)
+    } else {
+        "No authorization decisions, trace events, or finalized usage have been captured yet."
+            .to_owned()
+    };
+
+    let mut points = Vec::new();
+    if let Some(top_row) = usage
+        .rows
+        .iter()
+        .max_by(|left, right| left.total_cost_usd.total_cmp(&right.total_cost_usd))
+    {
+        points.push(format!(
+            "Most visible spend went to {} for {} / {}.",
+            top_row
+                .project
+                .as_deref()
+                .unwrap_or("an unattributed project"),
+            top_row.provider.as_deref().unwrap_or("unknown provider"),
+            top_row.model.as_deref().unwrap_or("unknown model")
+        ));
+    }
+    if let Some(item) = latest_decision {
+        if let Some(detail) = decision_supporting_line(item) {
+            points.push(detail);
+        }
+    }
+    if stats.warn > 0 {
+        points.push(format!(
+            "{} decision(s) were warned instead of blocked, which means work continued under policy pressure.",
+            stats.warn
+        ));
+    }
+    if let Some(adoption) = &usage.protected_adoption {
+        if adoption.unused_protected_opportunity_usd > 0.0 {
+            points.push(format!(
+                "{} of protected opportunity is still available across {} low adopters.",
+                format_money(adoption.unused_protected_opportunity_usd),
+                adoption.low_adopters.len()
+            ));
+        }
+    }
+    let tool_events = activity
+        .iter()
+        .filter(|item| is_tool_kind(&item.kind))
+        .count();
+    if tool_events > 0 {
+        points.push(format!(
+            "{} tool event(s) were captured, so this view includes actual workflow evidence beyond model billing.",
+            tool_events
+        ));
+    }
+    if points.is_empty() && !decisions.is_empty() {
+        points.push(
+            "Recent decision cards carry the routing, model, and limit evidence for this run."
+                .to_owned(),
+        );
+    }
+    (title, lead, points)
+}
+
+fn simulation_story(
+    report: &crate::simulation::SimulationComparisonReport,
+) -> (String, String, Vec<String>) {
+    let mut notes = Vec::new();
+    for strategy in &report.strategies {
+        if let Some(day) = strategy.exhaustion_day {
+            notes.push(format!(
+                "{} exhausted shared budget on day {}.",
+                strategy.id, day
+            ));
+        }
+        if strategy.limit_hit_count > 0 {
+            notes.push(format!(
+                "{} blocked {} limit-hit requests, prevented {}, and left {} unused.",
+                strategy.id,
+                strategy.limit_hit_count,
+                format_money(strategy.runaway_spend_prevented_usd),
+                format_money(strategy.unused_budget_usd)
+            ));
+        }
+        if strategy.unused_protected_opportunity_usd > 0.0
+            || strategy.low_adopter_count > 0
+            || strategy.high_adopter_count > 0
+        {
+            notes.push(format!(
+                "{} surfaced {} of unused protected opportunity across {} low adopters and {} high adopters.",
+                strategy.id,
+                format_money(strategy.unused_protected_opportunity_usd),
+                strategy.low_adopter_count,
+                strategy.high_adopter_count
+            ));
+        }
+    }
+
+    let title = if report
+        .strategies
+        .iter()
+        .any(|strategy| strategy.limit_hit_count > 0)
+    {
+        "Budget limits changed the spend story".to_owned()
+    } else if report
+        .strategies
+        .iter()
+        .any(|strategy| strategy.unused_protected_opportunity_usd > 0.0)
+    {
+        "Adoption policy changed what the team could see".to_owned()
+    } else {
+        "Policy choices changed the outcome under identical demand".to_owned()
+    };
+    let lead = format!(
+        "{} strategy variants processed {} simulated requests with the same synthetic demand.",
+        report.strategies.len(),
+        compact_number(report.total_requests)
+    );
+    (title, lead, notes)
+}
+
 fn metric_card(html: &mut String, label: &str, value: &str, hint: &str) {
     let _ = write!(
         html,
@@ -1489,10 +2037,252 @@ fn metric_card(html: &mut String, label: &str, value: &str, hint: &str) {
     );
 }
 
+fn meta_pill(html: &mut String, value: &str) {
+    let _ = write!(
+        html,
+        "<span class=\"meta-pill\">{}</span>",
+        escape_html(value)
+    );
+}
+
+fn fact_block_if_some(html: &mut String, label: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        fact_block(html, label, value);
+    }
+}
+
+fn details_block(html: &mut String, summary: &str, evidence: &str) {
+    let _ = write!(
+        html,
+        "<details class=\"evidence\"><summary>{}</summary><div class=\"summary\">{}</div></details>",
+        escape_html(summary),
+        escape_html(evidence)
+    );
+}
+
+fn routing_evidence_present(item: &TraceReportItem) -> bool {
+    decision_budget(item).is_some()
+        || decision_request(item).is_some()
+        || decision_remaining_budget(item).is_some()
+        || decision_estimated_cost(item).is_some()
+        || decision_matched_entity(item).is_some()
+        || decision_model_check(item).is_some()
+        || item
+            .limit_hits
+            .as_ref()
+            .is_some_and(|hits| !hits.is_empty())
+}
+
+fn compare_row(
+    html: &mut String,
+    label: &str,
+    detail: &str,
+    value: &str,
+    ratio: f64,
+    fill_class: &str,
+) {
+    let _ = write!(
+        html,
+        "<div class=\"compare-row\"><div class=\"compare-label\"><strong>{}</strong><div class=\"summary\">{}</div></div><div class=\"track\"><div class=\"fill {}\" style=\"width:{:.2}%\"></div></div><div class=\"metric-value\">{}</div></div>",
+        escape_html(label),
+        escape_html(detail),
+        fill_class,
+        ratio.clamp(0.0, 100.0),
+        escape_html(value)
+    );
+}
+
+fn decision_flow_panel(html: &mut String, stats: &DecisionStats) {
+    let total = stats.total();
+    if total == 0 {
+        return;
+    }
+    let allow = percent(stats.allow, total);
+    let warn = percent(stats.warn, total);
+    let deny = percent(stats.deny, total);
+    let posture = if stats.deny > 0 {
+        "Budget limits actively stopped risky work."
+    } else if stats.warn > 0 {
+        "Policy allowed work to continue under pressure."
+    } else {
+        "Policy stayed in an allow-first posture."
+    };
+    html.push_str("<section class=\"panel\"><h2>Budget posture</h2><p class=\"summary\">Start here for the policy shape of the run: what continued, what continued under warning, and what was blocked before spend landed.</p>");
+    let _ = write!(
+        html,
+        "<div class=\"entry-title\">{}</div>",
+        escape_html(posture)
+    );
+    let _ = write!(
+        html,
+        "<div class=\"stack\"><div class=\"segment good\" style=\"width:{allow:.2}%\"></div><div class=\"segment warn\" style=\"width:{warn:.2}%\"></div><div class=\"segment bad\" style=\"width:{deny:.2}%\"></div></div>"
+    );
+    let _ = write!(
+        html,
+        "<div class=\"legend\"><span><span class=\"dot good\"></span>allow {}</span><span><span class=\"dot warn\"></span>warn {}</span><span><span class=\"dot bad\"></span>deny {}</span><span>limit hits {}</span></div>",
+        stats.allow, stats.warn, stats.deny, stats.limit_hits
+    );
+    html.push_str("<div class=\"fact-grid\">");
+    fact_block(html, "Decisions observed", &total.to_string());
+    fact_block(html, "Limit hits", &stats.limit_hits.to_string());
+    fact_block(html, "Allowed share", &format!("{allow:.0}%"));
+    fact_block(html, "Blocked share", &format!("{deny:.0}%"));
+    html.push_str("</div>");
+    html.push_str("</section>");
+}
+
+fn spend_breakdown_panel(html: &mut String, usage: &UsageReport) {
+    let max_cost = usage
+        .rows
+        .iter()
+        .map(|row| row.total_cost_usd)
+        .fold(0.0_f64, f64::max);
+    if max_cost <= 0.0 {
+        return;
+    }
+    html.push_str("<section class=\"panel\"><h2>Where the spend went</h2><p class=\"summary\">The tallest bars show where finalized cost concentrated, so you can see whether one project, model, or subject dominated the run.</p>");
+    for row in usage.rows.iter().take(6) {
+        let ratio = if max_cost == 0.0 {
+            0.0
+        } else {
+            (row.total_cost_usd / max_cost) * 100.0
+        };
+        compare_row(
+            html,
+            row.project.as_deref().unwrap_or("-"),
+            &format!(
+                "{} / {} · {}",
+                row.provider.as_deref().unwrap_or("-"),
+                row.model.as_deref().unwrap_or("-"),
+                row.subject.as_deref().unwrap_or("-")
+            ),
+            &format_money(row.total_cost_usd),
+            ratio,
+            "blue",
+        );
+    }
+    html.push_str("</section>");
+}
+
+fn metric_compare_block(
+    html: &mut String,
+    title: &str,
+    hint: &str,
+    values: &[(String, f64, String)],
+    emphasis: ComparisonEmphasis,
+) {
+    let max_value = values
+        .iter()
+        .map(|(_, value, _)| *value)
+        .fold(0.0_f64, f64::max);
+    let best_value = values
+        .iter()
+        .map(|(_, value, _)| *value)
+        .fold(0.0_f64, f64::max);
+    html.push_str("<div class=\"compare-group\">");
+    let _ = write!(
+        html,
+        "<div class=\"compare-title\">{}</div><div class=\"summary\">{}</div>",
+        escape_html(title),
+        escape_html(hint)
+    );
+    for (label, value, display) in values {
+        let ratio = if max_value == 0.0 {
+            0.0
+        } else {
+            (*value / max_value) * 100.0
+        };
+        let fill = match emphasis {
+            ComparisonEmphasis::Neutral => "blue",
+            ComparisonEmphasis::HigherBetter if (*value - best_value).abs() < 1e-9 => "good",
+            ComparisonEmphasis::HigherBetter => "violet",
+        };
+        compare_row(html, label, "", display, ratio, fill);
+    }
+    html.push_str("</div>");
+}
+
+fn strategy_scorecards_panel(
+    html: &mut String,
+    report: &crate::simulation::SimulationComparisonReport,
+) {
+    html.push_str("<section class=\"panel\"><h2>Strategy scorecards</h2><p class=\"summary\">Each card tells the story of one strategy before you drop into the evidence table.</p><div class=\"score-grid\">");
+    for strategy in &report.strategies {
+        let exhaustion = strategy
+            .exhaustion_day
+            .map(|day| format!("budget exhausted on day {day}"))
+            .unwrap_or_else(|| "budget stayed available through the horizon".to_owned());
+        let _ = write!(
+            html,
+            "<article class=\"card\"><div class=\"label\">{}</div><div class=\"value\">{}</div><div class=\"hint\">{} allowed · {} denied · fairness {:.2}</div><ul class=\"score-list\"><li>{}</li><li>Unused budget: {}</li><li>Runaway prevented: {}</li>",
+            escape_html(&strategy.id),
+            format_money(strategy.total_cost_usd),
+            strategy.allowed_requests,
+            strategy.denied_requests,
+            strategy.fairness_score,
+            escape_html(&exhaustion),
+            format_money(strategy.unused_budget_usd),
+            format_money(strategy.runaway_spend_prevented_usd),
+        );
+        if strategy.unused_protected_opportunity_usd > 0.0
+            || strategy.low_adopter_count > 0
+            || strategy.high_adopter_count > 0
+        {
+            let _ = write!(
+                html,
+                "<li>Protected opportunity: {} across {} low adopters and {} high adopters.</li>",
+                format_money(strategy.unused_protected_opportunity_usd),
+                strategy.low_adopter_count,
+                strategy.high_adopter_count
+            );
+        }
+        html.push_str("</ul></article>");
+    }
+    html.push_str("</div></section>");
+}
+
+fn simulation_evidence_table(
+    html: &mut String,
+    report: &crate::simulation::SimulationComparisonReport,
+) {
+    html.push_str("<section class=\"panel\"><h2>Detailed comparison</h2><div class=\"table-wrap\"><table><thead><tr><th>Strategy</th><th>Spend</th><th>Denied</th><th>Runaway prevented</th><th>Protected opportunity</th><th>Fairness</th><th>Exhaustion</th></tr></thead><tbody>");
+    for strategy in &report.strategies {
+        let exhaustion = strategy
+            .exhaustion_day
+            .map(|day| day.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = write!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{}</td></tr>",
+            escape_html(&strategy.id),
+            format_money(strategy.total_cost_usd),
+            strategy.denied_requests,
+            format_money(strategy.runaway_spend_prevented_usd),
+            format_money(strategy.unused_protected_opportunity_usd),
+            strategy.fairness_score,
+            escape_html(&exhaustion)
+        );
+    }
+    html.push_str("</tbody></table></div></section>");
+}
+
 fn token_mix_panel(html: &mut String, totals: &UsageTotals) {
     html.push_str("<section class=\"panel\"><h2>Token mix</h2>");
     if totals.total_tokens == 0 {
         html.push_str("<div class=\"empty\">No finalized token usage yet.</div></section>");
+        return;
+    }
+    if totals.input_tokens == 0
+        && totals.output_tokens == 0
+        && totals.cache_read_tokens == 0
+        && totals.cache_write_tokens == 0
+    {
+        let _ = write!(
+            html,
+            "<p class=\"summary\">Only the total token count was finalized for this run, so Noether cannot yet split it into input, output, or cache categories.</p><div class=\"bar\"><div class=\"fill slate\" style=\"width:100%\"></div></div><div class=\"legend\"><span><span class=\"dot slate\"></span>total {}</span></div>",
+            compact_number(totals.total_tokens)
+        );
+        html.push_str("</section>");
         return;
     }
     let input = percent(totals.input_tokens, totals.total_tokens);
@@ -1515,260 +2305,456 @@ fn token_mix_panel(html: &mut String, totals: &UsageTotals) {
     html.push_str("</section>");
 }
 
+fn adoption_snapshot_panel(html: &mut String, usage: &UsageReport) {
+    let Some(adoption) = &usage.protected_adoption else {
+        return;
+    };
+    html.push_str("<section class=\"panel\"><h2>Adoption snapshot</h2><p class=\"summary\">Protected budget only matters if it reaches under-users without hiding where heavy protected usage is already concentrated.</p><div class=\"grid\">");
+    metric_card(
+        html,
+        "Protected opportunity remaining",
+        &format_money(adoption.unused_protected_opportunity_usd),
+        "current protected grant that still has room to be used",
+    );
+    metric_card(
+        html,
+        "Carryover liability",
+        &format_money(adoption.carryover_liability_usd),
+        "unused protected grant that can roll forward into the next window",
+    );
+    metric_card(
+        html,
+        "Low adopters",
+        &adoption.low_adopters.len().to_string(),
+        "people or teams with meaningful protected room left",
+    );
+    metric_card(
+        html,
+        "Top consumers",
+        &adoption.high_adopters.len().to_string(),
+        "people or teams already consuming most of the protected pool",
+    );
+    html.push_str("</div></section>");
+}
+
 fn usage_rows_panel(html: &mut String, usage: &UsageReport) {
-    html.push_str("<section class=\"panel\"><h2>Where the spend went</h2>");
+    html.push_str("<section class=\"panel\"><h2>Spend evidence</h2><p class=\"summary\">These cards keep row-level billing evidence readable without forcing a wide ledger table.</p>");
     if usage.rows.is_empty() {
         html.push_str("<div class=\"empty\">No usage has been finalized yet.</div></section>");
         return;
     }
-    html.push_str("<table><thead><tr><th>Project</th><th>Provider / model</th><th>Subject</th><th>Cost</th><th>Tokens</th><th>Status</th></tr></thead><tbody>");
-    for row in &usage.rows {
+    html.push_str("<div class=\"entry-list\">");
+    for row in usage.rows.iter().take(8) {
+        let title = row
+            .project
+            .as_deref()
+            .or(row.subject.as_deref())
+            .unwrap_or("Unattributed spend");
+        let summary = format!(
+            "{} finalized {} on {} / {} across {} token(s).",
+            row.subject.as_deref().unwrap_or("This row"),
+            format_money(row.total_cost_usd),
+            row.provider.as_deref().unwrap_or("unknown provider"),
+            row.model.as_deref().unwrap_or("unknown model"),
+            compact_number(row.total_tokens)
+        );
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}<br><span class=\"summary\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{} finalized / {} active</td></tr>",
-            escape_html(row.project.as_deref().unwrap_or("-")),
-            escape_html(row.provider.as_deref().unwrap_or("-")),
-            escape_html(row.model.as_deref().unwrap_or("-")),
-            escape_html(row.subject.as_deref().unwrap_or("-")),
-            format_money(row.total_cost_usd),
-            compact_number(row.total_tokens),
-            row.finalized_reservations,
-            row.active_reservations
+            "<div class=\"eyebrow\">Finalized spend row</div><div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div>",
+            escape_html(title),
+            escape_html(&summary)
         );
+        html.push_str("<div class=\"meta-row\">");
+        meta_pill(html, &format_money(row.total_cost_usd));
+        meta_pill(
+            html,
+            &format!("{} tokens", compact_number(row.total_tokens)),
+        );
+        html.push_str("</div></div><div class=\"fact-grid\">");
+        fact_block_if_some(html, "Project", row.project.as_deref());
+        fact_block_if_some(html, "Subject", row.subject.as_deref());
+        fact_block_if_some(html, "Provider", row.provider.as_deref());
+        fact_block_if_some(html, "Model", row.model.as_deref());
+        fact_block(html, "Finalized", &row.finalized_reservations.to_string());
+        fact_block(html, "Active", &row.active_reservations.to_string());
+        html.push_str("</div></article>");
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</div></section>");
+}
+
+fn protected_adoption_cards_panel(
+    html: &mut String,
+    title: &str,
+    summary: &str,
+    entries: &[crate::ledger::ProtectedAdoptionEntityReport],
+    accent: &str,
+    opportunity_label: &str,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let _ = write!(
+        html,
+        "<section class=\"panel\"><h2>{}</h2><p class=\"summary\">{}</p><div class=\"entity-grid\">",
+        escape_html(title),
+        escape_html(summary)
+    );
+    for entity in entries {
+        let _ = write!(
+            html,
+            "<article class=\"entity-card {}\"><div class=\"eyebrow\">{}</div><div class=\"entry-title\">{}</div>",
+            escape_html(accent),
+            escape_html(&entity.budget_id),
+            escape_html(&entity.entity_key)
+        );
+        let lead = if accent == "accent-violet" {
+            format!(
+                "{} still available from the current protected grant after only {} of visible use.",
+                format_money(entity.current_grant_usd),
+                format_money(entity.used_current_grant_usd)
+            )
+        } else {
+            format!(
+                "{} has already been used from a protected amount of {}.",
+                format_money(entity.used_current_grant_usd),
+                format_money(entity.protected_amount_usd)
+            )
+        };
+        let _ = write!(html, "<p class=\"summary\">{}</p>", escape_html(&lead));
+        html.push_str("<div class=\"fact-grid\">");
+        fact_block(
+            html,
+            opportunity_label,
+            &format_money(entity.current_grant_usd),
+        );
+        fact_block(html, "Carryover", &format_money(entity.carryover_usd));
+        fact_block(
+            html,
+            "Current usage",
+            &format_money(entity.used_current_grant_usd),
+        );
+        fact_block(
+            html,
+            "Protected amount",
+            &format_money(entity.protected_amount_usd),
+        );
+        html.push_str("</div></article>");
+    }
+    html.push_str("</div></section>");
 }
 
 fn protected_adoption_panel(html: &mut String, usage: &UsageReport) {
     let Some(adoption) = &usage.protected_adoption else {
         return;
     };
-    html.push_str("<section class=\"panel\"><h2>Adoption health</h2>");
+    protected_adoption_cards_panel(
+        html,
+        "Protected opportunity remaining",
+        "These are the people or teams who still have meaningful protected budget available and may need enablement rather than stricter caps.",
+        &adoption.low_adopters,
+        "accent-violet",
+        "Opportunity left",
+    );
+    protected_adoption_cards_panel(
+        html,
+        "Top consumers",
+        "These are the heaviest protected-budget consumers in the current window, which helps separate healthy adoption from concentrated usage.",
+        &adoption.high_adopters,
+        "accent-good",
+        "Current grant left",
+    );
+}
+
+fn event_entries_panel(
+    html: &mut String,
+    title: &str,
+    summary: &str,
+    items: &[&TraceReportItem],
+    empty_message: &str,
+) {
     let _ = write!(
         html,
-        "<div class=\"legend\"><span>Protected opportunity {}</span><span>Carryover liability {}</span><span>Low adopters {}</span><span>Top consumers {}</span></div>",
-        format_money(adoption.unused_protected_opportunity_usd),
-        format_money(adoption.carryover_liability_usd),
-        adoption.low_adopters.len(),
-        adoption.high_adopters.len()
+        "<section class=\"panel\"><h2>{}</h2><p class=\"summary\">{}</p>",
+        escape_html(title),
+        escape_html(summary)
     );
-
-    html.push_str("<h3>Low adopters</h3>");
-    if adoption.low_adopters.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No low adopters were detected in the protected adoption buckets.</div>",
+    if items.is_empty() {
+        let _ = write!(
+            html,
+            "<div class=\"empty\">{}</div></section>",
+            escape_html(empty_message)
         );
-    } else {
-        html.push_str("<table><thead><tr><th>Budget</th><th>Entity</th><th>Protected opportunity</th><th>Carryover</th><th>Current usage</th></tr></thead><tbody>");
-        for entity in &adoption.low_adopters {
-            let _ = write!(
-                html,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&entity.budget_id),
-                escape_html(&entity.entity_key),
-                format_money(entity.current_grant_usd),
-                format_money(entity.carryover_usd),
-                format_money(entity.used_current_grant_usd)
-            );
-        }
-        html.push_str("</tbody></table>");
+        return;
     }
-
-    html.push_str("<h3>Top consumers</h3>");
-    if adoption.high_adopters.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No high protected-budget consumers were detected yet.</div>",
+    html.push_str("<div class=\"entry-list\">");
+    for item in items.iter().take(8) {
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
+        let _ = write!(
+            html,
+            "<div class=\"eyebrow\">{}</div><div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div>",
+            escape_html(&short_time(item)),
+            escape_html(&item.kind),
+            escape_html(&item.summary)
         );
-    } else {
-        html.push_str("<table><thead><tr><th>Budget</th><th>Entity</th><th>Used current grant</th><th>Carryover</th><th>Protected amount</th></tr></thead><tbody>");
-        for entity in &adoption.high_adopters {
-            let _ = write!(
-                html,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&entity.budget_id),
-                escape_html(&entity.entity_key),
-                format_money(entity.used_current_grant_usd),
-                format_money(entity.carryover_usd),
-                format_money(entity.protected_amount_usd)
-            );
-        }
-        html.push_str("</tbody></table>");
+        html.push_str("<div class=\"meta-row\">");
+        meta_pill(html, &item.kind);
+        html.push_str("</div></div>");
+        details_block(html, "Show exact event evidence", &item.summary);
+        html.push_str("</article>");
     }
-    html.push_str("</section>");
+    html.push_str("</div></section>");
 }
 
 fn tools_panel(html: &mut String, activity: &[&TraceReportItem]) {
-    html.push_str("<section class=\"panel\"><h2>Tool usage</h2>");
     let tools: Vec<_> = activity
         .iter()
         .copied()
         .filter(|item| is_tool_kind(&item.kind))
         .collect();
-    if tools.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No tool calls or tool results were observed for this run yet. If Pi did not use tools, this is expected.</div></section>",
-        );
-        return;
-    }
-    html.push_str("<table><thead><tr><th>When</th><th>Tool event</th><th>What happened</th></tr></thead><tbody>");
-    for item in tools {
-        let _ = write!(
-            html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
-            escape_html(&short_time(item)),
-            event_pill(&item.kind),
-            escape_html(&item.summary)
-        );
-    }
-    html.push_str("</tbody></table></section>");
+    event_entries_panel(
+        html,
+        "Tool usage",
+        "Tool cards show what Pi invoked and what landed back in the trace without exposing raw prompt logs.",
+        &tools,
+        "No tool calls or tool results were observed for this run yet. If Pi did not use tools, this is expected.",
+    );
 }
 
 fn agent_activity_panel(html: &mut String, activity: &[&TraceReportItem]) {
-    html.push_str("<section class=\"panel\"><h2>Agent activity</h2>");
     let agent_events: Vec<_> = activity
         .iter()
         .copied()
         .filter(|item| is_agent_kind(&item.kind))
         .collect();
-    if agent_events.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No Pi agent lifecycle events were observed yet. This usually means the run came from the vertical demo or Pi did not emit lifecycle hooks for this trace.</div></section>",
-        );
-        return;
-    }
-    html.push_str(
-        "<table><thead><tr><th>When</th><th>Agent event</th><th>Signal</th></tr></thead><tbody>",
+    event_entries_panel(
+        html,
+        "Agent activity",
+        "Lifecycle cards show how the agent progressed through provider calls, turn boundaries, and final completion.",
+        &agent_events,
+        "No Pi agent lifecycle events were observed yet. This usually means the run came from the vertical demo or Pi did not emit lifecycle hooks for this trace.",
     );
-    for item in agent_events {
-        let _ = write!(
-            html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
-            escape_html(&short_time(item)),
-            event_pill(&item.kind),
-            escape_html(&item.summary)
-        );
-    }
-    html.push_str("</tbody></table></section>");
 }
 
 fn skill_context_panel(html: &mut String, activity: &[&TraceReportItem]) {
-    html.push_str("<section class=\"panel\"><h2>Skills and context</h2>");
     let context_events: Vec<_> = activity
         .iter()
         .copied()
         .filter(|item| is_skill_context_kind(&item.kind))
         .collect();
-    if context_events.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No skill/context event was observed yet. When Pi provides agent context, this section will show selected tools, skills, and context-file summaries without prompt text.</div></section>",
-        );
-        return;
-    }
-    html.push_str(
-        "<table><thead><tr><th>When</th><th>Context event</th><th>Summary</th></tr></thead><tbody>",
+    event_entries_panel(
+        html,
+        "Skills and context",
+        "Context cards show the skills, tools, and repo context Pi carried into the run without leaking prompt content.",
+        &context_events,
+        "No skill/context event was observed yet. When Pi provides agent context, this section will show selected tools, skills, and context-file summaries without prompt text.",
     );
-    for item in context_events {
-        let _ = write!(
-            html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
-            escape_html(&short_time(item)),
-            event_pill(&item.kind),
-            escape_html(&item.summary)
-        );
-    }
-    html.push_str("</tbody></table></section>");
 }
 
 fn decisions_panel(html: &mut String, decisions: &[TraceReportItem]) {
-    html.push_str("<section class=\"panel\"><h2>Recent decisions</h2>");
+    html.push_str("<section class=\"panel\"><h2>Decision narrative</h2><p class=\"summary\">Readable cards come first; exact ledger fields stay collapsed underneath each decision.</p>");
     if decisions.is_empty() {
         html.push_str("<div class=\"empty\">No authorization decisions yet.</div></section>");
         return;
     }
-    html.push_str(
-        "<table><thead><tr><th>When</th><th>Outcome</th><th>Summary</th></tr></thead><tbody>",
-    );
+    html.push_str("<div class=\"entry-list\">");
     for item in decisions.iter().take(8) {
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            "<div class=\"eyebrow\">{}</div>{}<div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div>",
             escape_html(&short_time(item)),
             outcome_pill(&item.kind),
-            escape_html(&item.summary)
+            escape_html(&decision_headline(item)),
+            escape_html(&latest_decision_hint(item))
         );
+        html.push_str("<div class=\"meta-row\">");
+        if let Some(budget) = decision_budget(item) {
+            meta_pill(html, &budget);
+        }
+        if let Some(model) = decision_model(item) {
+            meta_pill(html, &model);
+        }
+        if let Some(request) = decision_request(item) {
+            meta_pill(html, &request);
+        }
+        html.push_str("</div></div><div class=\"fact-grid\">");
+        fact_block_if_some(html, "Budget", decision_budget(item).as_deref());
+        fact_block_if_some(
+            html,
+            "Matched entity",
+            decision_matched_entity(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Budget-window remaining",
+            decision_remaining_budget(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Estimated cost",
+            decision_estimated_cost(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Model check",
+            decision_model_check_label(item).as_deref(),
+        );
+        html.push_str("</div>");
+        if let Some(hits) = &item.limit_hits {
+            html.push_str("<ul class=\"score-list\">");
+            for hit in hits {
+                let _ = write!(
+                    html,
+                    "<li><strong>{}</strong> - {}</li>",
+                    escape_html(&hit.rule_id),
+                    escape_html(&hit.reason)
+                );
+            }
+            html.push_str("</ul>");
+        }
+        details_block(html, "Show exact decision evidence", &item.summary);
+        html.push_str("</article>");
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</div></section>");
+}
+
+fn budget_routing_panel(html: &mut String, decisions: &[TraceReportItem]) {
+    let routed: Vec<_> = decisions
+        .iter()
+        .filter(|item| routing_evidence_present(item))
+        .take(6)
+        .collect();
+    if routed.is_empty() {
+        return;
+    }
+    html.push_str("<section class=\"panel\"><h2>Budget routing</h2><p class=\"summary\">This layer explains why Noether chose a budget, how much room was left, and what fallback or model checks shaped the decision.</p><div class=\"entry-list\">");
+    for item in routed {
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
+        let title = decision_budget(item)
+            .map(|budget| {
+                format!(
+                    "{} landed on {}",
+                    decision_model(item).unwrap_or_else(|| "Request".to_owned()),
+                    budget
+                )
+            })
+            .unwrap_or_else(|| decision_headline(item));
+        let _ = write!(
+            html,
+            "<div class=\"eyebrow\">{}</div><div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div>",
+            escape_html(&short_time(item)),
+            escape_html(&title),
+            escape_html(&decision_supporting_line(item).unwrap_or_else(|| {
+                "No additional routing explanation was recorded.".to_owned()
+            }))
+        );
+        html.push_str("<div class=\"meta-row\">");
+        if let Some(request) = decision_request(item) {
+            meta_pill(html, &request);
+        }
+        if let Some(entity) = decision_matched_entity(item) {
+            meta_pill(html, &entity);
+        }
+        html.push_str("</div></div><div class=\"fact-grid\">");
+        fact_block_if_some(html, "Budget", decision_budget(item).as_deref());
+        fact_block_if_some(
+            html,
+            "Matched entity",
+            decision_matched_entity(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Estimated cost",
+            decision_estimated_cost(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Budget-window remaining",
+            decision_remaining_budget(item).as_deref(),
+        );
+        fact_block_if_some(
+            html,
+            "Model check",
+            decision_model_check_label(item).as_deref(),
+        );
+        html.push_str("</div>");
+        details_block(html, "Show exact routing evidence", &item.summary);
+        html.push_str("</article>");
+    }
+    html.push_str("</div></section>");
 }
 
 fn risky_runs_panel(html: &mut String, decisions: &[TraceReportItem]) {
-    html.push_str("<section class=\"panel\"><h2>Risky runs</h2>");
     let risky: Vec<_> = decisions
         .iter()
         .filter(|item| {
-            item.guard_hits
+            item.limit_hits
                 .as_ref()
                 .is_some_and(|hits| !hits.is_empty())
         })
         .collect();
     if risky.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No guard hits were recorded for recent decisions.</div></section>",
-        );
         return;
     }
-    html.push_str(
-        "<table><thead><tr><th>When</th><th>Outcome</th><th>Guard hits</th></tr></thead><tbody>",
-    );
+    html.push_str("<section class=\"panel\"><h2>Risky runs</h2><p class=\"summary\">These decisions hit budget limits. Read the plain-language reason first, then expand the exact ledger evidence if needed.</p><div class=\"entry-list\">");
     for item in risky {
-        let hits = item
-            .guard_hits
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .map(|hit| format!("{}: {}", hit.rule_id, hit.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            "<div class=\"eyebrow\">{}</div>{}<div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div></div>",
             escape_html(&short_time(item)),
             outcome_pill(&item.kind),
-            escape_html(&hits)
+            escape_html(&decision_headline(item)),
+            escape_html(&latest_decision_hint(item))
         );
+        html.push_str("<ul class=\"score-list\">");
+        for hit in item.limit_hits.as_ref().into_iter().flatten() {
+            let _ = write!(
+                html,
+                "<li><strong>{}</strong> - {}</li>",
+                escape_html(&limit_hit_name(hit)),
+                escape_html(&hit.reason)
+            );
+        }
+        html.push_str("</ul>");
+        details_block(html, "Show exact limit evidence", &item.summary);
+        html.push_str("</article>");
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</div></section>");
 }
 
-fn lifecycle_guardrails_panel(html: &mut String, trace: Option<&TraceReport>) {
-    html.push_str("<section class=\"panel\"><h2>Lifecycle guardrails</h2>");
+fn lifecycle_limits_panel(html: &mut String, trace: Option<&TraceReport>) {
     let items: Vec<&TraceReportItem> = trace
         .map(|trace| {
             trace
                 .items
                 .iter()
-                .filter(|item| item.kind.starts_with("guard.report_only."))
+                .filter(|item| item.kind.starts_with("limit.report_only."))
                 .collect()
         })
         .unwrap_or_default();
     if items.is_empty() {
-        html.push_str(
-            "<div class=\"empty\">No lifecycle-backed report-only guard detections were recorded.</div></section>",
-        );
         return;
     }
     html.push_str(
-        "<table><thead><tr><th>When</th><th>Lifecycle guard</th><th>Detection</th></tr></thead><tbody>",
+        "<section class=\"panel\"><h2>Lifecycle limits</h2><p class=\"summary\">These are report-only detections emitted from the lifecycle trace. They surface risky patterns even when policy did not block the run.</p><div class=\"entry-list\">",
     );
     for item in items {
+        html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}</td><td class=\"summary\">{}</td></tr>",
+            "<div class=\"eyebrow\">{}</div><div class=\"entry-title\">{}</div><p class=\"summary\">{}</p></div><div class=\"meta-row\">",
             escape_html(&short_time(item)),
-            event_pill(&item.kind),
+            escape_html(&item.kind),
             escape_html(&item.summary)
         );
+        meta_pill(html, &item.kind);
+        html.push_str("</div></div>");
+        details_block(html, "Show exact lifecycle evidence", &item.summary);
+        html.push_str("</article>");
     }
-    html.push_str("</tbody></table></section>");
+    html.push_str("</div></section>");
 }
 
 fn timeline_panel(
@@ -1862,8 +2848,263 @@ fn summary_value(summary: &str, key: &str) -> Option<String> {
         .find_map(|part| part.strip_prefix(&prefix).map(ToOwned::to_owned))
 }
 
+fn formatted_summary_money(summary: &str, key: &str) -> Option<String> {
+    summary_value(summary, key).map(|raw| raw.parse::<f64>().map(format_money).unwrap_or(raw))
+}
+
+fn decision_budget(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.selected_budget_id.clone())
+        .or_else(|| summary_value(&item.summary, "selected_budget"))
+        .or_else(|| {
+            item.routing
+                .as_ref()
+                .and_then(|routing| routing.matched_entity.clone())
+        })
+        .or_else(|| summary_value(&item.summary, "matched_entity"))
+}
+
+fn decision_model(item: &TraceReportItem) -> Option<String> {
+    summary_value(&item.summary, "model")
+}
+
+fn decision_request(item: &TraceReportItem) -> Option<String> {
+    summary_value(&item.summary, "request")
+}
+
+fn decision_action(item: &TraceReportItem) -> Option<String> {
+    summary_value(&item.summary, "action")
+}
+
+fn decision_remaining_budget(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.budget_window_remaining_usd)
+        .map(format_money)
+        .or_else(|| formatted_summary_money(&item.summary, "budget_window_remaining"))
+}
+
+fn decision_estimated_cost(item: &TraceReportItem) -> Option<String> {
+    formatted_summary_money(&item.summary, "estimated_cost")
+}
+
+fn decision_matched_entity(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.matched_entity.clone())
+        .or_else(|| summary_value(&item.summary, "matched_entity"))
+}
+
+fn decision_model_check(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.model_check.clone())
+        .or_else(|| summary_value(&item.summary, "model_check"))
+}
+
+fn decision_rejected_budget(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.rejected_budget_id.clone())
+        .or_else(|| summary_value(&item.summary, "rejected_budget"))
+}
+
+fn decision_rejected_reason(item: &TraceReportItem) -> Option<String> {
+    item.routing
+        .as_ref()
+        .and_then(|routing| routing.rejected_budget_reason.clone())
+}
+
+fn decision_is_model_denial(item: &TraceReportItem) -> bool {
+    decision_model_check(item).as_deref() == Some("denied")
+        && decision_rejected_reason(item)
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider/model is not allowed"))
+}
+
+fn decision_model_check_label(item: &TraceReportItem) -> Option<String> {
+    let raw = decision_model_check(item)?;
+    if decision_is_model_denial(item) {
+        return Some("blocked by model allowlist".to_owned());
+    }
+    if let Some(budget) = raw.strip_prefix("allowed:") {
+        return Some(format!("allowed on {budget}"));
+    }
+    Some(raw)
+}
+
+fn limit_hit_name(hit: &crate::ledger::DecisionLimitHitReport) -> String {
+    if let Some(window_id) = &hit.window_id {
+        return match hit.window_mode.as_deref() {
+            Some(mode) => format!("{window_id} {mode} limit"),
+            None => format!("{window_id} limit"),
+        };
+    }
+
+    match hit
+        .rule_id
+        .rsplit('.')
+        .next()
+        .unwrap_or(hit.rule_id.as_str())
+    {
+        "context_tokens" => "context limit".to_owned(),
+        "request_cost" => "request-cost limit".to_owned(),
+        "tool_calls" => "tool-call limit".to_owned(),
+        "agent_steps" => "agent-step limit".to_owned(),
+        "retries" => "retry limit".to_owned(),
+        _ => format!("{} limit", hit.rule_id),
+    }
+}
+
+fn decision_binding_limit(
+    item: &TraceReportItem,
+) -> Option<&crate::ledger::DecisionLimitHitReport> {
+    item.limit_hits
+        .as_deref()
+        .and_then(crate::ledger::binding_limit_hit)
+}
+
+fn decision_headline(item: &TraceReportItem) -> String {
+    let model = decision_model(item).unwrap_or_else(|| "the requested model".to_owned());
+    if let Some(hit) = decision_binding_limit(item) {
+        let limit_name = limit_hit_name(hit);
+        if hit.severity == crate::contract::DecisionSeverity::Deny {
+            format!("{model} was blocked by {limit_name}")
+        } else if let Some(budget) = decision_budget(item) {
+            format!("{model} continued on {budget} under {limit_name}")
+        } else {
+            format!("{model} continued under {limit_name}")
+        }
+    } else if decision_action(item).as_deref() == Some("ask") {
+        if let Some(budget) = decision_budget(item).or_else(|| decision_rejected_budget(item)) {
+            format!("{model} required approval on {budget}")
+        } else {
+            format!("{model} required approval")
+        }
+    } else if item.kind.ends_with(".deny") {
+        if decision_is_model_denial(item) {
+            if let Some(budget) = decision_rejected_budget(item) {
+                format!("{model} was blocked by {budget}'s model allowlist")
+            } else {
+                format!("{model} was blocked by the model allowlist")
+            }
+        } else if let Some(budget) =
+            decision_budget(item).or_else(|| decision_rejected_budget(item))
+        {
+            format!("{model} was blocked on {budget}")
+        } else {
+            format!("{model} was blocked")
+        }
+    } else if item.kind.ends_with(".warn") {
+        if let Some(budget) = decision_budget(item) {
+            format!("{model} continued on {budget} with a warning")
+        } else {
+            format!("{model} continued with a warning")
+        }
+    } else if let Some(budget) = decision_budget(item) {
+        format!("{model} was approved on {budget}")
+    } else {
+        format!("{model} was approved")
+    }
+}
+
+fn decision_supporting_line(item: &TraceReportItem) -> Option<String> {
+    if let Some(hit) = decision_binding_limit(item) {
+        return Some(format!(
+            "Binding limit: {}. {}",
+            limit_hit_name(hit),
+            hit.reason
+        ));
+    }
+
+    if decision_is_model_denial(item) {
+        let model = decision_model(item).unwrap_or_else(|| "the requested model".to_owned());
+        let mut line = match decision_rejected_budget(item) {
+            Some(budget) => format!("Attempted model {model} is not allowed on budget {budget}."),
+            None => format!("Attempted model {model} is not allowed by the active budget policy."),
+        };
+        if item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.selected_budget_id.as_ref())
+            .is_none()
+        {
+            line.push_str(" No fallback budget could satisfy the request.");
+        }
+        return Some(line);
+    }
+
+    if decision_action(item).as_deref() == Some("ask") {
+        let mut line = "Noether required approval before this request could proceed.".to_owned();
+        if let Some(reason) = decision_rejected_reason(item) {
+            line.push_str(&format!(" {reason}."));
+        }
+        return Some(line);
+    }
+
+    if item.kind.ends_with(".deny") {
+        if let Some(reason) = decision_rejected_reason(item) {
+            let mut line = match decision_rejected_budget(item) {
+                Some(budget) => format!("Budget {budget} rejected the request: {reason}."),
+                None => format!("Noether blocked the request: {reason}."),
+            };
+            if let Some(remaining) = item
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.budget_window_remaining_usd)
+            {
+                line.push_str(&format!(
+                    " Recorded budget-window remaining at evaluation time: {}.",
+                    format_money(remaining)
+                ));
+            }
+            return Some(line);
+        }
+    }
+
+    item.routing.as_ref().map(|routing| {
+        let mut line = routing.selection_reason.clone().unwrap_or_else(|| {
+            "Noether selected the best available budget for this request.".to_owned()
+        });
+        if let Some(entity) = &routing.matched_entity {
+            line.push_str(&format!(" Matched entity: {entity}."));
+        }
+        if let Some(remaining) = routing.budget_window_remaining_usd {
+            line.push_str(&format!(
+                " Selected budget-window remaining: {}.",
+                format_money(remaining)
+            ));
+            line.push_str(" Tighter limits can still bind sooner.");
+        }
+        line
+    })
+}
+
 fn short_time(item: &TraceReportItem) -> String {
     item.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn token_hint(totals: &UsageTotals) -> String {
+    if totals.total_tokens == 0 {
+        "no finalized token usage".to_owned()
+    } else if totals.input_tokens == 0
+        && totals.output_tokens == 0
+        && totals.cache_read_tokens == 0
+        && totals.cache_write_tokens == 0
+    {
+        "finalized token total was recorded without an input/output split".to_owned()
+    } else {
+        format!(
+            "{} input / {} output",
+            compact_number(totals.input_tokens),
+            compact_number(totals.output_tokens)
+        )
+    }
+}
+
+fn latest_decision_hint(item: &TraceReportItem) -> String {
+    decision_supporting_line(item).unwrap_or_else(|| decision_headline(item))
 }
 
 fn compact_number(value: u64) -> String {
@@ -1913,9 +3154,7 @@ mod tests {
 
     use super::*;
 
-    fn compare_checked_in_simulation(
-        path: &str,
-    ) -> crate::simulation::SimulationComparisonReport {
+    fn compare_checked_in_simulation(path: &str) -> crate::simulation::SimulationComparisonReport {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let content = std::fs::read_to_string(manifest_dir.join(path))
             .expect("checked-in simulation example is readable");
@@ -1932,8 +3171,11 @@ mod tests {
             occurred_at: Utc::now(),
             kind: "decision.allow".to_owned(),
             summary: "decision_id=dec_1 selected_budget=project-budget matched_entity=project:noether selection_reason=selected fallback budget for project:noether rejected_budget=missing-budget rejected_reason=requested budget does not exist model_check=allowed:project-budget remaining_budget=0.750000".to_owned(),
-            routing: None,
-            guard_hits: None,
+            trace_id: None,
+                    entities: Vec::new(),
+        routing: None,
+            limit_hits: None,
+            binding_limit: None,
         }];
         let usage = UsageReport {
             total_cost_usd: 0.0,
@@ -2025,11 +3267,133 @@ mod tests {
         assert!(html.contains("Carryover liability"));
         assert!(html.contains("Low adopters"));
         assert!(html.contains("Top consumers"));
-        assert!(html.contains("Adoption health"));
+        assert!(html.contains("Adoption snapshot"));
+        assert!(html.contains("Protected opportunity remaining"));
+        assert!(!html.contains("<table"));
     }
 
     #[test]
-    fn dashboard_renders_risky_run_section_for_guard_hits() {
+    fn dashboard_prioritizes_story_cards_over_tables_for_real_runs() {
+        let usage = UsageReport {
+            total_cost_usd: 25.0,
+            rows: vec![
+                UsageReportRow {
+                    subject: Some("user:bob".to_owned()),
+                    project: Some("platform".to_owned()),
+                    provider: Some("openai".to_owned()),
+                    model: Some("gpt-4.1".to_owned()),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    total_tokens: 96_000,
+                    cache_read_cost_usd: 0.0,
+                    cache_write_cost_usd: 0.0,
+                    total_cost_usd: 24.0,
+                    reservations: 1,
+                    active_reservations: 0,
+                    finalized_reservations: 1,
+                },
+                UsageReportRow {
+                    subject: Some("user:alice".to_owned()),
+                    project: Some("docs".to_owned()),
+                    provider: Some("openai".to_owned()),
+                    model: Some("gpt-4.1-mini".to_owned()),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    total_tokens: 4_000,
+                    cache_read_cost_usd: 0.0,
+                    cache_write_cost_usd: 0.0,
+                    total_cost_usd: 1.0,
+                    reservations: 1,
+                    active_reservations: 0,
+                    finalized_reservations: 1,
+                },
+            ],
+            protected_adoption: Some(crate::ledger::ProtectedAdoptionReport {
+                unused_protected_opportunity_usd: 25.0,
+                carryover_liability_usd: 0.0,
+                low_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:alice".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 24.0,
+                    carryover_usd: 0.0,
+                    used_current_grant_usd: 1.0,
+                }],
+                high_adopters: vec![crate::ledger::ProtectedAdoptionEntityReport {
+                    budget_id: "ai-adoption".to_owned(),
+                    entity_key: "user:bob".to_owned(),
+                    protected_amount_usd: 25.0,
+                    current_grant_usd: 1.0,
+                    carryover_usd: 0.0,
+                    used_current_grant_usd: 24.0,
+                }],
+            }),
+        };
+        let decisions = vec![
+            TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "decision.allow".to_owned(),
+                summary: "decision_id=req-bob trace=req-bob request=req-bob model=openai/gpt-4.1 selected_budget=ai-adoption matched_entity=org:example selection_reason=selected fallback budget for org:example model_check=allowed:ai-adoption remaining_budget=1975.000000".to_owned(),
+                trace_id: Some("req-bob".to_owned()),
+                        entities: Vec::new(),
+        routing: Some(crate::ledger::DecisionRoutingReport {
+                    selected_budget_id: Some("ai-adoption".to_owned()),
+                    matched_entity: Some("org:example".to_owned()),
+                    selection_reason: Some("selected fallback budget for org:example".to_owned()),
+                    rejected_budget_id: None,
+                    rejected_budget_reason: None,
+                    model_check: Some("allowed:ai-adoption".to_owned()),
+                    budget_window_remaining_usd: Some(1975.0),
+                    budget_window_mode: None,
+                    budget_window_started_at: None,
+                    budget_window_ends_at: None,
+                }),
+                limit_hits: None,
+            binding_limit: None,
+            },
+            TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "decision.allow".to_owned(),
+                summary: "decision_id=req-alice trace=req-alice request=req-alice model=openai/gpt-4.1-mini selected_budget=ai-adoption matched_entity=org:example selection_reason=selected fallback budget for org:example model_check=allowed:ai-adoption remaining_budget=1999.000000".to_owned(),
+                trace_id: Some("req-alice".to_owned()),
+                        entities: Vec::new(),
+        routing: Some(crate::ledger::DecisionRoutingReport {
+                    selected_budget_id: Some("ai-adoption".to_owned()),
+                    matched_entity: Some("org:example".to_owned()),
+                    selection_reason: Some("selected fallback budget for org:example".to_owned()),
+                    rejected_budget_id: None,
+                    rejected_budget_reason: None,
+                    model_check: Some("allowed:ai-adoption".to_owned()),
+                    budget_window_remaining_usd: Some(1999.0),
+                    budget_window_mode: None,
+                    budget_window_started_at: None,
+                    budget_window_ends_at: None,
+                }),
+                limit_hits: None,
+            binding_limit: None,
+            },
+        ];
+
+        let html = render_dashboard(&usage, &decisions, None, &[]);
+
+        for marker in [
+            "Budget posture",
+            "Decision narrative",
+            "Adoption snapshot",
+            "Protected opportunity remaining",
+            "Budget routing",
+        ] {
+            assert!(html.contains(marker), "missing narrative marker: {marker}");
+        }
+        assert!(!html.contains("<table"));
+    }
+
+    #[test]
+    fn dashboard_renders_risky_run_section_for_limit_hits() {
         let usage = UsageReport {
             total_cost_usd: 0.0,
             rows: Vec::new(),
@@ -2038,23 +3402,35 @@ mod tests {
         let decisions = vec![TraceReportItem {
             occurred_at: Utc::now(),
             kind: "decision.deny".to_owned(),
-            summary: "decision_id=dec_guard guard_hits=dev-budget.max_context_tokens".to_owned(),
+            summary: "decision_id=dec_limit limit_hits=dev-budget.context_tokens".to_owned(),
+            trace_id: None,
+            entities: Vec::new(),
             routing: None,
-            guard_hits: Some(vec![crate::ledger::DecisionGuardHitReport {
-                rule_id: "dev-budget.max_context_tokens".to_owned(),
-                reason: "estimated context tokens 1200 exceed enforced guard max 1000".to_owned(),
+            limit_hits: Some(vec![crate::ledger::DecisionLimitHitReport {
+                rule_id: "dev-budget.context_tokens".to_owned(),
+                reason: "estimated context tokens 1200 exceed enforced limit max 1000".to_owned(),
                 severity: crate::contract::DecisionSeverity::Deny,
+                window_id: Some("daily-cap".to_owned()),
+                window_mode: Some("tumbling".to_owned()),
+                window_started_at: None,
+                window_ends_at: None,
+                projected_spend_usd: None,
+                max_usd: None,
+                scope_entity: None,
             }]),
+            binding_limit: None,
         }];
 
         let html = render_dashboard(&usage, &decisions, None, &[]);
 
         assert!(html.contains("Risky runs"));
-        assert!(html.contains("dev-budget.max_context_tokens"));
+        assert!(html.contains("daily-cap tumbling limit"));
+        assert!(html.contains("Show exact limit evidence"));
+        assert!(html.contains("Limit hits"));
     }
 
     #[test]
-    fn dashboard_renders_lifecycle_guardrail_section() {
+    fn dashboard_renders_lifecycle_limits_section() {
         let usage = UsageReport {
             total_cost_usd: 0.0,
             rows: Vec::new(),
@@ -2064,18 +3440,60 @@ mod tests {
             trace_id: "trace-lifecycle".to_owned(),
             items: vec![TraceReportItem {
                 occurred_at: Utc::now(),
-                kind: "guard.report_only.tool_calls".to_owned(),
+                kind: "limit.report_only.tool_calls".to_owned(),
                 summary: "tool_calls=12 max_tool_calls=10 reporting_only=true source=pi.tool_call"
                     .to_owned(),
+                trace_id: Some("trace-lifecycle".to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             }],
         };
 
         let html = render_dashboard(&usage, &[], Some(&trace), &[]);
 
-        assert!(html.contains("Lifecycle guardrails"));
-        assert!(html.contains("guard.report_only.tool_calls"));
+        assert!(html.contains("Lifecycle limits"));
+        assert!(html.contains("limit.report_only.tool_calls"));
+    }
+
+    #[test]
+    fn dashboard_hides_empty_visual_sections_for_limit_only_run() {
+        let usage = UsageReport {
+            total_cost_usd: 0.0,
+            rows: Vec::new(),
+            protected_adoption: None,
+        };
+        let decisions = vec![TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.deny".to_owned(),
+            summary:
+                "decision_id=dec_limit model=openai/gpt-4.1 limit_hits=runaway-budget.request_cost"
+                    .to_owned(),
+            trace_id: None,
+            entities: Vec::new(),
+            routing: None,
+            limit_hits: Some(vec![crate::ledger::DecisionLimitHitReport {
+                rule_id: "runaway-budget.request_cost".to_owned(),
+                reason: "estimated request cost $2.500000 exceeds enforced limit max $1.000000"
+                    .to_owned(),
+                severity: crate::contract::DecisionSeverity::Deny,
+                window_id: None,
+                window_mode: None,
+                window_started_at: None,
+                window_ends_at: None,
+                projected_spend_usd: None,
+                max_usd: None,
+                scope_entity: None,
+            }]),
+            binding_limit: None,
+        }];
+
+        let html = render_dashboard(&usage, &decisions, None, &[]);
+
+        assert!(!html.contains("<section class=\"split\"></section>"));
+        assert!(!html.contains("Spend evidence"));
+        assert!(!html.contains("Adoption snapshot"));
     }
 
     #[test]
@@ -2086,8 +3504,11 @@ mod tests {
                 occurred_at: Utc::now(),
                 kind: "decision.allow".to_owned(),
                 summary: "decision_id=dec_1".to_owned(),
+                trace_id: None,
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             }],
         };
 
@@ -2096,6 +3517,29 @@ mod tests {
         assert_eq!(lines[0], "trace\ttrace-1");
         assert_eq!(lines[1], "occurred_at\tkind\tsummary");
         assert!(lines[2].contains("\tdecision.allow\tdecision_id=dec_1"));
+    }
+
+    #[test]
+    fn trace_report_human_output_preserves_budget_window_summary_tokens() {
+        let report = TraceReport {
+            trace_id: "trace-window".to_owned(),
+            items: vec![TraceReportItem {
+                occurred_at: Utc::now(),
+                kind: "decision.warn".to_owned(),
+                summary: "decision_id=dec_window budget_window_mode=tumbling budget_window_start=2026-05-20T12:00:00Z budget_window_end=2026-05-20T13:00:00Z".to_owned(),
+                trace_id: None,
+                entities: Vec::new(),
+                routing: None,
+                limit_hits: None,
+            binding_limit: None,
+            }],
+        };
+
+        let lines = render_trace_report_lines(&report);
+
+        assert!(lines[2].contains("budget_window_mode=tumbling"));
+        assert!(lines[2].contains("budget_window_start=2026-05-20T12:00:00Z"));
+        assert!(lines[2].contains("budget_window_end=2026-05-20T13:00:00Z"));
     }
 
     #[test]
@@ -2125,8 +3569,11 @@ mod tests {
             occurred_at: Utc::now(),
             kind: "decision.allow".to_owned(),
             summary: "decision_id=dec_1".to_owned(),
+            trace_id: None,
+            entities: Vec::new(),
             routing: None,
-            guard_hits: None,
+            limit_hits: None,
+            binding_limit: None,
         }];
         let trace = TraceReport {
             trace_id: "trace-1".to_owned(),
@@ -2134,46 +3581,53 @@ mod tests {
                 occurred_at: Utc::now(),
                 kind: "tool.observed".to_owned(),
                 summary: "name=bash success=true".to_owned(),
+                trace_id: Some("trace-1".to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             }],
         };
         let observations = vec![TraceReportItem {
             occurred_at: Utc::now(),
             kind: "pi.turn_end".to_owned(),
             summary: "turn=1".to_owned(),
+            trace_id: Some("trace-1".to_owned()),
+            entities: Vec::new(),
             routing: None,
-            guard_hits: None,
+            limit_hits: None,
+            binding_limit: None,
         }];
 
         let html = render_dashboard(&usage, &decisions, Some(&trace), &observations);
 
         for marker in [
-            "Spend",
-            "Tokens",
-            "Recent decisions",
+            "Outcome summary",
+            "Finalized spend",
+            "Budget posture",
+            "Decision narrative",
             "Tool usage",
-            "Agent activity",
             "Run timeline",
         ] {
             assert!(html.contains(marker), "missing dashboard marker: {marker}");
         }
+        assert!(!html.contains("Skills and context"));
+        assert!(!html.contains("Agent activity"));
+        assert!(!html.contains("<table"));
     }
 
     #[test]
     fn simulation_dashboard_renders_showcase_tradeoff_markers() {
-        let runaway_report = compare_checked_in_simulation(
-            "examples/simulations/runaway-pressure.noet.yaml",
-        );
+        let runaway_report =
+            compare_checked_in_simulation("examples/simulations/runaway-pressure.noet.yaml");
         let runaway_html = render_simulation_dashboard(&runaway_report);
         assert!(runaway_html.contains("Comparison summary"));
-        assert!(runaway_html.contains("Guardrails changed the budget story"));
-        assert!(runaway_html.contains("guarded team budget blocked 107 guarded requests"));
-        assert!(runaway_html.contains("pooled without guard exhausted shared budget on day 3."));
+        assert!(runaway_html.contains("Budget limits changed the spend story"));
+        assert!(runaway_html.contains("limited team budget blocked 107 limit-hit requests"));
+        assert!(runaway_html.contains("pooled without limit exhausted shared budget on day 3."));
 
-        let adoption_report = compare_checked_in_simulation(
-            "examples/simulations/adoption-pressure.noet.yaml",
-        );
+        let adoption_report =
+            compare_checked_in_simulation("examples/simulations/adoption-pressure.noet.yaml");
         let adoption_html = render_simulation_dashboard(&adoption_report);
         assert!(adoption_html.contains("Comparison summary"));
         assert!(adoption_html.contains("Adoption policy changed what the team could see"));
@@ -2211,8 +3665,11 @@ mod tests {
             occurred_at: now,
             kind: "decision.allow".to_owned(),
             summary: "decision_id=dec_pi trace=trace-pi model=openai-codex/gpt-demo".to_owned(),
+            trace_id: Some("trace-pi".to_owned()),
+            entities: Vec::new(),
             routing: None,
-            guard_hits: None,
+            limit_hits: None,
+            binding_limit: None,
         }];
         let trace = TraceReport {
             trace_id: "trace-pi".to_owned(),
@@ -2221,50 +3678,71 @@ mod tests {
                     occurred_at: now,
                     kind: "pi.agent_context".to_owned(),
                     summary: "selected_tools=read,bash skills=diagnose context_files=AGENTS.md".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "pi.provider_call.started".to_owned(),
                     summary: "provider=openai-codex model=gpt-demo shape=input_count=1".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "pi.tool_call".to_owned(),
                     summary: "tool_name=bash input_summary.command.length=42".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "tool.observed".to_owned(),
                     summary: "name=bash success=true duration_ms=42".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "pi.message_end".to_owned(),
                     summary: "provider=openai-codex model=gpt-demo tokens=1080 cost=0.001900".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "pi.turn_end".to_owned(),
                     summary: "turn=1 usage=(provider=openai-codex model=gpt-demo tokens=1080 cost=0.001900)".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
                 TraceReportItem {
                     occurred_at: now,
                     kind: "pi.agent_end".to_owned(),
                     summary: "messages=2".to_owned(),
-                    routing: None,
-                    guard_hits: None,
+                    trace_id: Some("trace-pi".to_owned()),
+                            entities: Vec::new(),
+        routing: None,
+                    limit_hits: None,
+            binding_limit: None,
                 },
             ],
         };
@@ -2284,6 +3762,7 @@ mod tests {
             assert!(html.contains(marker), "missing Pi run marker: {marker}");
         }
         assert!(!html.contains(".raw.jsonl"));
+        assert!(!html.contains("<table"));
     }
 
     #[test]
@@ -2292,8 +3771,11 @@ mod tests {
             occurred_at: Utc::now(),
             kind: "tool.observed".to_owned(),
             summary: "name=bash success=true".to_owned(),
+            trace_id: None,
+            entities: Vec::new(),
             routing: None,
-            guard_hits: None,
+            limit_hits: None,
+            binding_limit: None,
         }];
 
         let lines = render_items_lines(&items);
@@ -2310,6 +3792,7 @@ mod tests {
             Command::Serve(args) => {
                 assert_eq!(args.bind.to_string(), "127.0.0.1:4040");
                 assert_eq!(args.fixture_dir, PathBuf::from(".noet/fixtures"));
+                assert_eq!(args.simulation_dir, PathBuf::from(".noet/simulations"));
                 assert_eq!(args.db_path, PathBuf::from(".noet/noether.sqlite"));
                 assert!(args.upstream.is_none());
                 assert!(args.routes.is_none());
@@ -2317,6 +3800,24 @@ mod tests {
                 assert_eq!(args.decision_mode, DecisionMode::DryRun);
             }
             _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn local_up_defaults_use_standard_noether_runtime() {
+        let cli = Cli::try_parse_from(["noet", "local", "up"]).expect("local args parse");
+
+        match cli.command {
+            Command::Local(command) => match command.command {
+                LocalSubcommand::Up(args) => {
+                    assert_eq!(args.bind.to_string(), "127.0.0.1:4051");
+                    assert_eq!(args.root, PathBuf::from("."));
+                    assert!(args.upstream.is_none());
+                    assert!(args.routes.is_none());
+                    assert_eq!(args.decision_mode, DecisionMode::Enforce);
+                }
+            },
+            _ => panic!("expected local command"),
         }
     }
 
@@ -2443,6 +3944,97 @@ assertions:
         assert!(dashboard.contains("Noether run dashboard"));
         assert!(dashboard.contains("selected_budget=project-noether"));
         assert!(dashboard.contains("name=bash success=true"));
+        assert!(!dashboard.contains("<table"));
+    }
+
+    #[tokio::test]
+    async fn scenario_run_exports_explicit_window_metadata_in_decisions_report() {
+        let tempdir = tempdir().expect("tempdir");
+        let scenario_path = tempdir.path().join("window-metadata.noet.yaml");
+        let out_dir = tempdir.path().join("artifacts");
+        std::fs::write(
+            &scenario_path,
+            r#"
+version: 1
+name: explicit windows
+policy:
+  version: 0
+  budgets:
+    - id: project-noether
+      limit_usd: 20
+      window_seconds: 60
+      window_mode: tumbling
+      window_anchor:
+        kind: first_seen
+      eligible:
+        entities: [project:noether]
+      limits:
+        spend:
+          - id: daily-cap
+            window: 1d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
+entities: [project:noether, user:alice]
+requests:
+  - id: req-1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 6
+  - id: req-2
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 5
+    denial:
+      rule_id: project-noether.spend_window.daily-cap
+assertions:
+  - kind: decision_outcome
+    request_id: req-1
+    outcome: allow
+  - kind: denied
+    request_id: req-2
+  - kind: limit_hit
+    request_id: req-2
+    rule_id: project-noether.spend_window.daily-cap
+  - kind: report_json
+    report: decisions
+    pointer: /0/limit_hits/0/window_mode
+    equals: tumbling
+  - kind: report_json
+    report: decisions
+    pointer: /1/routing/budget_window_mode
+    equals: tumbling
+"#,
+        )
+        .expect("write scenario");
+
+        run_scenario(ScenarioCommand {
+            command: ScenarioSubcommand::Run {
+                path: scenario_path,
+                out_dir: Some(out_dir.clone()),
+            },
+        })
+        .await
+        .expect("scenario run succeeds");
+
+        let decisions_report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.join("decisions-report.json")).expect("read decisions report"),
+        )
+        .expect("decisions report json");
+        assert_eq!(
+            decisions_report[0]["limit_hits"][0]["window_mode"],
+            "tumbling"
+        );
+        assert_eq!(
+            decisions_report[1]["routing"]["budget_window_mode"],
+            "tumbling"
+        );
     }
 
     #[tokio::test]
@@ -2502,15 +4094,15 @@ assertions:
     }
 
     #[tokio::test]
-    async fn scenario_run_supports_fallback_denial_and_guard_hit_assertions() {
+    async fn scenario_run_supports_fallback_denial_and_limit_hit_assertions() {
         let tempdir = tempdir().expect("tempdir");
-        let scenario_path = tempdir.path().join("routing-and-guards.noet.yaml");
+        let scenario_path = tempdir.path().join("routing-and-limits.noet.yaml");
         let out_dir = tempdir.path().join("artifacts");
         std::fs::write(
             &scenario_path,
             r#"
 version: 1
-name: routing and guards
+name: routing and limits
 policy:
   version: 0
   budgets:
@@ -2522,14 +4114,14 @@ policy:
       limit_usd: 20
       eligible:
         entities: [team:eng]
-    - id: guard-budget
+    - id: limit-budget
       limit_usd: 5
       eligible:
         entities: [project:guarded]
-      guards:
-        max_context_tokens:
+      limits:
+        context_tokens:
           max_tokens: 1000
-          effect: deny
+          action: block
 requests:
   - id: req-fallback
     authorize:
@@ -2550,7 +4142,7 @@ requests:
       requested_budget_id: missing-budget
       selected_budget_id: project-budget
       matched_entity: project:noether
-  - id: req-guard
+  - id: req-limit
     authorize:
       project: guarded
       provider: openai
@@ -2558,8 +4150,8 @@ requests:
       estimated_tokens: 1200
       entities: [project:guarded]
     denial:
-      rule_id: guard-budget.max_context_tokens
-      reason_contains: exceed enforced guard max 1000
+      rule_id: limit-budget.context_tokens
+      reason_contains: exceed enforced limit max 1000
 assertions:
   - kind: fallback
     request_id: req-fallback
@@ -2567,10 +4159,10 @@ assertions:
     selected_budget_id: project-budget
     matched_entity: project:noether
   - kind: denied
-    request_id: req-guard
-  - kind: guard_hit
-    request_id: req-guard
-    rule_id: guard-budget.max_context_tokens
+    request_id: req-limit
+  - kind: limit_hit
+    request_id: req-limit
+    rule_id: limit-budget.context_tokens
 "#,
         )
         .expect("write scenario");
@@ -2602,7 +4194,7 @@ assertions:
             "examples/scenarios/team-pooled-budget.noet.yaml",
             "examples/scenarios/project-budget-fallback.noet.yaml",
             "examples/scenarios/model-denial-fallback.noet.yaml",
-            "examples/scenarios/runaway-agent-guard.noet.yaml",
+            "examples/scenarios/runaway-agent-limit.noet.yaml",
             "examples/scenarios/protected-adoption-pool.noet.yaml",
         ] {
             let scenario_path = PathBuf::from(example);
@@ -2776,7 +4368,7 @@ requests:
             assert_eq!(strategy["warned_requests"], 0);
             assert_eq!(strategy["denied_requests"], 0);
             assert_eq!(strategy["fallback_count"], 337);
-            assert_eq!(strategy["guard_hit_count"], 0);
+            assert_eq!(strategy["limit_hit_count"], 0);
             assert_eq!(strategy["useful_work_blocked_score"], 0);
             assert_eq!(strategy["runaway_spend_prevented_usd"], 0.0);
             assert_eq!(strategy["adoption_coverage"], 1.0);
@@ -2804,5 +4396,93 @@ requests:
         assert!((adoption_unused - 51.475908).abs() < 1e-9);
         assert_eq!(adoption["low_adopter_count"], 2);
         assert_eq!(adoption["high_adopter_count"], 1);
+    }
+
+    #[test]
+    fn decision_headline_uses_binding_limit_without_claiming_warns_were_blocked() {
+        let item = TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.warn".to_owned(),
+            summary: "decision_id=dec_warn model=openai/gpt-4.1 selected_budget=team-budget"
+                .to_owned(),
+            trace_id: None,
+            entities: Vec::new(),
+            routing: Some(crate::ledger::DecisionRoutingReport {
+                selected_budget_id: Some("team-budget".to_owned()),
+                matched_entity: None,
+                selection_reason: None,
+                rejected_budget_id: None,
+                rejected_budget_reason: None,
+                model_check: None,
+                budget_window_remaining_usd: Some(50.0),
+                budget_window_mode: None,
+                budget_window_started_at: None,
+                budget_window_ends_at: None,
+            }),
+            limit_hits: Some(vec![crate::ledger::DecisionLimitHitReport {
+                rule_id: "team-budget.spend_window.daily-cap".to_owned(),
+                reason: "projected spend $11.000000 exceeds 1d limit max $10.000000".to_owned(),
+                severity: crate::contract::DecisionSeverity::Warn,
+                window_id: Some("daily-cap".to_owned()),
+                window_mode: Some("tumbling".to_owned()),
+                window_started_at: None,
+                window_ends_at: None,
+                projected_spend_usd: Some(11.0),
+                max_usd: Some(10.0),
+                scope_entity: Some("user:alice".to_owned()),
+            }]),
+            binding_limit: None,
+        };
+
+        assert_eq!(
+            decision_headline(&item),
+            "openai/gpt-4.1 continued on team-budget under daily-cap tumbling limit"
+        );
+        assert!(
+            decision_supporting_line(&item)
+                .expect("supporting line")
+                .contains("Binding limit: daily-cap tumbling limit.")
+        );
+    }
+
+    #[test]
+    fn decision_headline_and_model_check_humanize_model_denials() {
+        let item = TraceReportItem {
+            occurred_at: Utc::now(),
+            kind: "decision.deny".to_owned(),
+            summary: "decision_id=dec_model trace=trace-model model=openai-codex/gpt-5.4-mini rejected_budget=personal-local model_check=denied".to_owned(),
+            trace_id: Some("trace-model".to_owned()),
+            entities: vec!["project:noether".to_owned()],
+            routing: Some(crate::ledger::DecisionRoutingReport {
+                selected_budget_id: None,
+                matched_entity: None,
+                selection_reason: None,
+                rejected_budget_id: Some("personal-local".to_owned()),
+                rejected_budget_reason: Some(
+                    "requested provider/model is not allowed by requested budget".to_owned(),
+                ),
+                model_check: Some("denied".to_owned()),
+                budget_window_remaining_usd: None,
+                budget_window_mode: None,
+                budget_window_started_at: None,
+                budget_window_ends_at: None,
+            }),
+            limit_hits: None,
+            binding_limit: None,
+        };
+
+        assert_eq!(
+            decision_headline(&item),
+            "openai-codex/gpt-5.4-mini was blocked by personal-local's model allowlist"
+        );
+        assert_eq!(
+            decision_model_check_label(&item).as_deref(),
+            Some("blocked by model allowlist")
+        );
+        assert!(
+            decision_supporting_line(&item)
+                .expect("supporting line")
+                .contains("Attempted model openai-codex/gpt-5.4-mini is not allowed on budget personal-local.")
+        );
     }
 }

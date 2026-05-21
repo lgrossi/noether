@@ -1,0 +1,80 @@
+version: 1
+name: hybrid budget pacing windows
+policy:
+  version: 0
+  budgets:
+    - id: personal-primary
+      limit_usd: 1000
+      warn_at_fraction: 0.8
+      window_seconds: 2592000
+      window_mode: tumbling
+      window_anchor:
+        kind: first_seen
+      eligible:
+        entities: [project:noether]
+      limits:
+        spend:
+          - id: daily-cap
+            window: 1d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 100
+            action: block
+          - id: burst-5h
+            window: 5h
+            mode: rolling
+            max_usd: 40
+            action: block
+entities: [project:noether, user:alice]
+requests:
+  - id: req-1
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 30
+  - id: req-2
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 15
+    denial:
+      rule_id: personal-primary.spend_window.burst-5h
+      reason_contains: enforced 5h limit
+  - id: req-3
+    authorize:
+      project: noether
+      provider: openai
+      model: gpt-4.1
+      estimated_cost_usd: 71
+    denial:
+      rule_id: personal-primary.spend_window.daily-cap
+      reason_contains: enforced 1d limit
+assertions:
+  - kind: decision_outcome
+    request_id: req-1
+    outcome: allow
+  - kind: denied
+    request_id: req-2
+  - kind: limit_hit
+    request_id: req-2
+    rule_id: personal-primary.spend_window.burst-5h
+  - kind: denied
+    request_id: req-3
+  - kind: limit_hit
+    request_id: req-3
+    rule_id: personal-primary.spend_window.daily-cap
+  - kind: report_json
+    report: decisions
+    pointer: /0/limit_hits/0/window_mode
+    equals: tumbling
+  - kind: report_json
+    report: decisions
+    pointer: /1/limit_hits/0/window_mode
+    equals: rolling
+  - kind: report_json
+    report: decisions
+    pointer: /2/routing/budget_window_mode
+    equals: tumbling

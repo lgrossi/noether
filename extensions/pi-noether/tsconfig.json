@@ -11,7 +11,10 @@
     "outDir": "../../.noet/build/pi-noether",
     "strict": true,
     "noEmitOnError": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ]
   },
   "include": [
     "src/**/*.ts"

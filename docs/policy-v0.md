@@ -33,19 +33,35 @@ budgets:
     priority: 0
     warn_at_fraction: 0.8
     window_seconds: 86400
+    window_mode: tumbling
+    window_anchor:
+      kind: first_seen
     eligible:
       entities: [project:noether]
     models:
       allow:
         - openai:gpt-4.1
         - anthropic:claude-sonnet-*
-    guards:
-      max_estimated_request_cost_usd:
+    limits:
+      request_cost:
         max_usd: 0.50
-        effect: warn
-      max_context_tokens:
+        action: warn
+      context_tokens:
         max_tokens: 120000
-        effect: deny
+        action: block
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 10
+          action: block
+        - id: burst-5h
+          window: 5h
+          mode: rolling
+          max_usd: 40
+          action: block
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -58,7 +74,7 @@ budgets:
       project: noether
 policies:
   - id: require-project
-    effect: deny
+    action: block
     reason: project is required for budget attribution
     when:
       missing: project
@@ -77,11 +93,22 @@ The v0 evaluator is an in-memory fixed-window budget:
   `user:alice`, `team:core`, `org:example`, or `global`;
 - `models.allow` constrains a matching budget to provider/model patterns such as
   `openai:gpt-4.1` or wildcard suffixes such as `anthropic:claude-sonnet-*`;
-- `guards.max_estimated_request_cost_usd` can warn or deny when one request's estimated cost
-  exceeds a configured per-budget threshold;
-- `guards.max_context_tokens` can warn or deny when authorize-time context/input token estimates
-  exceed a configured per-budget threshold;
-- if a request does not include `estimated_tokens`, `max_context_tokens` does not fire and the
+- `limits.request_cost` defines a per-budget request-cost limit that can warn or
+  deny when one request's estimated cost exceeds its threshold;
+- `limits.context_tokens` defines a per-budget context limit that can warn or deny when
+  authorize-time context/input token estimates exceed its threshold;
+- `window_mode: tumbling` plus `window_anchor.kind: first_seen` makes the budget cap window
+  explicit instead of relying on legacy activity-anchored resets;
+- omitted `window_mode` / `window_anchor` keeps legacy behavior and `noet policy check` warns
+  about that implicit default;
+- `limits.spend[]` now supports explicit `id`, `mode`, and `anchor` for additional pacing
+  and burst spend limits on the same budget:
+  - `mode: tumbling` uses persisted bucket state and requires `anchor.kind: first_seen`;
+  - `mode: rolling` keeps trailing recent-spend behavior and must omit `anchor`;
+  - omitted `mode` / `anchor` keeps the legacy rolling limit behavior and `policy check` warns;
+- spend-window ids must be unique within one budget so report output can distinguish, for example,
+  a `1d tumbling` pacing limit from a `1d rolling` burst limit;
+- if a request does not include `estimated_tokens`, `limits.context_tokens` does not fire and the
   request continues under the rest of policy evaluation;
 - `allocation.standard: protected_adoption_pool` parses policy-only adoption-governance inputs:
   `by` (`user` or `team`), `protected_amount_usd`, `window` (`monthly`), and
@@ -97,3 +124,12 @@ The v0 evaluator is an in-memory fixed-window budget:
 - `deny` does not create a reservation.
 
 Reservations are finalized through `POST /v1/reservations/{id}/finalize`.
+
+## Hybrid pacing example
+
+See `examples/scenarios/hybrid-budget-pacing-windows.noet.yaml` for a runnable end-to-end example
+that demonstrates:
+
+- a `30d` tumbling budget cap;
+- a `1d` tumbling pacing limit deny;
+- a `5h` rolling burst limit deny.

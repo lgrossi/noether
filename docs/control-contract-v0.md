@@ -96,3 +96,16 @@ The endpoint currently accepts and stores events in memory.
 ## Supporting event types
 
 The v0 Rust contract also includes `UsageObservation`, `TraceEvent`, `ToolEvent`, and `EvalAnnotation` so adapters can report usage, tool execution, and evaluation outcomes without encoding provider-specific protocol details into Noether core.
+
+The policy-side Rust contract now also carries explicit window semantics:
+
+- `BudgetRule.window_mode` / `BudgetRule.window_anchor`
+- `SpendWindowLimit.id` / `SpendWindowLimit.mode` / `SpendWindowLimit.anchor`
+
+Current explicit window values are:
+
+- budget windows: `tumbling` with `window_anchor.kind: first_seen`
+- spend windows: `tumbling` or `rolling`
+
+Legacy policies that omit those fields still parse; `noet policy check` warns when window
+semantics are implicit.

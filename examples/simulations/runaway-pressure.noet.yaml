@@ -37,7 +37,7 @@ models:
     model: gpt-4.1-mini
     cost_per_1k_tokens_usd: 0.008
 strategies:
-  - id: pooled without guard
+  - id: pooled without limit
     description: One loop-risk agent can spend until the shared budget is exhausted.
     policy:
       version: 0
@@ -46,7 +46,7 @@ strategies:
           limit_usd: 12
           eligible:
             entities: [team:eng]
-  - id: guarded team budget
+  - id: limited team budget
     description: A short spend window denies bursty runaway requests before they consume the month.
     policy:
       version: 0
@@ -55,8 +55,8 @@ strategies:
           limit_usd: 12
           eligible:
             entities: [team:eng]
-          guards:
-            spend_windows:
+          limits:
+            spend:
               - window: 5h
                 max_usd: 1.2
-                effect: deny
+                action: block

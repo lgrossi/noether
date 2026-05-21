@@ -3,14 +3,14 @@ use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::contract::{
-    AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
-    DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyEffect, Reservation,
-    ReservationStatus, RuleMatch, ToolEvent, TraceEvent, UsageObservation,
+    AuthorizeDecision, AuthorizeRequest, BudgetRule, BudgetWindowMode, DecisionExplanation,
+    DecisionOutcome, DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction,
+    Reservation, ReservationStatus, RuleMatch, ToolEvent, TraceEvent, UsageObservation,
 };
 use crate::error::NoetError;
 use crate::policy::{
@@ -21,6 +21,7 @@ use crate::policy::{
 #[derive(Debug, Default)]
 pub struct BudgetLedger {
     windows: HashMap<String, WindowState>,
+    limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     reservations: HashMap<String, StoredReservation>,
     events: Vec<TraceEvent>,
@@ -46,6 +47,7 @@ struct StoredReservation {
     reservation: Reservation,
     estimated_cost_usd: f64,
     budget_rule_ids: Vec<String>,
+    limit_window_spends: Vec<LimitWindowReservationSpend>,
     allocation_spends: Vec<AllocationReservationSpend>,
     matched_entity: Option<String>,
 }
@@ -67,6 +69,13 @@ struct AllocationReservationSpend {
     current_grant_usd: f64,
 }
 
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+struct LimitWindowReservationSpend {
+    rule_id: String,
+    limit_id: String,
+    scope_key: String,
+}
+
 #[derive(Default)]
 struct RoutingPersistenceFields {
     selected_budget_id: Option<String>,
@@ -75,10 +84,13 @@ struct RoutingPersistenceFields {
     rejected_budget_id: Option<String>,
     rejected_budget_reason: Option<String>,
     model_check: Option<String>,
-    remaining_budget_usd: Option<f64>,
-    max_tool_calls: Option<u64>,
-    max_agent_steps: Option<u64>,
-    max_retries: Option<u64>,
+    budget_window_remaining_usd: Option<f64>,
+    budget_window_mode: Option<String>,
+    budget_window_started_at: Option<DateTime<Utc>>,
+    budget_window_ends_at: Option<DateTime<Utc>>,
+    tool_calls: Option<u64>,
+    agent_steps: Option<u64>,
+    retries: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,7 +120,34 @@ pub struct UsageReportRow {
     pub finalized_reservations: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageActivityRecord {
+    pub occurred_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_budget_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_entity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ProtectedAdoptionReport {
     pub unused_protected_opportunity_usd: f64,
     pub carryover_liability_usd: f64,
@@ -126,24 +165,30 @@ pub struct ProtectedAdoptionEntityReport {
     pub used_current_grant_usd: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TraceReport {
     pub trace_id: String,
     pub items: Vec<TraceReportItem>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TraceReportItem {
     pub occurred_at: DateTime<Utc>,
     pub kind: String,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<DecisionRoutingReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub guard_hits: Option<Vec<DecisionGuardHitReport>>,
+    pub limit_hits: Option<Vec<DecisionLimitHitReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_limit: Option<DecisionLimitHitReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DecisionRoutingReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_budget_id: Option<String>,
@@ -158,14 +203,34 @@ pub struct DecisionRoutingReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_check: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub remaining_budget_usd: Option<f64>,
+    pub budget_window_remaining_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_window_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_window_started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_window_ends_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct DecisionGuardHitReport {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DecisionLimitHitReport {
     pub rule_id: String,
     pub reason: String,
     pub severity: DecisionSeverity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ends_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_spend_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_entity: Option<String>,
 }
 
 impl BudgetLedger {
@@ -180,6 +245,7 @@ impl BudgetLedger {
             ..Self::default()
         };
         ledger.load_windows()?;
+        ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
         Ok(ledger)
@@ -200,23 +266,25 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
     ) -> Result<AuthorizeDecision, NoetError> {
         let now = Utc::now();
-        let mut outcome = DecisionOutcome::Allow;
+        let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
+        let mut limit_hits = Vec::new();
         let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
-            for (effect, explanation) in matching_policy_explanations(policy, request) {
-                outcome = merge_policy_outcome(outcome, effect);
+            for (policy_action, explanation) in matching_policy_explanations(policy, request) {
+                action = merge_policy_action(action, policy_action);
                 explanations.push(explanation);
             }
 
-            if outcome != DecisionOutcome::Deny {
+            if !action.halts_request() {
                 selected_budget_id = self.evaluate_budget_rules(
                     policy,
                     request,
                     now,
-                    &mut outcome,
+                    &mut action,
                     &mut explanations,
+                    &mut limit_hits,
                 );
             }
         } else {
@@ -227,23 +295,32 @@ impl BudgetLedger {
             });
         }
 
-        let reservation = if outcome == DecisionOutcome::Deny {
+        let reservation = if action.halts_request() {
             None
         } else {
             Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
         };
         if reservation.is_some() {
+            self.persist_windows()?;
+            self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
         }
 
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
-            outcome,
+            outcome: action.decision_outcome(),
+            action,
             reservation,
             explanations,
             created_at: now,
         };
-        self.persist_decision(policy, request, &decision)?;
+        self.persist_decision(
+            policy,
+            request,
+            &decision,
+            selected_budget_id.as_deref(),
+            &limit_hits,
+        )?;
         Ok(decision)
     }
 
@@ -271,6 +348,16 @@ impl BudgetLedger {
                     window.used_usd = (window.used_usd + delta).max(0.0);
                 }
             }
+            for spend in &stored.limit_window_spends {
+                let key = (
+                    spend.rule_id.clone(),
+                    spend.limit_id.clone(),
+                    spend.scope_key.clone(),
+                );
+                if let Some(window) = self.limit_windows.get_mut(&key) {
+                    window.used_usd = (window.used_usd + delta).max(0.0);
+                }
+            }
             stored.reservation.amount_usd = actual_cost;
         }
 
@@ -278,6 +365,7 @@ impl BudgetLedger {
         let reservation = stored.reservation.clone();
         self.persist_finalization(&reservation, payload)?;
         self.persist_windows()?;
+        self.persist_limit_windows()?;
         Ok(reservation)
     }
 
@@ -355,9 +443,10 @@ impl BudgetLedger {
         let mut stmt = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, selected_budget_id,
-                   matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
-                   model_check, remaining_budget_usd
+                   action,
+                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, entities_json,
+                   selected_budget_id, matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
+                   model_check, budget_window_remaining_usd, routing_json, limit_hits_json
             FROM decisions
             ORDER BY created_at DESC
             ",
@@ -365,6 +454,49 @@ impl BudgetLedger {
         stmt.query_map([], decision_report_item_from_row)?
             .collect::<Result<_, _>>()
             .map_err(NoetError::from)
+    }
+
+    pub fn usage_activity_report(&self) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT u.created_at, COALESCE(u.trace_id, d.trace_id), d.subject, d.project,
+                   COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
+                   d.selected_budget_id, d.matched_entity, d.entities_json,
+                   COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0),
+                   COALESCE(CAST(json_extract(u.metadata_json, '$.usage_details.cache_read_tokens') AS INTEGER), 0),
+                   COALESCE(CAST(json_extract(u.metadata_json, '$.usage_details.cache_write_tokens') AS INTEGER), 0),
+                   COALESCE(u.total_tokens, 0),
+                   COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0)
+            FROM usage_observations u
+            LEFT JOIN reservations r ON r.id = u.reservation_id
+            LEFT JOIN decisions d ON d.decision_id = r.decision_id
+            ORDER BY u.created_at DESC
+            ",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(UsageActivityRecord {
+                occurred_at: parse_time(row.get::<_, String>(0)?),
+                trace_id: row.get(1)?,
+                subject: row.get(2)?,
+                project: row.get(3)?,
+                provider: row.get(4)?,
+                model: row.get(5)?,
+                selected_budget_id: row.get(6)?,
+                matched_entity: row.get(7)?,
+                entities: parse_entities_json(row.get::<_, String>(8)?),
+                input_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(10)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+                cache_write_tokens: row.get::<_, i64>(12)?.max(0) as u64,
+                total_tokens: row.get::<_, i64>(13)?.max(0) as u64,
+                cost_usd: row.get(14)?,
+            })
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(NoetError::from)
     }
 
     pub fn observations_report(
@@ -375,7 +507,7 @@ impl BudgetLedger {
         let Some(conn) = &self.conn else {
             return Ok(Vec::new());
         };
-        let mut sql = "SELECT occurred_at, kind, payload_json FROM events".to_owned();
+        let mut sql = "SELECT occurred_at, kind, payload_json, trace_id FROM events".to_owned();
         let mut clauses = Vec::new();
         if kind_prefix.is_some() {
             clauses.push("kind LIKE ?");
@@ -397,8 +529,11 @@ impl BudgetLedger {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
+                trace_id: row.get(3)?,
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             })
         };
         match (prefix, trace_id) {
@@ -433,9 +568,10 @@ impl BudgetLedger {
         let mut decisions = conn.prepare(
             "
             SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, selected_budget_id,
-                   matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
-                   model_check, remaining_budget_usd
+                   action,
+                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, entities_json,
+                   selected_budget_id, matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
+                   model_check, budget_window_remaining_usd, routing_json, limit_hits_json
             FROM decisions
             WHERE trace_id = ?1
             ORDER BY created_at
@@ -476,8 +612,11 @@ impl BudgetLedger {
                     stop_reason: stop_reason.as_deref(),
                     metadata_json: &metadata_json,
                 }),
+                trace_id: Some(trace_id.to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             })
         })? {
             items.push(row?);
@@ -498,15 +637,18 @@ impl BudgetLedger {
                 occurred_at: parse_time(row.get::<_, String>(0)?),
                 summary: summarize_event_payload(&kind, &payload_json),
                 kind,
+                trace_id: Some(trace_id.to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             })
         })? {
             items.push(row?);
         }
 
-        if let Some(guard_items) = self.lifecycle_guard_report_items(trace_id)? {
-            items.extend(guard_items);
+        if let Some(limit_items) = self.lifecycle_limit_report_items(trace_id)? {
+            items.extend(limit_items);
         }
 
         items.sort_by_key(|item| item.occurred_at);
@@ -521,8 +663,9 @@ impl BudgetLedger {
         policy: &PolicyFile,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
-        outcome: &mut DecisionOutcome,
+        action: &mut PolicyAction,
         explanations: &mut Vec<DecisionExplanation>,
+        limit_hits: &mut Vec<DecisionLimitHitReport>,
     ) -> Option<String> {
         let estimated_cost = request.estimated_cost();
         let candidate = self.select_budget_rule(policy, request, now, explanations);
@@ -530,7 +673,7 @@ impl BudgetLedger {
         let Some(candidate) = candidate else {
             let exhausted_rules = self.exhausted_budget_rules(policy, request, now);
             if !exhausted_rules.is_empty() {
-                *outcome = DecisionOutcome::Deny;
+                *action = merge_policy_action(*action, PolicyAction::Block);
                 for (rule_id, projected, limit_usd) in exhausted_rules {
                     explanations.push(DecisionExplanation {
                         rule_id,
@@ -551,7 +694,7 @@ impl BudgetLedger {
                 .iter()
                 .any(|rule| !budget_model_allowed(rule, request))
             {
-                *outcome = DecisionOutcome::Deny;
+                *action = merge_policy_action(*action, PolicyAction::Block);
                 for rule in scoped_rules
                     .into_iter()
                     .filter(|rule| !budget_model_allowed(rule, request))
@@ -568,7 +711,7 @@ impl BudgetLedger {
                 .iter()
                 .any(|explanation| explanation.rule_id == "no_fallback_budget")
             {
-                *outcome = DecisionOutcome::Deny;
+                *action = merge_policy_action(*action, PolicyAction::Block);
                 return None;
             }
             explanations.push(DecisionExplanation {
@@ -582,21 +725,22 @@ impl BudgetLedger {
         let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
             return None;
         };
-        if apply_budget_guards(
+        if apply_budget_limits(
             self,
             rule,
             request,
             candidate.matched_entity.as_deref(),
             estimated_cost,
             now,
-            outcome,
+            action,
             explanations,
+            limit_hits,
         ) {
             return Some(rule.id.clone());
         }
         let projected = self.window_used_usd(rule, now) + estimated_cost;
         if projected >= rule.limit_usd * rule.warn_at_fraction {
-            *outcome = DecisionOutcome::Warn;
+            *action = merge_policy_action(*action, PolicyAction::Warn);
             explanations.push(DecisionExplanation {
                 rule_id: rule.id.clone(),
                 reason: format!(
@@ -792,6 +936,7 @@ impl BudgetLedger {
                 })
         });
         let mut allocation_spends = Vec::new();
+        let mut limit_window_spends = Vec::new();
         let expires_at = matching_rules
             .iter()
             .map(|rule| now + Duration::seconds(rule.window_seconds))
@@ -800,6 +945,23 @@ impl BudgetLedger {
 
         for rule in matching_rules {
             self.window(rule, now).used_usd += amount_usd;
+            for limit in &rule.limits.spend {
+                if !matches!(limit.mode, Some(crate::contract::SpendWindowMode::Tumbling)) {
+                    continue;
+                }
+                let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
+                    continue;
+                };
+                let limit_id = spend_limit_identifier(limit).to_owned();
+                let scope_key = limit_scope_key(matched_entity.as_deref());
+                self.limit_window(rule, &limit_id, window, &scope_key, now)
+                    .used_usd += amount_usd;
+                limit_window_spends.push(LimitWindowReservationSpend {
+                    rule_id: rule.id.clone(),
+                    limit_id,
+                    scope_key,
+                });
+            }
             if let Some(spend) = consume_allocation_bucket(self, rule, request, amount_usd, now) {
                 allocation_spends.push(spend);
             }
@@ -819,6 +981,7 @@ impl BudgetLedger {
                 reservation: reservation.clone(),
                 estimated_cost_usd: amount_usd,
                 budget_rule_ids,
+                limit_window_spends,
                 allocation_spends,
                 matched_entity,
             },
@@ -834,7 +997,12 @@ impl BudgetLedger {
         });
 
         if now - window.started_at >= window_seconds {
-            window.started_at = now;
+            window.started_at = match rule.window_mode {
+                Some(BudgetWindowMode::Tumbling) => {
+                    advance_tumbling_window_start(window.started_at, window_seconds, now)
+                }
+                None => now,
+            };
             window.used_usd = 0.0;
         }
 
@@ -852,11 +1020,55 @@ impl BudgetLedger {
         }
     }
 
+    fn limit_window(
+        &mut self,
+        rule: &BudgetRule,
+        limit_id: &str,
+        window_seconds: Duration,
+        scope_key: &str,
+        now: DateTime<Utc>,
+    ) -> &mut WindowState {
+        let key = (rule.id.clone(), limit_id.to_owned(), scope_key.to_owned());
+        let window = self.limit_windows.entry(key).or_insert(WindowState {
+            started_at: now,
+            used_usd: 0.0,
+        });
+
+        if now - window.started_at >= window_seconds {
+            window.started_at =
+                advance_tumbling_window_start(window.started_at, window_seconds, now);
+            window.used_usd = 0.0;
+        }
+
+        window
+    }
+
+    fn limit_window_used_usd(
+        &self,
+        rule: &BudgetRule,
+        limit_id: &str,
+        window_seconds: Duration,
+        scope_key: &str,
+        now: DateTime<Utc>,
+    ) -> f64 {
+        let key = (rule.id.clone(), limit_id.to_owned(), scope_key.to_owned());
+        let Some(window) = self.limit_windows.get(&key) else {
+            return 0.0;
+        };
+        if now - window.started_at >= window_seconds {
+            0.0
+        } else {
+            window.used_usd
+        }
+    }
+
     fn persist_decision(
         &self,
         policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         decision: &AuthorizeDecision,
+        selected_budget_id: Option<&str>,
+        limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
@@ -864,18 +1076,31 @@ impl BudgetLedger {
         let trace_id = string_metadata(request, "trace_id");
         let session_id = string_metadata(request, "session_id");
         let request_id = string_metadata(request, "request_id");
-        let routing = self.routing_persistence_fields(policy, request, decision);
+        let routing =
+            self.routing_persistence_fields(policy, request, decision, selected_budget_id);
+        let routing_report = decision_routing_report(
+            routing.selected_budget_id.clone(),
+            routing.matched_entity.clone(),
+            routing.selection_reason.clone(),
+            routing.rejected_budget_id.clone(),
+            routing.rejected_budget_reason.clone(),
+            routing.model_check.clone(),
+            routing.budget_window_remaining_usd,
+            routing.budget_window_mode.clone(),
+            routing.budget_window_started_at,
+            routing.budget_window_ends_at,
+        );
         conn.execute(
             "
             INSERT INTO decisions (
                 decision_id, trace_id, session_id, request_id, subject, project, provider, model,
-                estimated_tokens, estimated_cost_usd, outcome, explanations_json, metadata_json,
-                selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
-                rejected_budget_reason, model_check, remaining_budget_usd, max_tool_calls,
-                max_agent_steps, max_retries, created_at
+                estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
+                entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+                rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
+                limit_hits_json, max_tool_calls, max_agent_steps, max_retries, created_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24
+                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
             )
             ",
             params![
@@ -890,18 +1115,22 @@ impl BudgetLedger {
                 request.estimated_tokens.map(|value| value as i64),
                 request.estimated_cost_usd,
                 outcome_text(decision.outcome),
+                action_text(decision.action),
                 serde_json::to_string(&decision.explanations)?,
                 serde_json::to_string(&request.metadata)?,
+                serde_json::to_string(&request.entities)?,
                 routing.selected_budget_id.as_deref(),
                 routing.matched_entity.as_deref(),
                 routing.selection_reason.as_deref(),
                 routing.rejected_budget_id.as_deref(),
                 routing.rejected_budget_reason.as_deref(),
                 routing.model_check.as_deref(),
-                routing.remaining_budget_usd,
-                routing.max_tool_calls.map(|value| value as i64),
-                routing.max_agent_steps.map(|value| value as i64),
-                routing.max_retries.map(|value| value as i64),
+                routing.budget_window_remaining_usd,
+                serde_json::to_string(&routing_report)?,
+                serde_json::to_string(limit_hits)?,
+                routing.tool_calls.map(|value| value as i64),
+                routing.agent_steps.map(|value| value as i64),
+                routing.retries.map(|value| value as i64),
                 decision.created_at.to_rfc3339(),
             ],
         )?;
@@ -915,8 +1144,9 @@ impl BudgetLedger {
                 "
                 INSERT INTO reservations (
                     id, decision_id, amount_usd, estimated_amount_usd, currency, status,
-                    created_at, expires_at, budget_rule_ids_json, allocation_spends_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    created_at, expires_at, budget_rule_ids_json, limit_window_spends_json,
+                    allocation_spends_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ",
                 params![
                     reservation.id.as_str(),
@@ -928,6 +1158,13 @@ impl BudgetLedger {
                     reservation.created_at.to_rfc3339(),
                     reservation.expires_at.to_rfc3339(),
                     serde_json::to_string(budget_rule_ids)?,
+                    serde_json::to_string(
+                        &self
+                            .reservations
+                            .get(&reservation.id)
+                            .map(|stored| stored.limit_window_spends.as_slice())
+                            .unwrap_or_default(),
+                    )?,
                     serde_json::to_string(
                         &self
                             .reservations
@@ -946,13 +1183,15 @@ impl BudgetLedger {
         policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         decision: &AuthorizeDecision,
+        selected_budget_id: Option<&str>,
     ) -> RoutingPersistenceFields {
         let selected_budget_id = decision
             .reservation
             .as_ref()
             .and_then(|reservation| self.reservations.get(&reservation.id))
             .and_then(|stored| stored.budget_rule_ids.first())
-            .cloned();
+            .cloned()
+            .or_else(|| selected_budget_id.map(ToOwned::to_owned));
 
         let mut fields = RoutingPersistenceFields {
             selected_budget_id: selected_budget_id.clone(),
@@ -967,12 +1206,20 @@ impl BudgetLedger {
             {
                 fields.matched_entity =
                     matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
-                fields.remaining_budget_usd = Some(
+                fields.budget_window_remaining_usd = Some(
                     (rule.limit_usd - self.window_used_usd(rule, decision.created_at)).max(0.0),
                 );
-                fields.max_tool_calls = rule.guards.max_tool_calls;
-                fields.max_agent_steps = rule.guards.max_agent_steps;
-                fields.max_retries = rule.guards.max_retries;
+                if let Some(BudgetWindowMode::Tumbling) = rule.window_mode
+                    && let Some(window) = self.windows.get(&rule.id)
+                {
+                    fields.budget_window_mode = Some("tumbling".to_owned());
+                    fields.budget_window_started_at = Some(window.started_at);
+                    fields.budget_window_ends_at =
+                        Some(window.started_at + Duration::seconds(rule.window_seconds));
+                }
+                fields.tool_calls = rule.limits.tool_calls;
+                fields.agent_steps = rule.limits.agent_steps;
+                fields.retries = rule.limits.retries;
             }
             fields.selection_reason = decision
                 .explanations
@@ -996,7 +1243,7 @@ impl BudgetLedger {
         fields
     }
 
-    fn lifecycle_guard_report_items(
+    fn lifecycle_limit_report_items(
         &self,
         trace_id: &str,
     ) -> Result<Option<Vec<TraceReportItem>>, NoetError> {
@@ -1041,12 +1288,15 @@ impl BudgetLedger {
         {
             items.push(TraceReportItem {
                 occurred_at,
-                kind: "guard.report_only.tool_calls".to_owned(),
+                kind: "limit.report_only.tool_calls".to_owned(),
                 summary: format!(
                     "tool_calls={tool_calls} max_tool_calls={limit} reporting_only=true source=pi.tool_call"
                 ),
+                trace_id: Some(trace_id.to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             });
         }
         if let Some(limit) = max_agent_steps
@@ -1054,12 +1304,15 @@ impl BudgetLedger {
         {
             items.push(TraceReportItem {
                 occurred_at,
-                kind: "guard.report_only.agent_steps".to_owned(),
+                kind: "limit.report_only.agent_steps".to_owned(),
                 summary: format!(
                     "agent_steps={agent_steps} max_agent_steps={limit} reporting_only=true source=pi.turn_end"
                 ),
+                trace_id: Some(trace_id.to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             });
         }
         if let Some(limit) = max_retries
@@ -1067,12 +1320,15 @@ impl BudgetLedger {
         {
             items.push(TraceReportItem {
                 occurred_at,
-                kind: "guard.report_only.retries".to_owned(),
+                kind: "limit.report_only.retries".to_owned(),
                 summary: format!(
                     "retries={retries} provider_calls={provider_calls} turns={agent_steps} max_retries={limit} reporting_only=true source=pi.provider_call.started,pi.turn_end"
                 ),
+                trace_id: Some(trace_id.to_owned()),
+                entities: Vec::new(),
                 routing: None,
-                guard_hits: None,
+                limit_hits: None,
+                binding_limit: None,
             });
         }
         Ok((!items.is_empty()).then_some(items))
@@ -1211,6 +1467,31 @@ impl BudgetLedger {
         Ok(())
     }
 
+    fn persist_limit_windows(&self) -> Result<(), NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
+            conn.execute(
+                "
+                INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+                    started_at = excluded.started_at,
+                    used_usd = excluded.used_usd
+                ",
+                params![
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    window.started_at.to_rfc3339(),
+                    window.used_usd
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn persist_allocation_buckets(&self) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
@@ -1260,6 +1541,31 @@ impl BudgetLedger {
         Ok(())
     }
 
+    fn load_limit_windows(&mut self) -> Result<(), NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT rule_id, limit_id, scope_key, started_at, used_usd
+            FROM limit_window_states
+            ",
+        )?;
+        let limit_windows: Vec<((String, String, String), WindowState)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?),
+                    WindowState {
+                        started_at: parse_time(row.get::<_, String>(3)?),
+                        used_usd: row.get(4)?,
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        self.limit_windows = limit_windows.into_iter().collect();
+        Ok(())
+    }
+
     fn load_allocation_buckets(&mut self) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
@@ -1297,7 +1603,7 @@ impl BudgetLedger {
         let mut stmt = conn.prepare(
             "
             SELECT id, amount_usd, estimated_amount_usd, currency, status, created_at, expires_at,
-                   budget_rule_ids_json, allocation_spends_json
+                   budget_rule_ids_json, limit_window_spends_json, allocation_spends_json
             FROM reservations
             WHERE status = 'active'
             ",
@@ -1308,7 +1614,10 @@ impl BudgetLedger {
                 let budget_rule_ids_json: String = row.get(7)?;
                 let budget_rule_ids =
                     serde_json::from_str(&budget_rule_ids_json).unwrap_or_default();
-                let allocation_spends_json: String = row.get(8)?;
+                let limit_window_spends_json: String = row.get(8)?;
+                let limit_window_spends =
+                    serde_json::from_str(&limit_window_spends_json).unwrap_or_default();
+                let allocation_spends_json: String = row.get(9)?;
                 let allocation_spends =
                     serde_json::from_str(&allocation_spends_json).unwrap_or_default();
                 Ok((
@@ -1324,6 +1633,7 @@ impl BudgetLedger {
                         },
                         estimated_cost_usd: row.get(2)?,
                         budget_rule_ids,
+                        limit_window_spends,
                         allocation_spends,
                         matched_entity: None,
                     },
@@ -1335,13 +1645,14 @@ impl BudgetLedger {
     }
 }
 
-fn merge_policy_outcome(current: DecisionOutcome, effect: PolicyEffect) -> DecisionOutcome {
-    if current == DecisionOutcome::Deny || effect == PolicyEffect::Deny {
-        DecisionOutcome::Deny
-    } else if current == DecisionOutcome::Warn || effect == PolicyEffect::Warn {
-        DecisionOutcome::Warn
-    } else {
-        DecisionOutcome::Allow
+fn merge_policy_action(current: PolicyAction, next: PolicyAction) -> PolicyAction {
+    use PolicyAction::{Allow, Ask, Block, Warn};
+
+    match (current, next) {
+        (Block, _) | (_, Block) => Block,
+        (Ask, _) | (_, Ask) => Ask,
+        (Warn, _) | (_, Warn) => Warn,
+        _ => Allow,
     }
 }
 
@@ -1367,15 +1678,19 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             estimated_tokens INTEGER,
             estimated_cost_usd REAL,
             outcome TEXT NOT NULL,
+            action TEXT NOT NULL DEFAULT 'allow',
             explanations_json TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
+            entities_json TEXT NOT NULL DEFAULT '[]',
             selected_budget_id TEXT,
             matched_entity TEXT,
             selection_reason TEXT,
             rejected_budget_id TEXT,
             rejected_budget_reason TEXT,
             model_check TEXT,
-            remaining_budget_usd REAL,
+            budget_window_remaining_usd REAL,
+            routing_json TEXT,
+            limit_hits_json TEXT,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_decisions_trace ON decisions(trace_id);
@@ -1393,6 +1708,7 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             expires_at TEXT NOT NULL,
             finalized_at TEXT,
             budget_rule_ids_json TEXT NOT NULL DEFAULT '[]',
+            limit_window_spends_json TEXT NOT NULL DEFAULT '[]',
             allocation_spends_json TEXT NOT NULL DEFAULT '[]'
         );
 
@@ -1431,6 +1747,15 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             used_usd REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS limit_window_states (
+            rule_id TEXT NOT NULL,
+            limit_id TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            used_usd REAL NOT NULL,
+            PRIMARY KEY (rule_id, limit_id, scope_key)
+        );
+
         CREATE TABLE IF NOT EXISTS budget_allocation_buckets (
             rule_id TEXT NOT NULL,
             entity_key TEXT NOT NULL,
@@ -1452,6 +1777,18 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
     ensure_column(
         conn,
         "decisions",
+        "action",
+        "action TEXT NOT NULL DEFAULT 'allow'",
+    )?;
+    ensure_column(
+        conn,
+        "reservations",
+        "limit_window_spends_json",
+        "limit_window_spends_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "decisions",
         "selection_reason",
         "selection_reason TEXT",
     )?;
@@ -1468,11 +1805,13 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "rejected_budget_reason TEXT",
     )?;
     ensure_column(conn, "decisions", "model_check", "model_check TEXT")?;
+    ensure_column(conn, "decisions", "routing_json", "routing_json TEXT")?;
+    ensure_column(conn, "decisions", "limit_hits_json", "limit_hits_json TEXT")?;
     ensure_column(
         conn,
         "decisions",
-        "remaining_budget_usd",
-        "remaining_budget_usd REAL",
+        "budget_window_remaining_usd",
+        "budget_window_remaining_usd REAL",
     )?;
     ensure_column(
         conn,
@@ -1487,6 +1826,12 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "max_agent_steps INTEGER",
     )?;
     ensure_column(conn, "decisions", "max_retries", "max_retries INTEGER")?;
+    ensure_column(
+        conn,
+        "decisions",
+        "entities_json",
+        "entities_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
     ensure_column(
         conn,
         "reservations",
@@ -1565,11 +1910,31 @@ fn outcome_text(outcome: DecisionOutcome) -> &'static str {
     }
 }
 
+fn action_text(action: PolicyAction) -> &'static str {
+    match action {
+        PolicyAction::Allow => "allow",
+        PolicyAction::Warn => "warn",
+        PolicyAction::Block => "block",
+        PolicyAction::Ask => "ask",
+    }
+}
+
 fn reservation_status_text(status: ReservationStatus) -> &'static str {
     match status {
         ReservationStatus::Active => "active",
         ReservationStatus::Finalized => "finalized",
     }
+}
+
+fn advance_tumbling_window_start(
+    started_at: DateTime<Utc>,
+    window_seconds: Duration,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let elapsed_seconds = (now - started_at).num_seconds();
+    let window_size_seconds = window_seconds.num_seconds();
+    let completed_windows = elapsed_seconds.div_euclid(window_size_seconds);
+    started_at + Duration::seconds(completed_windows * window_size_seconds)
 }
 
 fn parse_time(value: String) -> DateTime<Utc> {
@@ -1642,19 +2007,45 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
     let request_id: Option<String> = row.get(4)?;
     let provider: Option<String> = row.get(5)?;
     let model: Option<String> = row.get(6)?;
-    let estimated_tokens: Option<i64> = row.get(7)?;
-    let estimated_cost_usd: Option<f64> = row.get(8)?;
-    let explanations_json: String = row.get(9)?;
-    let metadata_json: String = row.get(10)?;
-    let selected_budget_id: Option<String> = row.get(11)?;
-    let matched_entity: Option<String> = row.get(12)?;
-    let selection_reason: Option<String> = row.get(13)?;
-    let rejected_budget_id: Option<String> = row.get(14)?;
-    let rejected_budget_reason: Option<String> = row.get(15)?;
-    let model_check: Option<String> = row.get(16)?;
-    let remaining_budget_usd: Option<f64> = row.get(17)?;
-    let guard_hits = guard_hits_from_explanations_json(&explanations_json);
+    let action: String = row.get(7)?;
+    let estimated_tokens: Option<i64> = row.get(8)?;
+    let estimated_cost_usd: Option<f64> = row.get(9)?;
+    let explanations_json: String = row.get(10)?;
+    let metadata_json: String = row.get(11)?;
+    let entities_json: String = row.get(12)?;
+    let selected_budget_id: Option<String> = row.get(13)?;
+    let matched_entity: Option<String> = row.get(14)?;
+    let selection_reason: Option<String> = row.get(15)?;
+    let rejected_budget_id: Option<String> = row.get(16)?;
+    let rejected_budget_reason: Option<String> = row.get(17)?;
+    let model_check: Option<String> = row.get(18)?;
+    let budget_window_remaining_usd: Option<f64> = row.get(19)?;
+    let routing_json: Option<String> = row.get(20)?;
+    let limit_hits_json: Option<String> = row.get(21)?;
+    let routing = routing_json
+        .as_deref()
+        .and_then(parse_optional_json::<DecisionRoutingReport>)
+        .or_else(|| {
+            decision_routing_report(
+                selected_budget_id.clone(),
+                matched_entity.clone(),
+                selection_reason.clone(),
+                rejected_budget_id.clone(),
+                rejected_budget_reason.clone(),
+                model_check.clone(),
+                budget_window_remaining_usd,
+                None,
+                None,
+                None,
+            )
+        });
+    let limit_hits = limit_hits_json
+        .as_deref()
+        .and_then(parse_optional_json::<Vec<DecisionLimitHitReport>>)
+        .filter(|hits| !hits.is_empty())
+        .or_else(|| limit_hits_from_explanations_json(&explanations_json));
     let summary = DecisionSummary {
+        action: &action,
         decision_id: &decision_id,
         trace_id: trace_id.as_deref(),
         request_id: request_id.as_deref(),
@@ -1663,31 +2054,56 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
         estimated_tokens,
         estimated_cost_usd,
         metadata_json: &metadata_json,
-        guard_hits: guard_hits.as_deref(),
+        limit_hits: limit_hits.as_deref(),
         routing: DecisionRoutingSummary {
-            selected_budget_id: selected_budget_id.as_deref(),
-            matched_entity: matched_entity.as_deref(),
-            selection_reason: selection_reason.as_deref(),
-            rejected_budget_id: rejected_budget_id.as_deref(),
-            rejected_budget_reason: rejected_budget_reason.as_deref(),
-            model_check: model_check.as_deref(),
-            remaining_budget_usd,
+            selected_budget_id: routing
+                .as_ref()
+                .and_then(|report| report.selected_budget_id.as_deref())
+                .or(selected_budget_id.as_deref()),
+            matched_entity: routing
+                .as_ref()
+                .and_then(|report| report.matched_entity.as_deref())
+                .or(matched_entity.as_deref()),
+            selection_reason: routing
+                .as_ref()
+                .and_then(|report| report.selection_reason.as_deref())
+                .or(selection_reason.as_deref()),
+            rejected_budget_id: routing
+                .as_ref()
+                .and_then(|report| report.rejected_budget_id.as_deref())
+                .or(rejected_budget_id.as_deref()),
+            rejected_budget_reason: routing
+                .as_ref()
+                .and_then(|report| report.rejected_budget_reason.as_deref())
+                .or(rejected_budget_reason.as_deref()),
+            model_check: routing
+                .as_ref()
+                .and_then(|report| report.model_check.as_deref())
+                .or(model_check.as_deref()),
+            budget_window_remaining_usd: routing
+                .as_ref()
+                .and_then(|report| report.budget_window_remaining_usd)
+                .or(budget_window_remaining_usd),
+            budget_window_mode: routing
+                .as_ref()
+                .and_then(|report| report.budget_window_mode.as_deref()),
+            budget_window_started_at: routing
+                .as_ref()
+                .and_then(|report| report.budget_window_started_at),
+            budget_window_ends_at: routing
+                .as_ref()
+                .and_then(|report| report.budget_window_ends_at),
         },
     };
     Ok(TraceReportItem {
         occurred_at: parse_time(row.get::<_, String>(0)?),
         kind: format!("decision.{outcome}"),
         summary: summarize_decision(summary),
-        routing: decision_routing_report(
-            selected_budget_id,
-            matched_entity,
-            selection_reason,
-            rejected_budget_id,
-            rejected_budget_reason,
-            model_check,
-            remaining_budget_usd,
-        ),
-        guard_hits,
+        trace_id,
+        entities: parse_entities_json(entities_json),
+        binding_limit: limit_hits.as_deref().and_then(binding_limit_hit).cloned(),
+        routing,
+        limit_hits,
     })
 }
 
@@ -1698,7 +2114,10 @@ fn decision_routing_report(
     rejected_budget_id: Option<String>,
     rejected_budget_reason: Option<String>,
     model_check: Option<String>,
-    remaining_budget_usd: Option<f64>,
+    budget_window_remaining_usd: Option<f64>,
+    budget_window_mode: Option<String>,
+    budget_window_started_at: Option<DateTime<Utc>>,
+    budget_window_ends_at: Option<DateTime<Utc>>,
 ) -> Option<DecisionRoutingReport> {
     let has_fields = selected_budget_id.is_some()
         || matched_entity.is_some()
@@ -1706,7 +2125,10 @@ fn decision_routing_report(
         || rejected_budget_id.is_some()
         || rejected_budget_reason.is_some()
         || model_check.is_some()
-        || remaining_budget_usd.is_some();
+        || budget_window_remaining_usd.is_some()
+        || budget_window_mode.is_some()
+        || budget_window_started_at.is_some()
+        || budget_window_ends_at.is_some();
     has_fields.then_some(DecisionRoutingReport {
         selected_budget_id,
         matched_entity,
@@ -1714,137 +2136,263 @@ fn decision_routing_report(
         rejected_budget_id,
         rejected_budget_reason,
         model_check,
-        remaining_budget_usd,
+        budget_window_remaining_usd,
+        budget_window_mode,
+        budget_window_started_at,
+        budget_window_ends_at,
     })
 }
 
-fn guard_hits_from_explanations_json(
+fn parse_entities_json(value: String) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&value).unwrap_or_default()
+}
+
+fn parse_optional_json<T: DeserializeOwned>(value: &str) -> Option<T> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        serde_json::from_str(trimmed).ok()
+    }
+}
+
+fn limit_hits_from_explanations_json(
     explanations_json: &str,
-) -> Option<Vec<DecisionGuardHitReport>> {
-    let hits: Vec<DecisionGuardHitReport> =
+) -> Option<Vec<DecisionLimitHitReport>> {
+    let hits: Vec<DecisionLimitHitReport> =
         serde_json::from_str::<Vec<DecisionExplanation>>(explanations_json)
             .unwrap_or_default()
             .into_iter()
-            .filter(|explanation| is_guard_rule_id(&explanation.rule_id))
-            .map(|explanation| DecisionGuardHitReport {
+            .filter(|explanation| is_limit_rule_id(&explanation.rule_id))
+            .map(|explanation| DecisionLimitHitReport {
                 rule_id: explanation.rule_id,
                 reason: explanation.reason,
                 severity: explanation.severity,
+                window_id: None,
+                window_mode: None,
+                window_started_at: None,
+                window_ends_at: None,
+                projected_spend_usd: None,
+                max_usd: None,
+                scope_entity: None,
             })
             .collect();
     (!hits.is_empty()).then_some(hits)
 }
 
-fn is_guard_rule_id(rule_id: &str) -> bool {
-    rule_id.contains(".max_estimated_request_cost_usd")
-        || rule_id.contains(".max_context_tokens")
+fn is_limit_rule_id(rule_id: &str) -> bool {
+    rule_id.contains(".request_cost")
+        || rule_id.contains(".context_tokens")
         || rule_id.contains(".spend_window.")
 }
 
-fn apply_budget_guards(
+fn apply_budget_limits(
     ledger: &BudgetLedger,
     rule: &BudgetRule,
     request: &AuthorizeRequest,
     matched_entity: Option<&str>,
     estimated_cost: f64,
     now: DateTime<Utc>,
-    outcome: &mut DecisionOutcome,
+    action: &mut PolicyAction,
     explanations: &mut Vec<DecisionExplanation>,
+    limit_hits: &mut Vec<DecisionLimitHitReport>,
 ) -> bool {
-    if let Some(guard) = &rule.guards.max_estimated_request_cost_usd
-        && estimated_cost > guard.max_usd
-        && push_guard_explanation(
-            format!("{}.max_estimated_request_cost_usd", rule.id),
+    if let Some(limit) = &rule.limits.request_cost
+        && estimated_cost > limit.max_usd
+        && push_limit_explanation(
+            format!("{}.request_cost", rule.id),
             format!(
-                "estimated request cost ${estimated_cost:.6} exceeds guard max ${:.6}",
-                guard.max_usd
+                "estimated request cost ${estimated_cost:.6} exceeds limit max ${:.6}",
+                limit.max_usd
             ),
             format!(
-                "estimated request cost ${estimated_cost:.6} exceeds enforced guard max ${:.6}",
-                guard.max_usd
+                "estimated request cost ${estimated_cost:.6} exceeds enforced limit max ${:.6}",
+                limit.max_usd
             ),
-            guard.effect,
-            outcome,
+            limit.action,
+            action,
             explanations,
         )
     {
         return true;
     }
 
-    if let Some(guard) = &rule.guards.max_context_tokens
+    if let Some(limit) = &rule.limits.context_tokens
         && let Some(estimated_tokens) = request.estimated_tokens
-        && estimated_tokens > guard.max_tokens
-        && push_guard_explanation(
-            format!("{}.max_context_tokens", rule.id),
+        && estimated_tokens > limit.max_tokens
+        && push_limit_explanation(
+            format!("{}.context_tokens", rule.id),
             format!(
-                "estimated context tokens {estimated_tokens} exceed guard max {}",
-                guard.max_tokens
+                "estimated context tokens {estimated_tokens} exceed limit max {}",
+                limit.max_tokens
             ),
             format!(
-                "estimated context tokens {estimated_tokens} exceed enforced guard max {}",
-                guard.max_tokens
+                "estimated context tokens {estimated_tokens} exceed enforced limit max {}",
+                limit.max_tokens
             ),
-            guard.effect,
-            outcome,
+            limit.action,
+            action,
             explanations,
         )
     {
         return true;
     }
 
-    for guard in &rule.guards.spend_windows {
-        let Some(window) = crate::policy::parse_guard_window(&guard.window) else {
+    for limit in &rule.limits.spend {
+        let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
             continue;
         };
-        let recent_spend = recent_spend_usd(ledger, &rule.id, matched_entity, now - window, now);
-        let projected_spend = recent_spend + estimated_cost;
-        if projected_spend > guard.max_usd
-            && push_guard_explanation(
-                format!("{}.spend_window.{}", rule.id, guard.window),
-                format!(
-                    "projected spend ${projected_spend:.6} exceeds {} guard max ${:.6}",
-                    guard.window, guard.max_usd
-                ),
-                format!(
-                    "projected spend ${projected_spend:.6} exceeds enforced {} guard max ${:.6}",
-                    guard.window, guard.max_usd
-                ),
-                guard.effect,
-                outcome,
+        let limit_id = spend_limit_identifier(limit);
+        let limit_mode = limit
+            .mode
+            .unwrap_or(crate::contract::SpendWindowMode::Rolling);
+        let current_spend = match limit_mode {
+            crate::contract::SpendWindowMode::Rolling => {
+                recent_spend_usd(ledger, &rule.id, matched_entity, now - window, now)
+            }
+            crate::contract::SpendWindowMode::Tumbling => ledger.limit_window_used_usd(
+                rule,
+                limit_id,
+                window,
+                &limit_scope_key(matched_entity),
+                now,
+            ),
+        };
+        let projected_spend = current_spend + estimated_cost;
+        if projected_spend > limit.max_usd {
+            let warn_reason = format!(
+                "projected spend ${projected_spend:.6} exceeds {} limit max ${:.6}",
+                limit.window, limit.max_usd
+            );
+            let deny_reason = format!(
+                "projected spend ${projected_spend:.6} exceeds enforced {} limit max ${:.6}",
+                limit.window, limit.max_usd
+            );
+            let denied = push_limit_explanation(
+                format!("{}.spend_window.{}", rule.id, limit_id),
+                warn_reason.clone(),
+                deny_reason.clone(),
+                limit.action,
+                action,
                 explanations,
-            )
-        {
-            return true;
+            );
+            let (window_started_at, window_ends_at) = match limit_mode {
+                crate::contract::SpendWindowMode::Rolling => (Some(now - window), Some(now)),
+                crate::contract::SpendWindowMode::Tumbling => {
+                    let key = (
+                        rule.id.clone(),
+                        limit_id.to_owned(),
+                        limit_scope_key(matched_entity),
+                    );
+                    let started_at = ledger
+                        .limit_windows
+                        .get(&key)
+                        .map(|state| {
+                            if now - state.started_at >= window {
+                                advance_tumbling_window_start(state.started_at, window, now)
+                            } else {
+                                state.started_at
+                            }
+                        })
+                        .unwrap_or(now);
+                    (Some(started_at), Some(started_at + window))
+                }
+            };
+            limit_hits.push(DecisionLimitHitReport {
+                rule_id: format!("{}.spend_window.{}", rule.id, limit_id),
+                reason: match limit.action {
+                    PolicyAction::Warn => warn_reason,
+                    PolicyAction::Ask | PolicyAction::Block => deny_reason,
+                    PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
+                },
+                severity: match limit.action {
+                    PolicyAction::Warn => DecisionSeverity::Warn,
+                    PolicyAction::Ask | PolicyAction::Block => DecisionSeverity::Deny,
+                    PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
+                },
+                window_id: Some(limit_id.to_owned()),
+                window_mode: Some(match limit_mode {
+                    crate::contract::SpendWindowMode::Rolling => "rolling".to_owned(),
+                    crate::contract::SpendWindowMode::Tumbling => "tumbling".to_owned(),
+                }),
+                window_started_at,
+                window_ends_at,
+                projected_spend_usd: Some(projected_spend),
+                max_usd: Some(limit.max_usd),
+                scope_entity: matched_entity.map(ToOwned::to_owned),
+            });
+            if denied {
+                return true;
+            }
         }
     }
 
     false
 }
 
-fn push_guard_explanation(
+fn push_limit_explanation(
     rule_id: String,
     warn_reason: String,
     deny_reason: String,
-    effect: PolicyEffect,
-    outcome: &mut DecisionOutcome,
+    action: PolicyAction,
+    current_action: &mut PolicyAction,
     explanations: &mut Vec<DecisionExplanation>,
 ) -> bool {
-    let (severity, reason, denied) = match effect {
-        PolicyEffect::Warn => (DecisionSeverity::Warn, warn_reason, false),
-        PolicyEffect::Deny => (DecisionSeverity::Deny, deny_reason, true),
-        PolicyEffect::Allow => unreachable!("guard validation forbids allow effects"),
+    let (severity, reason, denied) = match action {
+        PolicyAction::Warn => (DecisionSeverity::Warn, warn_reason, false),
+        PolicyAction::Ask | PolicyAction::Block => (DecisionSeverity::Deny, deny_reason, true),
+        PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
     };
-    if denied {
-        *outcome = DecisionOutcome::Deny;
-    } else if *outcome != DecisionOutcome::Deny {
-        *outcome = DecisionOutcome::Warn;
-    }
+    *current_action = merge_policy_action(*current_action, action);
     explanations.push(DecisionExplanation {
         rule_id,
         reason,
         severity,
     });
     denied
+}
+
+fn spend_limit_identifier(limit: &crate::contract::SpendWindowLimit) -> &str {
+    limit.id.as_deref().unwrap_or(limit.window.as_str())
+}
+
+fn limit_hit_identifier(hit: &DecisionLimitHitReport) -> &str {
+    hit.window_id.as_deref().unwrap_or(hit.rule_id.as_str())
+}
+
+fn limit_hit_overflow(hit: &DecisionLimitHitReport) -> Option<f64> {
+    Some(hit.projected_spend_usd? - hit.max_usd?)
+}
+
+fn limit_hit_severity_rank(hit: &DecisionLimitHitReport) -> u8 {
+    match hit.severity {
+        DecisionSeverity::Deny => 0,
+        DecisionSeverity::Warn => 1,
+        DecisionSeverity::Info => 2,
+    }
+}
+
+pub(crate) fn binding_limit_hit(
+    hits: &[DecisionLimitHitReport],
+) -> Option<&DecisionLimitHitReport> {
+    hits.iter().min_by(|left, right| {
+        limit_hit_severity_rank(left)
+            .cmp(&limit_hit_severity_rank(right))
+            .then_with(
+                || match (limit_hit_overflow(left), limit_hit_overflow(right)) {
+                    (Some(left_overflow), Some(right_overflow)) => {
+                        right_overflow.total_cmp(&left_overflow)
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                },
+            )
+            .then_with(|| limit_hit_identifier(left).cmp(limit_hit_identifier(right)))
+            .then_with(|| left.rule_id.cmp(&right.rule_id))
+    })
+}
+
+fn limit_scope_key(matched_entity: Option<&str>) -> String {
+    matched_entity.unwrap_or("").to_owned()
 }
 
 fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -> Option<String> {
@@ -2115,6 +2663,7 @@ fn routing_model_check(
 }
 
 struct DecisionSummary<'a> {
+    action: &'a str,
     decision_id: &'a str,
     trace_id: Option<&'a str>,
     request_id: Option<&'a str>,
@@ -2123,7 +2672,7 @@ struct DecisionSummary<'a> {
     estimated_tokens: Option<i64>,
     estimated_cost_usd: Option<f64>,
     metadata_json: &'a str,
-    guard_hits: Option<&'a [DecisionGuardHitReport]>,
+    limit_hits: Option<&'a [DecisionLimitHitReport]>,
     routing: DecisionRoutingSummary<'a>,
 }
 
@@ -2135,12 +2684,16 @@ struct DecisionRoutingSummary<'a> {
     rejected_budget_id: Option<&'a str>,
     rejected_budget_reason: Option<&'a str>,
     model_check: Option<&'a str>,
-    remaining_budget_usd: Option<f64>,
+    budget_window_remaining_usd: Option<f64>,
+    budget_window_mode: Option<&'a str>,
+    budget_window_started_at: Option<DateTime<Utc>>,
+    budget_window_ends_at: Option<DateTime<Utc>>,
 }
 
 fn summarize_decision(decision: DecisionSummary<'_>) -> String {
     let metadata = serde_json::from_str::<Value>(decision.metadata_json).unwrap_or(Value::Null);
     let mut parts = vec![format!("decision_id={}", decision.decision_id)];
+    parts.push(format!("action={}", decision.action));
     push_opt(&mut parts, "trace", decision.trace_id);
     push_opt(&mut parts, "request", decision.request_id);
     let model_ref = match (decision.provider, decision.model) {
@@ -2184,29 +2737,62 @@ fn summarize_decision(decision: DecisionSummary<'_>) -> String {
         decision.routing.rejected_budget_reason,
     );
     push_opt(&mut parts, "model_check", decision.routing.model_check);
-    if let Some(remaining_budget_usd) = decision.routing.remaining_budget_usd {
-        parts.push(format!("remaining_budget={remaining_budget_usd:.6}"));
+    if let Some(budget_window_remaining_usd) = decision.routing.budget_window_remaining_usd {
+        parts.push(format!(
+            "budget_window_remaining={budget_window_remaining_usd:.6}"
+        ));
     }
-    if let Some(guard_hits) = decision.guard_hits
-        && !guard_hits.is_empty()
+    push_opt(
+        &mut parts,
+        "budget_window_mode",
+        decision.routing.budget_window_mode,
+    );
+    if let Some(started_at) = decision.routing.budget_window_started_at {
+        parts.push(format!("budget_window_start={}", started_at.to_rfc3339()));
+    }
+    if let Some(ends_at) = decision.routing.budget_window_ends_at {
+        parts.push(format!("budget_window_end={}", ends_at.to_rfc3339()));
+    }
+    if let Some(limit_hits) = decision.limit_hits
+        && !limit_hits.is_empty()
     {
-        let hits = guard_hits
+        let hits = limit_hits
             .iter()
             .map(|hit| hit.rule_id.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        parts.push(format!("guard_hits={hits}"));
+        parts.push(format!("limit_hits={hits}"));
+        let limit_ids = limit_hits
+            .iter()
+            .map(limit_hit_identifier)
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("limit_ids={limit_ids}"));
+        if let Some(binding_limit) = binding_limit_hit(limit_hits) {
+            parts.push(format!(
+                "binding_limit={}",
+                limit_hit_identifier(binding_limit)
+            ));
+        }
     }
     let shape = summarize_request_shape(&metadata);
     if !shape.is_empty() {
         parts.push(format!("shape={}", shape.join(",")));
     }
+    push_value_u64(&mut parts, "context_window", metadata.get("context_window"));
+    push_value_f64(
+        &mut parts,
+        "context_usage_pct",
+        metadata.get("context_usage_percent"),
+    );
     parts.join(" ")
 }
 
 fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
     let payload = serde_json::from_str::<Value>(payload_json).unwrap_or(Value::Null);
     match kind {
+        "pi.agent_context" => summarize_agent_context_payload(&payload),
+        "pi.tool_call" => summarize_tool_call_payload(&payload),
         "pi.provider_call.started" => summarize_provider_call_payload(&payload),
         "pi.stream_summary" => summarize_stream_payload(&payload),
         "tool.observed" => summarize_tool_payload(&payload),
@@ -2282,6 +2868,13 @@ fn summarize_provider_call_payload(payload: &Value) -> String {
     push_value_str(&mut parts, "provider", payload.get("provider"));
     push_value_str(&mut parts, "model", payload.get("model"));
     push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    push_value_u64(&mut parts, "context_tokens", payload.get("context_tokens"));
+    push_value_u64(&mut parts, "context_window", payload.get("context_window"));
+    push_value_f64(
+        &mut parts,
+        "context_usage_pct",
+        payload.get("context_usage_percent"),
+    );
     if let Some(summary) = payload.get("payload_summary") {
         let shape = summarize_request_shape(&serde_json::json!({ "payload_summary": summary }));
         if !shape.is_empty() {
@@ -2290,6 +2883,30 @@ fn summarize_provider_call_payload(payload: &Value) -> String {
     }
     summarize_attribution(&mut parts, payload);
     summarize_parts_or_kind(parts, "provider call")
+}
+
+fn summarize_agent_context_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "cwd", payload.get("cwd"));
+    push_array_len(&mut parts, "selected_tools", payload.get("selected_tools"));
+    push_array_len(&mut parts, "skills", payload.get("skills"));
+    push_array_len(&mut parts, "context_files", payload.get("context_files"));
+    if let Some(names) = summarized_names(payload.get("selected_tools"), 3) {
+        parts.push(format!("tool_names={names}"));
+    }
+    if let Some(names) = summarized_names(payload.get("skills"), 3) {
+        parts.push(format!("skill_names={names}"));
+    }
+    summarize_parts_or_kind(parts, "agent context")
+}
+
+fn summarize_tool_call_payload(payload: &Value) -> String {
+    let mut parts = Vec::new();
+    push_value_str(&mut parts, "tool_name", payload.get("tool_name"));
+    push_value_str(&mut parts, "tool_call_id", payload.get("tool_call_id"));
+    push_value_str(&mut parts, "provider_call", payload.get("provider_call_id"));
+    summarize_attribution(&mut parts, payload);
+    summarize_parts_or_kind(parts, "tool call")
 }
 
 fn summarize_stream_payload(payload: &Value) -> String {
@@ -2345,6 +2962,8 @@ fn summarize_usage_payload(payload: &Value) -> String {
     let mut parts = Vec::new();
     push_value_str(&mut parts, "provider", usage.get("provider"));
     push_value_str(&mut parts, "model", usage.get("model"));
+    push_value_u64(&mut parts, "input_tokens", usage.get("input_tokens"));
+    push_value_u64(&mut parts, "output_tokens", usage.get("output_tokens"));
     push_value_u64(&mut parts, "tokens", usage.get("total_tokens"));
     push_value_u64(
         &mut parts,
@@ -2366,11 +2985,11 @@ fn summarize_usage_payload(payload: &Value) -> String {
 fn summarize_turn_payload(payload: &Value) -> String {
     let mut parts = Vec::new();
     push_value_u64(&mut parts, "turn", payload.get("turn_index"));
-    if let Some(usage) = payload.get("usage") {
-        let usage_summary = summarize_usage_payload(usage);
-        if usage_summary != "usage" {
-            parts.push(format!("usage=({usage_summary})"));
-        }
+    if let Some(usage) = payload.get("usage").and_then(Value::as_object) {
+        push_value_str(&mut parts, "provider", usage.get("provider"));
+        push_value_str(&mut parts, "model", usage.get("model"));
+        push_value_u64(&mut parts, "usage_tokens", usage.get("total_tokens"));
+        push_value_f64(&mut parts, "usage_cost", usage.get("cost_usd"));
     }
     summarize_parts_or_kind(parts, "turn")
 }
@@ -2378,6 +2997,19 @@ fn summarize_turn_payload(payload: &Value) -> String {
 fn summarize_agent_payload(payload: &Value) -> String {
     let mut parts = Vec::new();
     push_value_u64(&mut parts, "messages", payload.get("message_count"));
+    push_value_u64(
+        &mut parts,
+        "provider_calls",
+        payload.get("provider_call_count"),
+    );
+    if let Some(counts) = payload.get("attribution_counts").and_then(Value::as_object) {
+        if let Some(value) = counts.get("fallback").and_then(Value::as_u64) {
+            parts.push(format!("fallback_attribution={value}"));
+        }
+        if let Some(value) = counts.get("unmatched").and_then(Value::as_u64) {
+            parts.push(format!("unmatched_attribution={value}"));
+        }
+    }
     summarize_parts_or_kind(parts, "agent")
 }
 
@@ -2472,6 +3104,22 @@ fn push_value_f64(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
     }
 }
 
+fn push_array_len(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_array) {
+        parts.push(format!("{label}_count={}", value.len()));
+    }
+}
+
+fn summarized_names(value: Option<&Value>, limit: usize) -> Option<String> {
+    let values = value?.as_array()?;
+    let names: Vec<&str> = values
+        .iter()
+        .filter_map(Value::as_str)
+        .take(limit)
+        .collect();
+    (!names.is_empty()).then(|| names.join(","))
+}
+
 fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
     if parts.is_empty() {
         fallback.to_owned()
@@ -2482,9 +3130,12 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use crate::contract::{
-        BudgetEligibility, BudgetGuardPolicy, BudgetModelPolicy, BudgetRule, MaxContextTokensGuard,
-        MaxEstimatedRequestCostGuard, RuleMatch, SpendWindowGuard,
+        BudgetEligibility, BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, BudgetWindowMode,
+        ContextTokenLimit, RequestCostLimit, RuleMatch, SpendWindowLimit, SpendWindowMode,
+        WindowAnchorKind, WindowAnchorPolicy,
     };
 
     use super::*;
@@ -2499,9 +3150,11 @@ mod tests {
                 priority: 0,
                 warn_at_fraction,
                 window_seconds: 60,
+                window_mode: None,
+                window_anchor: None,
                 eligible: Default::default(),
                 models: Default::default(),
-                guards: Default::default(),
+                limits: Default::default(),
                 allocation: None,
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
@@ -2584,18 +3237,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_guard_warns_on_expensive_single_request() {
+    fn budget_limit_warns_on_expensive_single_request() {
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: Some(MaxEstimatedRequestCostGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: Some(RequestCostLimit {
                 max_usd: 0.20,
-                effect: PolicyEffect::Warn,
+                action: PolicyAction::Warn,
             }),
-            max_context_tokens: None,
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            context_tokens: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2604,26 +3257,26 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Warn);
         assert!(decision.reservation.is_some());
         assert!(decision.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget.max_estimated_request_cost_usd"
+            explanation.rule_id == "dev-budget.request_cost"
                 && explanation.reason
-                    == "estimated request cost $0.250000 exceeds guard max $0.200000"
+                    == "estimated request cost $0.250000 exceeds limit max $0.200000"
                 && explanation.severity == DecisionSeverity::Warn
         }));
     }
 
     #[test]
-    fn budget_guard_denies_expensive_single_request_when_enforced() {
+    fn budget_limit_denies_expensive_single_request_when_enforced() {
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: Some(MaxEstimatedRequestCostGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: Some(RequestCostLimit {
                 max_usd: 0.20,
-                effect: PolicyEffect::Deny,
+                action: PolicyAction::Block,
             }),
-            max_context_tokens: None,
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            context_tokens: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2632,26 +3285,26 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.reservation.is_none());
         assert!(decision.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget.max_estimated_request_cost_usd"
+            explanation.rule_id == "dev-budget.request_cost"
                 && explanation.reason
-                    == "estimated request cost $0.250000 exceeds enforced guard max $0.200000"
+                    == "estimated request cost $0.250000 exceeds enforced limit max $0.200000"
                 && explanation.severity == DecisionSeverity::Deny
         }));
     }
 
     #[test]
-    fn budget_guard_warns_on_large_context_estimate() {
+    fn budget_limit_warns_on_large_context_estimate() {
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: Some(MaxContextTokensGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
-                effect: PolicyEffect::Warn,
+                action: PolicyAction::Warn,
             }),
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2662,25 +3315,25 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Warn);
         assert!(decision.reservation.is_some());
         assert!(decision.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget.max_context_tokens"
-                && explanation.reason == "estimated context tokens 1200 exceed guard max 1000"
+            explanation.rule_id == "dev-budget.context_tokens"
+                && explanation.reason == "estimated context tokens 1200 exceed limit max 1000"
                 && explanation.severity == DecisionSeverity::Warn
         }));
     }
 
     #[test]
-    fn budget_guard_denies_large_context_estimate_when_enforced() {
+    fn budget_limit_denies_large_context_estimate_when_enforced() {
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: Some(MaxContextTokensGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
-                effect: PolicyEffect::Deny,
+                action: PolicyAction::Block,
             }),
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
@@ -2691,26 +3344,26 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.reservation.is_none());
         assert!(decision.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget.max_context_tokens"
+            explanation.rule_id == "dev-budget.context_tokens"
                 && explanation.reason
-                    == "estimated context tokens 1200 exceed enforced guard max 1000"
+                    == "estimated context tokens 1200 exceed enforced limit max 1000"
                 && explanation.severity == DecisionSeverity::Deny
         }));
     }
 
     #[test]
-    fn budget_guard_allows_missing_context_estimate() {
+    fn budget_limit_allows_missing_context_estimate() {
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: Some(MaxContextTokensGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
-                effect: PolicyEffect::Deny,
+                action: PolicyAction::Block,
             }),
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2722,24 +3375,27 @@ mod tests {
             !decision
                 .explanations
                 .iter()
-                .any(|explanation| { explanation.rule_id == "dev-budget.max_context_tokens" })
+                .any(|explanation| { explanation.rule_id == "dev-budget.context_tokens" })
         );
     }
 
     #[test]
-    fn spend_window_guard_warns_on_projected_recent_spend() {
+    fn spend_window_limit_warns_on_projected_recent_spend() {
         let mut policy = policy(20.0, 1.0);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: None,
-            spend_windows: vec![SpendWindowGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: None,
                 window: "5h".to_owned(),
+                mode: None,
+                anchor: None,
                 max_usd: 10.0,
-                effect: PolicyEffect::Warn,
+                action: PolicyAction::Warn,
             }],
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2751,25 +3407,28 @@ mod tests {
         assert!(second.explanations.iter().any(|explanation| {
             explanation.rule_id == "dev-budget.spend_window.5h"
                 && explanation.reason
-                    == "projected spend $11.000000 exceeds 5h guard max $10.000000"
+                    == "projected spend $11.000000 exceeds 5h limit max $10.000000"
                 && explanation.severity == DecisionSeverity::Warn
         }));
     }
 
     #[test]
-    fn spend_window_guard_denies_on_projected_recent_spend() {
+    fn spend_window_limit_denies_on_projected_recent_spend() {
         let mut policy = policy(20.0, 1.0);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: None,
-            spend_windows: vec![SpendWindowGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: None,
                 window: "7d".to_owned(),
+                mode: None,
+                anchor: None,
                 max_usd: 10.0,
-                effect: PolicyEffect::Deny,
+                action: PolicyAction::Block,
             }],
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut ledger = BudgetLedger::default();
 
@@ -2781,9 +3440,226 @@ mod tests {
         assert!(second.explanations.iter().any(|explanation| {
             explanation.rule_id == "dev-budget.spend_window.7d"
                 && explanation.reason
-                    == "projected spend $11.000000 exceeds enforced 7d guard max $10.000000"
+                    == "projected spend $11.000000 exceeds enforced 7d limit max $10.000000"
                 && explanation.severity == DecisionSeverity::Deny
         }));
+    }
+
+    #[test]
+    fn tumbling_spend_window_limit_warns_on_projected_bucket_spend() {
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: Some("daily-tumbling".to_owned()),
+                window: "1d".to_owned(),
+                mode: Some(SpendWindowMode::Tumbling),
+                anchor: Some(WindowAnchorPolicy {
+                    kind: WindowAnchorKind::FirstSeen,
+                }),
+                max_usd: 10.0,
+                action: PolicyAction::Warn,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        assert_eq!(second.outcome, DecisionOutcome::Warn);
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.daily-tumbling"
+                && explanation.reason
+                    == "projected spend $11.000000 exceeds 1d limit max $10.000000"
+                && explanation.severity == DecisionSeverity::Warn
+        }));
+    }
+
+    #[test]
+    fn tumbling_spend_window_limit_denies_on_projected_bucket_spend() {
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: Some("daily-tumbling".to_owned()),
+                window: "1d".to_owned(),
+                mode: Some(SpendWindowMode::Tumbling),
+                anchor: Some(WindowAnchorPolicy {
+                    kind: WindowAnchorKind::FirstSeen,
+                }),
+                max_usd: 10.0,
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::default();
+
+        ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.daily-tumbling"
+                && explanation.reason
+                    == "projected spend $11.000000 exceeds enforced 1d limit max $10.000000"
+                && explanation.severity == DecisionSeverity::Deny
+        }));
+    }
+
+    #[test]
+    fn tumbling_and_rolling_spend_limits_of_same_duration_can_coexist() {
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![
+                SpendWindowLimit {
+                    id: Some("daily-tumbling".to_owned()),
+                    window: "1d".to_owned(),
+                    mode: Some(SpendWindowMode::Tumbling),
+                    anchor: Some(WindowAnchorPolicy {
+                        kind: WindowAnchorKind::FirstSeen,
+                    }),
+                    max_usd: 10.0,
+                    action: PolicyAction::Warn,
+                },
+                SpendWindowLimit {
+                    id: Some("daily-rolling".to_owned()),
+                    window: "1d".to_owned(),
+                    mode: Some(SpendWindowMode::Rolling),
+                    anchor: None,
+                    max_usd: 10.0,
+                    action: PolicyAction::Warn,
+                },
+            ],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::default();
+
+        ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(second.outcome, DecisionOutcome::Warn);
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.daily-tumbling"
+        }));
+        assert!(
+            second.explanations.iter().any(|explanation| {
+                explanation.rule_id == "dev-budget.spend_window.daily-rolling"
+            })
+        );
+    }
+
+    #[test]
+    fn sqlite_persists_tumbling_limit_windows_across_reopen() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("limit-window.sqlite");
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: Some("daily-tumbling".to_owned()),
+                window: "1d".to_owned(),
+                mode: Some(SpendWindowMode::Tumbling),
+                anchor: Some(WindowAnchorPolicy {
+                    kind: WindowAnchorKind::FirstSeen,
+                }),
+                max_usd: 10.0,
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let first = ledger.authorize(Some(&policy), &request(6.0));
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        let persisted = ledger
+            .conn
+            .as_ref()
+            .expect("sqlite conn")
+            .query_row(
+                "
+                SELECT used_usd
+                FROM limit_window_states
+                WHERE rule_id = ?1 AND limit_id = ?2 AND scope_key = ?3
+                ",
+                ["dev-budget", "daily-tumbling", "project:noether"],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("limit window row");
+        assert_eq!(persisted, 6.0);
+        drop(ledger);
+
+        let mut reopened = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
+        let second = reopened.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+        assert!(second.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.daily-tumbling"
+        }));
+    }
+
+    #[test]
+    fn explicit_tumbling_budget_windows_advance_by_whole_multiples_after_idle_gap() {
+        let mut ledger = BudgetLedger::default();
+        let mut rule = budget("tumbling-budget", 10.0, 0, ["project:noether"]);
+        rule.window_mode = Some(BudgetWindowMode::Tumbling);
+        rule.window_anchor = Some(WindowAnchorPolicy {
+            kind: WindowAnchorKind::FirstSeen,
+        });
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 20, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        ledger.windows.insert(
+            rule.id.clone(),
+            WindowState {
+                started_at,
+                used_usd: 4.0,
+            },
+        );
+
+        let now = started_at + Duration::seconds(130);
+        let window = ledger.window(&rule, now);
+
+        assert_eq!(window.started_at, started_at + Duration::seconds(120));
+        assert_eq!(window.used_usd, 0.0);
+    }
+
+    #[test]
+    fn legacy_budget_windows_still_reset_from_now_after_idle_gap() {
+        let mut ledger = BudgetLedger::default();
+        let rule = budget("legacy-budget", 10.0, 0, ["project:noether"]);
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 20, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        ledger.windows.insert(
+            rule.id.clone(),
+            WindowState {
+                started_at,
+                used_usd: 4.0,
+            },
+        );
+
+        let now = started_at + Duration::seconds(130);
+        let window = ledger.window(&rule, now);
+
+        assert_eq!(window.started_at, now);
+        assert_eq!(window.used_usd, 0.0);
     }
 
     #[test]
@@ -2887,7 +3763,7 @@ mod tests {
             .query_row(
                 "
                 SELECT selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
-                       rejected_budget_reason, model_check, remaining_budget_usd
+                       rejected_budget_reason, model_check, budget_window_remaining_usd
                 FROM decisions
                 WHERE decision_id = ?1
                 ",
@@ -2961,7 +3837,7 @@ mod tests {
             routing.model_check.as_deref(),
             Some("allowed:project-budget")
         );
-        assert_eq!(routing.remaining_budget_usd, Some(0.75));
+        assert_eq!(routing.budget_window_remaining_usd, Some(0.75));
 
         let trace = ledger.trace_report("trace-report").expect("trace report");
         let trace_routing = trace.items[0].routing.as_ref().expect("trace routing");
@@ -2972,26 +3848,26 @@ mod tests {
     }
 
     #[test]
-    fn report_items_include_guard_hits() {
+    fn report_items_include_limit_hits() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tempdir.path().join("guard-hits-report.sqlite");
+        let db_path = tempdir.path().join("limit-hits-report.sqlite");
         let mut policy = policy(1.0, 0.8);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: Some(MaxContextTokensGuard {
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
-                effect: PolicyEffect::Deny,
+                action: PolicyAction::Block,
             }),
-            spend_windows: Vec::new(),
-            max_tool_calls: None,
-            max_agent_steps: None,
-            max_retries: None,
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
         };
         let mut request = request(0.25);
         request.estimated_tokens = Some(1_200);
         request.metadata.insert(
             "trace_id".to_owned(),
-            Value::String("trace-guard".to_owned()),
+            Value::String("trace-limit".to_owned()),
         );
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
 
@@ -2999,42 +3875,179 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
 
         let decisions = ledger.decisions_report().expect("decisions report");
-        let guard_hits = decisions[0]
-            .guard_hits
+        let limit_hits = decisions[0]
+            .limit_hits
             .as_ref()
-            .expect("decision guard hits");
-        assert_eq!(guard_hits.len(), 1);
-        assert_eq!(guard_hits[0].rule_id, "dev-budget.max_context_tokens");
+            .expect("decision limit hits");
+        assert_eq!(limit_hits.len(), 1);
+        assert_eq!(limit_hits[0].rule_id, "dev-budget.context_tokens");
         assert_eq!(
-            guard_hits[0].reason,
-            "estimated context tokens 1200 exceed enforced guard max 1000"
+            limit_hits[0].reason,
+            "estimated context tokens 1200 exceed enforced limit max 1000"
         );
         assert!(
             decisions[0]
                 .summary
-                .contains("guard_hits=dev-budget.max_context_tokens")
+                .contains("limit_hits=dev-budget.context_tokens")
         );
 
-        let trace = ledger.trace_report("trace-guard").expect("trace report");
-        let trace_guard_hits = trace.items[0]
-            .guard_hits
+        let trace = ledger.trace_report("trace-limit").expect("trace report");
+        let trace_limit_hits = trace.items[0]
+            .limit_hits
             .as_ref()
-            .expect("trace guard hits");
-        assert_eq!(trace_guard_hits[0].rule_id, "dev-budget.max_context_tokens");
+            .expect("trace limit hits");
+        assert_eq!(trace_limit_hits[0].rule_id, "dev-budget.context_tokens");
     }
 
     #[test]
-    fn trace_report_includes_report_only_lifecycle_guard_detections() {
+    fn explicit_budget_window_metadata_is_exposed_in_decision_reports() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tempdir.path().join("lifecycle-guards.sqlite");
+        let db_path = tempdir.path().join("budget-window-report.sqlite");
+        let mut policy = policy(5.0, 1.0);
+        policy.budgets[0].window_mode = Some(BudgetWindowMode::Tumbling);
+        policy.budgets[0].window_anchor = Some(WindowAnchorPolicy {
+            kind: WindowAnchorKind::FirstSeen,
+        });
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let decision = ledger.authorize(Some(&policy), &request(0.25));
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+
+        let decisions = ledger.decisions_report().expect("decisions report");
+        let routing = decisions[0].routing.as_ref().expect("routing report");
+        assert_eq!(routing.budget_window_mode.as_deref(), Some("tumbling"));
+        assert!(routing.budget_window_started_at.is_some());
+        assert_eq!(
+            routing.budget_window_ends_at,
+            routing
+                .budget_window_started_at
+                .map(|started_at| started_at + Duration::seconds(60))
+        );
+        assert!(decisions[0].summary.contains("budget_window_mode=tumbling"));
+        assert!(decisions[0].summary.contains("budget_window_start="));
+        assert!(decisions[0].summary.contains("budget_window_end="));
+    }
+
+    #[test]
+    fn tumbling_limit_window_metadata_is_exposed_in_decision_reports() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("limit-window-report.sqlite");
         let mut policy = policy(20.0, 1.0);
-        policy.budgets[0].guards = BudgetGuardPolicy {
-            max_estimated_request_cost_usd: None,
-            max_context_tokens: None,
-            spend_windows: Vec::new(),
-            max_tool_calls: Some(1),
-            max_agent_steps: Some(1),
-            max_retries: Some(1),
+        policy.budgets[0].window_mode = Some(BudgetWindowMode::Tumbling);
+        policy.budgets[0].window_anchor = Some(WindowAnchorPolicy {
+            kind: WindowAnchorKind::FirstSeen,
+        });
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                id: Some("daily-tumbling".to_owned()),
+                window: "1d".to_owned(),
+                mode: Some(SpendWindowMode::Tumbling),
+                anchor: Some(WindowAnchorPolicy {
+                    kind: WindowAnchorKind::FirstSeen,
+                }),
+                max_usd: 10.0,
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        ledger.authorize(Some(&policy), &request(6.0));
+        let denied = ledger.authorize(Some(&policy), &request(5.0));
+        assert_eq!(denied.outcome, DecisionOutcome::Deny);
+
+        let decisions = ledger.decisions_report().expect("decisions report");
+        let limit_hit = decisions[0]
+            .limit_hits
+            .as_ref()
+            .and_then(|hits| hits.first())
+            .expect("limit hit");
+        let routing = decisions[0].routing.as_ref().expect("routing report");
+        assert_eq!(routing.selected_budget_id.as_deref(), Some("dev-budget"));
+        assert_eq!(routing.matched_entity.as_deref(), Some("project:noether"));
+        assert_eq!(routing.budget_window_mode.as_deref(), Some("tumbling"));
+        assert!(routing.budget_window_started_at.is_some());
+        assert_eq!(
+            routing.budget_window_ends_at,
+            routing
+                .budget_window_started_at
+                .map(|started_at| started_at + Duration::seconds(60))
+        );
+        assert_eq!(limit_hit.rule_id, "dev-budget.spend_window.daily-tumbling");
+        assert_eq!(limit_hit.window_id.as_deref(), Some("daily-tumbling"));
+        assert_eq!(limit_hit.window_mode.as_deref(), Some("tumbling"));
+        assert_eq!(limit_hit.projected_spend_usd, Some(11.0));
+        assert_eq!(limit_hit.max_usd, Some(10.0));
+        assert_eq!(limit_hit.scope_entity.as_deref(), Some("project:noether"));
+        assert!(limit_hit.window_started_at.is_some());
+        assert_eq!(
+            limit_hit.window_ends_at,
+            limit_hit
+                .window_started_at
+                .map(|started_at| started_at + Duration::days(1))
+        );
+        assert!(
+            decisions[0]
+                .summary
+                .contains("limit_hits=dev-budget.spend_window.daily-tumbling")
+        );
+        assert!(decisions[0].summary.contains("limit_ids=daily-tumbling"));
+        assert!(
+            decisions[0]
+                .summary
+                .contains("binding_limit=daily-tumbling")
+        );
+        assert!(decisions[0].summary.contains("selected_budget=dev-budget"));
+        assert!(decisions[0].summary.contains("budget_window_mode=tumbling"));
+    }
+
+    #[test]
+    fn binding_limit_hit_prefers_largest_overflow_within_same_severity() {
+        let smaller = DecisionLimitHitReport {
+            rule_id: "dev-budget.spend_window.daily".to_owned(),
+            reason: "smaller overflow".to_owned(),
+            severity: DecisionSeverity::Deny,
+            window_id: Some("daily".to_owned()),
+            window_mode: Some("tumbling".to_owned()),
+            window_started_at: None,
+            window_ends_at: None,
+            projected_spend_usd: Some(11.0),
+            max_usd: Some(10.0),
+            scope_entity: Some("project:noether".to_owned()),
+        };
+        let larger = DecisionLimitHitReport {
+            rule_id: "dev-budget.spend_window.burst".to_owned(),
+            reason: "larger overflow".to_owned(),
+            severity: DecisionSeverity::Deny,
+            window_id: Some("burst".to_owned()),
+            window_mode: Some("rolling".to_owned()),
+            window_started_at: None,
+            window_ends_at: None,
+            projected_spend_usd: Some(18.0),
+            max_usd: Some(10.0),
+            scope_entity: Some("project:noether".to_owned()),
+        };
+
+        let hits = [smaller, larger];
+        let selected = binding_limit_hit(&hits).expect("binding limit");
+        assert_eq!(selected.window_id.as_deref(), Some("burst"));
+    }
+
+    #[test]
+    fn trace_report_includes_report_only_lifecycle_limit_detections() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("lifecycle-limits.sqlite");
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: Vec::new(),
+            tool_calls: Some(1),
+            agent_steps: Some(1),
+            retries: Some(1),
         };
         let mut request = request(1.0);
         request.metadata.insert(
@@ -3073,19 +4086,19 @@ mod tests {
             trace
                 .items
                 .iter()
-                .any(|item| item.kind == "guard.report_only.tool_calls")
+                .any(|item| item.kind == "limit.report_only.tool_calls")
         );
         assert!(
             trace
                 .items
                 .iter()
-                .any(|item| item.kind == "guard.report_only.agent_steps")
+                .any(|item| item.kind == "limit.report_only.agent_steps")
         );
         assert!(
             trace
                 .items
                 .iter()
-                .any(|item| item.kind == "guard.report_only.retries")
+                .any(|item| item.kind == "limit.report_only.retries")
         );
     }
 
@@ -3102,11 +4115,13 @@ mod tests {
                 priority: 0,
                 warn_at_fraction: 1.0,
                 window_seconds: 60,
+                window_mode: None,
+                window_anchor: None,
                 eligible: BudgetEligibility {
                     entities: vec!["org:example".to_owned()],
                 },
                 models: BudgetModelPolicy::default(),
-                guards: BudgetGuardPolicy::default(),
+                limits: BudgetLimitPolicy::default(),
                 allocation: Some(crate::contract::BudgetAllocationPolicy {
                     standard: "protected_adoption_pool".to_owned(),
                     by: Some("user".to_owned()),
@@ -3182,11 +4197,13 @@ mod tests {
                 priority: 0,
                 warn_at_fraction: 1.0,
                 window_seconds: 60,
+                window_mode: None,
+                window_anchor: None,
                 eligible: BudgetEligibility {
                     entities: vec!["org:example".to_owned()],
                 },
                 models: BudgetModelPolicy::default(),
-                guards: BudgetGuardPolicy::default(),
+                limits: BudgetLimitPolicy::default(),
                 allocation: Some(crate::contract::BudgetAllocationPolicy {
                     standard: "protected_adoption_pool".to_owned(),
                     by: Some("user".to_owned()),
@@ -3239,11 +4256,13 @@ mod tests {
                 priority: 0,
                 warn_at_fraction: 1.0,
                 window_seconds: 60,
+                window_mode: None,
+                window_anchor: None,
                 eligible: BudgetEligibility {
                     entities: vec!["org:example".to_owned()],
                 },
                 models: BudgetModelPolicy::default(),
-                guards: BudgetGuardPolicy::default(),
+                limits: BudgetLimitPolicy::default(),
                 allocation: Some(crate::contract::BudgetAllocationPolicy {
                     standard: "protected_adoption_pool".to_owned(),
                     by: Some("user".to_owned()),
@@ -3305,11 +4324,13 @@ mod tests {
                 priority: 0,
                 warn_at_fraction: 1.0,
                 window_seconds: 1,
+                window_mode: None,
+                window_anchor: None,
                 eligible: BudgetEligibility {
                     entities: vec!["org:example".to_owned()],
                 },
                 models: BudgetModelPolicy::default(),
-                guards: BudgetGuardPolicy::default(),
+                limits: BudgetLimitPolicy::default(),
                 allocation: Some(crate::contract::BudgetAllocationPolicy {
                     standard: "protected_adoption_pool".to_owned(),
                     by: Some("user".to_owned()),
@@ -3371,11 +4392,13 @@ mod tests {
                 priority: 0,
                 warn_at_fraction: 1.0,
                 window_seconds: 60,
+                window_mode: None,
+                window_anchor: None,
                 eligible: BudgetEligibility {
                     entities: vec!["org:example".to_owned()],
                 },
                 models: BudgetModelPolicy::default(),
-                guards: BudgetGuardPolicy::default(),
+                limits: BudgetLimitPolicy::default(),
                 allocation: Some(crate::contract::BudgetAllocationPolicy {
                     standard: "protected_adoption_pool".to_owned(),
                     by: Some("user".to_owned()),
@@ -3479,11 +4502,13 @@ mod tests {
             priority,
             warn_at_fraction: 1.0,
             window_seconds: 60,
+            window_mode: None,
+            window_anchor: None,
             eligible: BudgetEligibility {
                 entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
             },
             models: BudgetModelPolicy::default(),
-            guards: BudgetGuardPolicy::default(),
+            limits: BudgetLimitPolicy::default(),
             allocation: None,
             rule_match: RuleMatch::default(),
         }

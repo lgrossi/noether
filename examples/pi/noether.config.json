@@ -1,0 +1,14 @@
+{
+  "noetherUrl": "http://127.0.0.1:4051",
+  "projectFromCwd": true,
+  "failMode": "fail_open",
+  "policyMode": "user_approved",
+  "synthetic": {
+    "enabled": true,
+    "users": 50,
+    "teams": 6,
+    "companies": 3,
+    "workflows": ["coding", "review", "research", "ops", "enablement", "incident"],
+    "surfaces": ["editor", "terminal", "automation"]
+  }
+}

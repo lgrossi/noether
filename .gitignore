@@ -1,2 +1,4 @@
 /target
 .noet/
+/**/node_modules
+/test-results

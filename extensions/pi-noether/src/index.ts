@@ -1,8 +1,12 @@
 // @ts-ignore: Pi runs extensions in Node; this package intentionally avoids a local @types/node dependency.
 import { appendFile, mkdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { basename, join } from "node:path";
 
 declare const process: {
 	env: Record<string, string | undefined>;
+	cwd: () => string;
 };
 
 const DEFAULT_NOETHER_URL = "http://127.0.0.1:4040";
@@ -12,8 +16,19 @@ const DEFAULT_AUTHORIZE_TIMEOUT_MS = 1_000;
 const DEFAULT_QUEUE_MAX_ITEMS = 100;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 1_000;
 const DEFAULT_DELIVERY_MAX_ATTEMPTS = 3;
+const DEFAULT_WORKFLOWS = ["coding", "review", "research", "ops", "enablement", "incident"];
+const DEFAULT_SURFACES = ["editor", "terminal", "automation"];
 
 type FailMode = "fail_open" | "fail_closed";
+type DecisionAction = "allow" | "warn" | "block" | "ask";
+type AppliedPolicyAction = DecisionAction | "approved";
+type UserApproval = "approved" | "rejected" | "unavailable";
+
+type ExtensionUIContext = {
+	notify?: (message: string, type?: "info" | "warning" | "error") => void;
+	setStatus?: (key: string, text: string | undefined) => void;
+	confirm?: (title: string, message: string, options?: { timeout?: number; signal?: AbortSignal }) => Promise<boolean>;
+};
 
 type ExtensionAPI = {
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>): void;
@@ -23,6 +38,8 @@ type ExtensionContext = {
 	cwd?: string;
 	model?: Record<string, unknown>;
 	signal?: AbortSignal;
+	hasUI?: boolean;
+	ui?: ExtensionUIContext;
 	getContextUsage?: () => Record<string, unknown> | undefined;
 	abort?: () => void;
 };
@@ -30,9 +47,11 @@ type ExtensionContext = {
 type NoetherConfig = {
 	noetherUrl: string;
 	project?: string;
+	projectFromCwd: boolean;
 	subject?: string;
 	budgetId?: string;
 	entities?: string[];
+	synthetic?: SyntheticPopulationConfig;
 	failMode: FailMode;
 	includeBody: boolean;
 	version: string;
@@ -40,6 +59,19 @@ type NoetherConfig = {
 	queueMaxItems: number;
 	debugHooks: boolean;
 	debugHookLogDir?: string;
+};
+
+type SyntheticPopulationConfig = {
+	enabled: boolean;
+	users: number;
+	teams: number;
+	companies: number;
+	workflows: string[];
+	surfaces: string[];
+};
+
+type PersistedNoetherConfig = Partial<Omit<NoetherConfig, "synthetic">> & {
+	synthetic?: Partial<SyntheticPopulationConfig>;
 };
 
 type ActiveRequest = {
@@ -71,12 +103,32 @@ type StreamSummary = {
 	tool_calls: Record<string, { name?: string }>;
 };
 
+type DecisionExplanation = {
+	rule_id?: string;
+	reason?: string;
+	severity?: string;
+};
+
+type DecisionRouting = {
+	selected_budget_id?: string;
+	matched_entity?: string;
+	selection_reason?: string;
+	rejected_budget_id?: string;
+	rejected_budget_reason?: string;
+	model_check?: string;
+	remaining_budget_usd?: number;
+};
+
 type AuthorizeDecision = {
 	decision_id?: string;
 	outcome?: string;
+	action?: string;
 	reservation?: {
 		id?: string;
 	};
+	explanations?: DecisionExplanation[];
+	routing?: DecisionRouting;
+	metadata?: Record<string, unknown>;
 };
 
 type Usage = {
@@ -99,20 +151,39 @@ type MutableAuthorizeRequest = ReturnType<typeof buildAuthorizeRequest> & {
 	metadata?: Record<string, unknown>;
 };
 
-export function extensionConfig(env: Record<string, string | undefined> = process.env): NoetherConfig {
+export function extensionConfig(
+	env: Record<string, string | undefined> = process.env,
+	options: { cwd?: string; loadFiles?: boolean } = {},
+): NoetherConfig {
+	const cwd = options.cwd || process.cwd();
+	const fileConfig = options.loadFiles === false ? {} : loadPersistedConfig(cwd);
+	const synthetic = normalizeSyntheticConfig({
+		...(fileConfig.synthetic || {}),
+		enabled: booleanOverride(env.NOET_PI_SYNTHETIC_ENABLED, fileConfig.synthetic?.enabled),
+		users: positiveInteger(env.NOET_PI_SYNTHETIC_USERS) || fileConfig.synthetic?.users,
+		teams: positiveInteger(env.NOET_PI_SYNTHETIC_TEAMS) || fileConfig.synthetic?.teams,
+		companies: positiveInteger(env.NOET_PI_SYNTHETIC_COMPANIES) || fileConfig.synthetic?.companies,
+		workflows: parseEntities(env.NOET_PI_SYNTHETIC_WORKFLOWS) || fileConfig.synthetic?.workflows,
+		surfaces: parseEntities(env.NOET_PI_SYNTHETIC_SURFACES) || fileConfig.synthetic?.surfaces,
+	});
 	return {
-		noetherUrl: stripTrailingSlash(env.NOET_URL || DEFAULT_NOETHER_URL),
-		project: emptyToUndefined(env.NOET_PI_PROJECT),
-		subject: emptyToUndefined(env.NOET_PI_SUBJECT),
-		budgetId: emptyToUndefined(env.NOET_PI_BUDGET_ID),
-		entities: parseEntities(env.NOET_PI_ENTITIES),
-		failMode: env.NOET_PI_FAIL_MODE === "fail_closed" ? "fail_closed" : DEFAULT_FAIL_MODE,
-		includeBody: env.NOET_PI_INCLUDE_BODY === "1" || env.NOET_PI_INCLUDE_BODY === "true",
-		version: env.NOET_PI_EXTENSION_VERSION || "dev",
-		authorizeTimeoutMs: positiveInteger(env.NOET_PI_AUTHORIZE_TIMEOUT_MS) || DEFAULT_AUTHORIZE_TIMEOUT_MS,
-		queueMaxItems: positiveInteger(env.NOET_PI_QUEUE_MAX_ITEMS) || DEFAULT_QUEUE_MAX_ITEMS,
-		debugHooks: env.NOET_PI_DEBUG_HOOKS === "raw",
-		debugHookLogDir: emptyToUndefined(env.NOET_PI_DEBUG_HOOK_LOG_DIR),
+		noetherUrl: stripTrailingSlash(env.NOET_URL || fileConfig.noetherUrl || DEFAULT_NOETHER_URL),
+		project: emptyToUndefined(env.NOET_PI_PROJECT) || fileConfig.project,
+		projectFromCwd: booleanOverride(env.NOET_PI_PROJECT_FROM_CWD, fileConfig.projectFromCwd) ?? true,
+		subject: emptyToUndefined(env.NOET_PI_SUBJECT) || fileConfig.subject,
+		budgetId: emptyToUndefined(env.NOET_PI_BUDGET_ID) || fileConfig.budgetId,
+		entities: parseEntities(env.NOET_PI_ENTITIES) || fileConfig.entities,
+		synthetic,
+		failMode:
+			normalizeFailMode(env.NOET_PI_FAIL_MODE) || normalizeFailMode(fileConfig.failMode) || DEFAULT_FAIL_MODE,
+		includeBody:
+			booleanOverride(env.NOET_PI_INCLUDE_BODY, fileConfig.includeBody) || false,
+		version: env.NOET_PI_EXTENSION_VERSION || fileConfig.version || "dev",
+		authorizeTimeoutMs:
+			positiveInteger(env.NOET_PI_AUTHORIZE_TIMEOUT_MS) || fileConfig.authorizeTimeoutMs || DEFAULT_AUTHORIZE_TIMEOUT_MS,
+		queueMaxItems: positiveInteger(env.NOET_PI_QUEUE_MAX_ITEMS) || fileConfig.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS,
+		debugHooks: env.NOET_PI_DEBUG_HOOKS === "raw" || fileConfig.debugHooks || false,
+		debugHookLogDir: emptyToUndefined(env.NOET_PI_DEBUG_HOOK_LOG_DIR) || fileConfig.debugHookLogDir,
 	};
 }
 
@@ -124,12 +195,26 @@ function emptyToUndefined(value: string | undefined): string | undefined {
 	return value && value.trim() ? value : undefined;
 }
 
+function booleanOverride(value: string | undefined, fallback?: boolean): boolean | undefined {
+	if (value === "1" || value === "true") {
+		return true;
+	}
+	if (value === "0" || value === "false") {
+		return false;
+	}
+	return fallback;
+}
+
 function positiveInteger(value: string | undefined): number | undefined {
 	if (!value) {
 		return undefined;
 	}
 	const parsed = Number.parseInt(value, 10);
 	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function normalizeFailMode(value: unknown): FailMode | undefined {
+	return value === "fail_closed" || value === "fail_open" ? value : undefined;
 }
 
 function parseEntities(value: string | undefined): string[] | undefined {
@@ -143,6 +228,58 @@ function parseEntities(value: string | undefined): string[] | undefined {
 	return entities.length > 0 ? entities : undefined;
 }
 
+function normalizeSyntheticConfig(
+	value: Partial<SyntheticPopulationConfig> | undefined,
+): SyntheticPopulationConfig | undefined {
+	if (!value?.enabled) {
+		return undefined;
+	}
+	return {
+		enabled: true,
+		users: value.users || 50,
+		teams: value.teams || 6,
+		companies: value.companies || 3,
+		workflows: value.workflows && value.workflows.length > 0 ? value.workflows : DEFAULT_WORKFLOWS,
+		surfaces: value.surfaces && value.surfaces.length > 0 ? value.surfaces : DEFAULT_SURFACES,
+	};
+}
+
+function loadPersistedConfig(cwd: string): PersistedNoetherConfig {
+	return mergePersistedConfigs(
+		readPersistedConfig(join(homedir(), ".pi/agent/noether.json")),
+		readPersistedConfig(join(cwd, ".pi/noether.json")),
+	);
+}
+
+function readPersistedConfig(path: string): PersistedNoetherConfig {
+	if (!existsSync(path)) {
+		return {};
+	}
+	try {
+		const value = JSON.parse(readFileSync(path, "utf8"));
+		return isRecord(value) ? (value as PersistedNoetherConfig) : {};
+	} catch (error) {
+		console.error(
+			`[noether-pi] failed to parse config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return {};
+	}
+}
+
+function mergePersistedConfigs(...configs: PersistedNoetherConfig[]): PersistedNoetherConfig {
+	return configs.reduce<PersistedNoetherConfig>(
+		(acc, config) => ({
+			...acc,
+			...config,
+			synthetic: {
+				...(acc.synthetic || {}),
+				...(config.synthetic || {}),
+			},
+		}),
+		{},
+	);
+}
+
 export function buildAuthorizeRequest(
 	event: { payload?: unknown },
 	ctx: ExtensionContext,
@@ -154,6 +291,16 @@ export function buildAuthorizeRequest(
 	const contextUsage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
 	const provider = stringValue(model.provider) || stringValue(payload.provider);
 	const modelId = stringValue(model.id) || stringValue(model.model) || stringValue(payload.model);
+	const synthetic = syntheticAttribution(config, ctx, correlation);
+	const project = config.project || deriveProjectFromCwd(ctx.cwd, config.projectFromCwd) || synthetic.project;
+	const subject = config.subject || synthetic.subject || deriveSubjectFromOs();
+	const modelApi = stringValue(model.api);
+	const entities = uniqueEntities([
+		...(config.entities || []),
+		...(project ? [`project:${project}`] : []),
+		...(subject ? [normalizeSubject(subject)] : []),
+		...synthetic.entities,
+	]);
 	const metadata = {
 		harness: "pi",
 		extension: EXTENSION_NAME,
@@ -164,24 +311,137 @@ export function buildAuthorizeRequest(
 		request_id: correlation.requestId,
 		provider_call_id: correlation.providerCallId,
 		cwd: ctx.cwd,
-		model_api: stringValue(model.api),
+		model_api: modelApi,
+		request_surface: deriveRequestSurface(provider, modelApi, payload),
 		payload_kind: Array.isArray(event.payload) ? "array" : typeof event.payload,
 		payload_keys: Object.keys(payload).sort(),
 		payload_summary: summarizePayload(payload, config.includeBody),
 		context_window: numberValue(contextUsage && contextUsage.contextWindow),
 		context_usage_percent: numberValue(contextUsage && contextUsage.percent),
+		project_source: !config.project && project ? "cwd" : undefined,
+		synthetic_attribution: synthetic.metadata,
 	};
 
 	return {
 		budget_id: config.budgetId,
-		entities: config.entities && config.entities.length > 0 ? config.entities : undefined,
-		subject: config.subject,
-		project: config.project,
+		entities: entities.length > 0 ? entities : undefined,
+		subject,
+		project,
 		provider,
 		model: modelId,
 		estimated_tokens: integerValue(contextUsage && contextUsage.tokens),
 		metadata: dropUndefined(metadata),
 	};
+}
+
+function deriveProjectFromCwd(cwd: string | undefined, enabled: boolean): string | undefined {
+	if (!enabled) {
+		return undefined;
+	}
+	const source = cwd || process.cwd();
+	const segment = basename(source);
+	const normalized = segment.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	return normalized || undefined;
+}
+
+function deriveSubjectFromOs(): string | undefined {
+	const envUser = emptyToUndefined(process.env.USER) || emptyToUndefined(process.env.LOGNAME);
+	if (envUser) {
+		return normalizeSubject(envUser);
+	}
+	try {
+		return normalizeSubject(userInfo().username);
+	} catch {
+		return undefined;
+	}
+}
+
+function normalizeSubject(subject: string): string {
+	return subject.includes(":") ? subject : `user:${subject}`;
+}
+
+function deriveRequestSurface(
+	provider: string | undefined,
+	modelApi: string | undefined,
+	payload: Record<string, unknown>,
+): string | undefined {
+	const normalizedApi = modelApi?.toLowerCase();
+	if (normalizedApi?.includes("responses")) {
+		return "responses";
+	}
+	if (normalizedApi?.includes("chat")) {
+		return "chat";
+	}
+	if (normalizedApi?.includes("messages")) {
+		return "messages";
+	}
+	if (Array.isArray(payload.messages)) {
+		return provider?.toLowerCase().includes("anthropic") ? "messages" : "chat";
+	}
+	if ("input" in payload || "instructions" in payload) {
+		return "responses";
+	}
+	return undefined;
+}
+
+function uniqueEntities(values: string[]): string[] {
+	const seen = new Set<string>();
+	const output: string[] = [];
+	for (const value of values) {
+		const trimmed = value.trim();
+		if (!trimmed || seen.has(trimmed)) {
+			continue;
+		}
+		seen.add(trimmed);
+		output.push(trimmed);
+	}
+	return output;
+}
+
+function syntheticAttribution(
+	config: NoetherConfig,
+	ctx: ExtensionContext,
+	correlation: { providerCallId?: string; requestId?: string },
+): { project?: string; subject?: string; entities: string[]; metadata?: Record<string, unknown> } {
+	const synthetic = config.synthetic;
+	if (!synthetic?.enabled) {
+		return { entities: [] };
+	}
+	const seed = `${correlation.providerCallId || correlation.requestId || makeTraceId()}|${ctx.cwd || ""}`;
+	const userIndex = seededIndex(seed, synthetic.users);
+	const teamIndex = userIndex % synthetic.teams;
+	const companyIndex = teamIndex % synthetic.companies;
+	const workflow = synthetic.workflows[seededIndex(`${seed}|workflow`, synthetic.workflows.length)];
+	const surface = synthetic.surfaces[seededIndex(`${seed}|surface`, synthetic.surfaces.length)];
+	const subject = `user:user-${String(userIndex + 1).padStart(2, "0")}`;
+	return {
+		subject,
+		entities: [
+			`org:company-${String(companyIndex + 1).padStart(2, "0")}`,
+			`team:team-${String(teamIndex + 1).padStart(2, "0")}`,
+			`workflow:${workflow}`,
+			`surface:${surface}`,
+		],
+		metadata: {
+			mode: "synthetic_population",
+			user: subject,
+			team: `team-${String(teamIndex + 1).padStart(2, "0")}`,
+			company: `company-${String(companyIndex + 1).padStart(2, "0")}`,
+			workflow,
+			surface,
+		},
+	};
+}
+
+function seededIndex(seed: string, size: number): number {
+	if (size <= 1) {
+		return 0;
+	}
+	let hash = 0;
+	for (let index = 0; index < seed.length; index += 1) {
+		hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+	}
+	return hash % size;
 }
 
 export function summarizePayload(payload: Record<string, unknown>, includeBody: boolean): Record<string, unknown> {
@@ -484,8 +744,291 @@ async function authorize(
 	}
 }
 
+function normalizeDecisionAction(value: unknown): DecisionAction | undefined {
+	return value === "allow" || value === "warn" || value === "block" || value === "ask" ? value : undefined;
+}
+
+export function decisionAction(decision: AuthorizeDecision | undefined): DecisionAction {
+	const explicit = normalizeDecisionAction(decision?.action);
+	if (explicit) {
+		return explicit;
+	}
+	if (decision?.outcome === "warn") {
+		return "warn";
+	}
+	if (decision?.outcome === "deny") {
+		return "block";
+	}
+	return "allow";
+}
+
 export function shouldAbortForDecision(decision: AuthorizeDecision | undefined): boolean {
-	return decision?.outcome === "deny";
+	const action = decisionAction(decision);
+	return action === "block" || action === "ask";
+}
+
+function decisionExplanations(decision: AuthorizeDecision | undefined): DecisionExplanation[] {
+	if (!decision || !Array.isArray(decision.explanations)) {
+		return [];
+	}
+	return decision.explanations.filter((explanation) => isRecord(explanation));
+}
+
+function summarizeDecisionExplanations(
+	decision: AuthorizeDecision | undefined,
+): Array<{ rule_id?: string; reason?: string; severity?: string }> | undefined {
+	const explanations = decisionExplanations(decision).map((explanation) =>
+		dropUndefined({
+			rule_id: stringValue(explanation.rule_id),
+			reason: stringValue(explanation.reason),
+			severity: stringValue(explanation.severity),
+		}),
+	);
+	return explanations.length > 0 ? explanations : undefined;
+}
+
+function extractDecisionRouting(decision: AuthorizeDecision | undefined): DecisionRouting | undefined {
+	if (!decision) {
+		return undefined;
+	}
+	const candidate =
+		(isRecord(decision.routing) && decision.routing) ||
+		(isRecord(decision.metadata) && isRecord(decision.metadata.routing) ? decision.metadata.routing : undefined);
+	if (!candidate) {
+		return undefined;
+	}
+	const routing = dropUndefined({
+		selected_budget_id: stringValue(candidate.selected_budget_id),
+		matched_entity: stringValue(candidate.matched_entity),
+		selection_reason: stringValue(candidate.selection_reason),
+		rejected_budget_id: stringValue(candidate.rejected_budget_id),
+		rejected_budget_reason: stringValue(candidate.rejected_budget_reason),
+		model_check: stringValue(candidate.model_check),
+		remaining_budget_usd: numberValue(candidate.remaining_budget_usd),
+	});
+	return Object.keys(routing).length > 0 ? routing : undefined;
+}
+
+function formatDecisionExplanation(explanation: DecisionExplanation): string | undefined {
+	const reason = stringValue(explanation.reason);
+	const ruleId = stringValue(explanation.rule_id);
+	if (reason && ruleId) {
+		return `${reason} (${ruleId})`;
+	}
+	if (reason) {
+		return reason;
+	}
+	if (ruleId) {
+		return `matched rule ${ruleId}`;
+	}
+	return undefined;
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+	const seen = new Set<string>();
+	const output: string[] = [];
+	for (const value of values) {
+		const normalized = value?.trim();
+		if (!normalized || seen.has(normalized)) {
+			continue;
+		}
+		seen.add(normalized);
+		output.push(normalized);
+	}
+	return output;
+}
+
+type AttemptedModelContext = {
+	provider?: string;
+	model?: string;
+};
+
+function attemptedModelLabel(context: AttemptedModelContext | undefined): string | undefined {
+	if (!context) {
+		return undefined;
+	}
+	if (context.provider && context.model) {
+		return `${context.provider}/${context.model}`;
+	}
+	return context.model || context.provider;
+}
+
+function decisionHasReason(decision: AuthorizeDecision | undefined, fragment: string): boolean {
+	return decisionExplanations(decision).some((explanation) => stringValue(explanation.reason)?.includes(fragment));
+}
+
+function decisionBudgetId(decision: AuthorizeDecision | undefined): string | undefined {
+	const routing = extractDecisionRouting(decision);
+	return (
+		routing?.rejected_budget_id ||
+		routing?.selected_budget_id ||
+		decisionExplanations(decision)
+			.map((explanation) => stringValue(explanation.rule_id))
+			.find((ruleId) => ruleId && !["no_fallback_budget", "no_budget_match"].includes(ruleId))
+	);
+}
+
+function describeDecisionReason(
+	decision: AuthorizeDecision | undefined,
+	attemptedModel?: AttemptedModelContext,
+): string {
+	const routing = extractDecisionRouting(decision);
+	if (decisionHasReason(decision, "provider/model is not allowed")) {
+		const model = attemptedModelLabel(attemptedModel) || "the requested model";
+		const budgetId = decisionBudgetId(decision);
+		const noFallback = decisionHasReason(decision, "no fallback budget can satisfy the request");
+		if (budgetId && noFallback) {
+			return `${model} is not allowed on budget ${budgetId}, and no fallback budget can satisfy the request`;
+		}
+		if (budgetId) {
+			return `${model} is not allowed on budget ${budgetId}`;
+		}
+		if (noFallback) {
+			return `${model} is not allowed by the available budgets, and no fallback budget can satisfy the request`;
+		}
+		return `${model} is not allowed by the active budget policy`;
+	}
+	const primaryExplanation = decisionExplanations(decision).find((explanation) => {
+		const reason = stringValue(explanation.reason);
+		if (!reason) {
+			return false;
+		}
+		return (
+			!reason.startsWith("selected requested budget") &&
+			!reason.startsWith("selected fallback budget") &&
+			reason !== "requested budget does not exist"
+		);
+	});
+	if (primaryExplanation) {
+		return formatDecisionExplanation(primaryExplanation) || "Noether returned deny without an explanation";
+	}
+	const fragments = uniqueStrings([
+		routing?.selection_reason,
+		routing?.rejected_budget_reason
+			? routing.rejected_budget_id
+				? `budget ${routing.rejected_budget_id} rejected: ${routing.rejected_budget_reason}`
+				: routing.rejected_budget_reason
+			: undefined,
+		routing?.matched_entity ? `matched entity ${routing.matched_entity}` : undefined,
+		routing?.model_check ? `model check ${routing.model_check}` : undefined,
+		typeof routing?.remaining_budget_usd === "number"
+			? `remaining budget USD ${routing.remaining_budget_usd.toFixed(6)}`
+			: undefined,
+	]);
+	return fragments.length > 0 ? fragments.join("; ") : "Noether returned deny without an explanation";
+}
+
+function appliedPolicyAction(
+	decision: AuthorizeDecision | undefined,
+	userApproval?: UserApproval,
+): AppliedPolicyAction {
+	const action = decisionAction(decision);
+	if (action !== "ask") {
+		return action;
+	}
+	return userApproval === "approved" ? "approved" : "block";
+}
+
+function messageWithDecisionId(message: string, decisionId: string | undefined): string {
+	return decisionId ? `${message} [decision ${decisionId}]` : message;
+}
+
+function buildUserApprovalPrompt(
+	decision: AuthorizeDecision,
+	attemptedModel?: AttemptedModelContext,
+): { title: string; message: string } {
+	const reason = describeDecisionReason(decision, attemptedModel);
+	const header = decision.decision_id ? `Decision ${decision.decision_id}` : "Noether deny decision";
+	return {
+		title: "Noether requested approval",
+		message: `${header}: ${reason}\n\nProceed anyway?`,
+	};
+}
+
+async function requestUserApproval(
+	ctx: ExtensionContext,
+	decision: AuthorizeDecision,
+	attemptedModel?: AttemptedModelContext,
+): Promise<UserApproval> {
+	if (!ctx.hasUI || !ctx.ui?.confirm) {
+		return "unavailable";
+	}
+	const prompt = buildUserApprovalPrompt(decision, attemptedModel);
+	try {
+		return (await ctx.ui.confirm(prompt.title, prompt.message, { signal: ctx.signal })) ? "approved" : "rejected";
+	} catch {
+		return "unavailable";
+	}
+}
+
+function buildPolicyDecisionMessage(
+	decision: AuthorizeDecision,
+	action: DecisionAction,
+	userApproval?: UserApproval,
+	attemptedModel?: AttemptedModelContext,
+): string {
+	const reason = describeDecisionReason(decision, attemptedModel);
+	if (action === "ask") {
+		if (userApproval === "approved") {
+			return messageWithDecisionId(
+				`Noether requested approval for this request, and you approved proceeding: ${reason}`,
+				decision.decision_id,
+			);
+		}
+		if (userApproval === "rejected") {
+			return messageWithDecisionId(
+				`Noether asked for approval, you rejected proceeding, so the request stayed blocked: ${reason}`,
+				decision.decision_id,
+			);
+		}
+		return messageWithDecisionId(
+			`Noether would normally ask for approval here, but this Pi run could not show an approval prompt, so the request was blocked: ${reason}`,
+			decision.decision_id,
+		);
+	}
+	if (action === "warn") {
+		return messageWithDecisionId(`Noether warned on this request: ${reason}`, decision.decision_id);
+	}
+	return messageWithDecisionId(`Noether blocked this request: ${reason}`, decision.decision_id);
+}
+
+function buildAuthorizeFailureMessage(error: unknown, failMode: FailMode): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	return `Noether authorization failed and failMode=${failMode} blocked this provider request: ${detail}`;
+}
+
+function truncateSingleLine(value: string, maxLength = 160): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (normalized.length <= maxLength) {
+		return normalized;
+	}
+	return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function clearExtensionStatus(ctx: ExtensionContext): void {
+	ctx.ui?.setStatus?.(EXTENSION_NAME, undefined);
+}
+
+function surfaceExtensionMessage(
+	ctx: ExtensionContext,
+	message: string,
+	type: "info" | "warning" | "error",
+): void {
+	ctx.ui?.notify?.(message, type);
+	ctx.ui?.setStatus?.(EXTENSION_NAME, truncateSingleLine(message));
+}
+
+function logPolicyMessage(message: string, level: "info" | "warn" | "error"): void {
+	const formatted = `[noether-pi] ${message}`;
+	if (level === "error") {
+		console.error(formatted);
+		return;
+	}
+	if (level === "warn") {
+		console.warn(formatted);
+		return;
+	}
+	console.info(formatted);
 }
 
 function buildTraceEvent(kind: string, payload: Record<string, unknown>, attribution: AttributedProviderCall) {
@@ -825,6 +1368,7 @@ function streamSummaryPayload(span: ActiveRequest): Record<string, unknown> {
 export default function registerNoetherExtension(pi: ExtensionAPI, config: NoetherConfig = extensionConfig()): void {
 	config = {
 		...config,
+		failMode: normalizeFailMode(config.failMode) || DEFAULT_FAIL_MODE,
 		authorizeTimeoutMs: config.authorizeTimeoutMs || DEFAULT_AUTHORIZE_TIMEOUT_MS,
 		queueMaxItems: config.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS,
 		debugHooks: config.debugHooks || false,
@@ -957,6 +1501,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
+		clearExtensionStatus(ctx);
 		const providerCallId = makeTraceId();
 		const requestId = providerCallId;
 		const request = buildAuthorizeRequest(isRecord(event) ? event : {}, ctx, config, {
@@ -995,7 +1540,24 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 			span.decisionId = decision.decision_id;
 			span.reservationId = decision.reservation?.id;
 			span.outcome = decision.outcome;
-			if (shouldAbortForDecision(decision)) {
+			const action = decisionAction(decision);
+			const decisionNeedsHandling = action !== "allow";
+			const attemptedModel = { provider: request.provider, model: request.model };
+			const decisionReason = decisionNeedsHandling ? describeDecisionReason(decision, attemptedModel) : undefined;
+			const userApproval = action === "ask" ? await requestUserApproval(ctx, decision, attemptedModel) : undefined;
+			const policyAction = appliedPolicyAction(decision, userApproval);
+
+			if (decisionNeedsHandling) {
+				const message = buildPolicyDecisionMessage(decision, action, userApproval, attemptedModel);
+				if (policyAction === "warn" || policyAction === "approved") {
+					surfaceExtensionMessage(ctx, message, "warning");
+					logPolicyMessage(message, "warn");
+				} else {
+					surfaceExtensionMessage(ctx, message, "error");
+					logPolicyMessage(message, "error");
+				}
+			}
+			if (policyAction === "block") {
 				ctx.abort?.();
 			}
 			if (pendingAgentContext && Object.keys(pendingAgentContext).length > 0) {
@@ -1006,6 +1568,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				{
 					provider: request.provider,
 					model: request.model,
+					context_tokens: request.estimated_tokens,
 					payload_keys: request.metadata?.payload_keys,
 					payload_summary: request.metadata?.payload_summary,
 					context_window: request.metadata?.context_window,
@@ -1014,9 +1577,26 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				{ span, status: "exact" },
 				3,
 			);
-			enqueueEvent("pi.authorize", { request, outcome: decision.outcome }, { span, status: "exact" }, 3);
+			enqueueEvent(
+				"pi.authorize",
+				{
+					request,
+					outcome: decision.outcome,
+					decision_action: action,
+					policy_action: policyAction,
+					user_approval: userApproval,
+					decision_reason: decisionReason,
+					explanations: summarizeDecisionExplanations(decision),
+					routing: extractDecisionRouting(decision),
+				},
+				{ span, status: "exact" },
+				3,
+			);
 		} catch (error) {
 			if (config.failMode === "fail_closed") {
+				const message = buildAuthorizeFailureMessage(error, config.failMode);
+				surfaceExtensionMessage(ctx, message, "error");
+				logPolicyMessage(message, "error");
 				ctx.abort?.();
 			}
 			enqueueEvent(

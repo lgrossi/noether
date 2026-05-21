@@ -98,7 +98,7 @@ async fn evaluate_capture_decision(
     state: &AppState,
     request: &CapturedRequest,
 ) -> Result<Option<CapturedDecision>, NoetError> {
-    let Some(policy) = state.policy.as_ref() else {
+    let Some(policy) = state.active_policy().await else {
         return Ok(None);
     };
     let authorize_request = authorize_request_from_capture(request);

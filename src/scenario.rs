@@ -113,7 +113,7 @@ pub enum ScenarioAssertion {
     TotalCostUsd {
         amount_usd: f64,
     },
-    GuardHit {
+    LimitHit {
         request_id: String,
         rule_id: String,
     },
@@ -304,7 +304,7 @@ fn assertion_request_id(assertion: &ScenarioAssertion) -> Option<&str> {
         ScenarioAssertion::DecisionOutcome { request_id, .. }
         | ScenarioAssertion::SelectedBudget { request_id, .. }
         | ScenarioAssertion::Denied { request_id }
-        | ScenarioAssertion::GuardHit { request_id, .. }
+        | ScenarioAssertion::LimitHit { request_id, .. }
         | ScenarioAssertion::Fallback { request_id, .. } => Some(request_id.as_str()),
         ScenarioAssertion::ReportJson {
             report: ScenarioReportSource::Trace,

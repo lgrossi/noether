@@ -1,5 +1,8 @@
 # Product surface gap audit — 2026-05-17
 
+> Historical note: this audit predates the artifact-backed simulation HTTP/browser surfaces shipped
+> on 2026-05-18. Use `docs/export-reporting-api.md` for the current surface contract.
+
 ## Scope
 
 This audit tracks product-language drift between shipped Noether surfaces and the way docs describe

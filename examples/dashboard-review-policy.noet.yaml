@@ -1,0 +1,169 @@
+version: 0
+budgets:
+  - id: team-platform
+    limit_usd: 420
+    priority: 1
+    warn_at_fraction: 0.65
+    eligible:
+      entities: [team:platform]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: team-product
+    limit_usd: 320
+    priority: 1
+    warn_at_fraction: 0.65
+    eligible:
+      entities: [team:product]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: team-security
+    limit_usd: 240
+    priority: 1
+    warn_at_fraction: 0.6
+    eligible:
+      entities: [team:security]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: team-revenue
+    limit_usd: 210
+    priority: 1
+    warn_at_fraction: 0.62
+    eligible:
+      entities: [team:revenue]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: team-support
+    limit_usd: 160
+    priority: 1
+    warn_at_fraction: 0.68
+    eligible:
+      entities: [team:support]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: platform-premium
+    limit_usd: 180
+    priority: 10
+    warn_at_fraction: 0.55
+    eligible:
+      entities: [project:noether]
+    models:
+      allow:
+        - openai:gpt-4.1
+        - anthropic:claude-sonnet-*
+
+  - id: search-burst
+    limit_usd: 150
+    priority: 9
+    warn_at_fraction: 0.5
+    eligible:
+      entities: [project:search]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: security-incident
+    limit_usd: 120
+    priority: 9
+    warn_at_fraction: 0.5
+    eligible:
+      entities: [project:incident]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+    limits:
+      spend:
+        - window: 12h
+          max_usd: 18
+          action: warn
+
+  - id: revenue-pricing
+    limit_usd: 110
+    priority: 9
+    warn_at_fraction: 0.58
+    eligible:
+      entities: [project:pricing]
+    models:
+      allow:
+        - openai:*
+        - anthropic:*
+
+  - id: editor-claude
+    limit_usd: 90
+    priority: 9
+    warn_at_fraction: 0.55
+    eligible:
+      entities: [project:editor]
+    models:
+      allow:
+        - anthropic:claude-sonnet-*
+
+  - id: editor-openai-fallback
+    limit_usd: 140
+    priority: 8
+    warn_at_fraction: 0.6
+    eligible:
+      entities: [project:editor]
+    models:
+      allow:
+        - openai:*
+
+  - id: product-adoption
+    limit_usd: 240
+    priority: 7
+    warn_at_fraction: 0.7
+    eligible:
+      entities: [team:product]
+    allocation:
+      standard: protected_adoption_pool
+      by: user
+      protected_amount_usd: 25
+      window: monthly
+      carryover:
+        percent: 10
+        cap_usd: 50
+
+  - id: support-adoption
+    limit_usd: 110
+    priority: 7
+    warn_at_fraction: 0.7
+    eligible:
+      entities: [team:support]
+    allocation:
+      standard: protected_adoption_pool
+      by: user
+      protected_amount_usd: 12
+      window: monthly
+      carryover:
+        percent: 5
+        cap_usd: 20
+
+  - id: runaway-sandbox
+    limit_usd: 90
+    priority: 11
+    warn_at_fraction: 0.5
+    eligible:
+      entities: [project:labs]
+    limits:
+      request_cost:
+        max_usd: 12
+        action: block
+      tool_calls: 6
+      agent_steps: 2
+      retries: 1

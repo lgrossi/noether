@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,10 +10,18 @@ const extension = await import(resolve(__dirname, "../../../.noet/build/pi-noeth
 function fakeContext(overrides = {}) {
 	return {
 		cwd: "/repo",
+		hasUI: true,
 		model: {
 			provider: "openai-codex",
 			id: "gpt-5.5",
 			api: "openai-codex-responses",
+		},
+		ui: {
+			notify() {},
+			setStatus() {},
+			async confirm() {
+				return false;
+			},
 		},
 		getContextUsage() {
 			return {
@@ -24,6 +32,29 @@ function fakeContext(overrides = {}) {
 		},
 		abort() {},
 		...overrides,
+	};
+}
+
+function captureUiSignals() {
+	const notifications = [];
+	const statuses = [];
+	const confirms = [];
+	return {
+		confirms,
+		notifications,
+		statuses,
+		ui: {
+			notify(message, type) {
+				notifications.push({ message, type });
+			},
+			setStatus(key, text) {
+				statuses.push({ key, text });
+			},
+			async confirm(title, message, options) {
+				confirms.push({ title, message, options });
+				return false;
+			},
+		},
 	};
 }
 
@@ -161,15 +192,63 @@ function deferred() {
 	assert.equal(request.subject, "user@example.test");
 	assert.equal(request.project, "noether");
 	assert.equal(request.budget_id, undefined);
-	assert.equal(request.entities, undefined);
+	assert.deepEqual(request.entities, ["project:noether", "user:user@example.test"]);
 	assert.equal(request.provider, "openai-codex");
 	assert.equal(request.model, "gpt-5.5");
 	assert.equal(request.estimated_tokens, 1234);
+	assert.equal(request.metadata.request_surface, "responses");
 	assert.equal(request.metadata.trace_id, undefined);
 	assert.deepEqual(request.metadata.payload_summary.input, { type: "array", length: 1, item_types: { user: 1 } });
 	assert.deepEqual(request.metadata.payload_summary.instructions, { type: "string", length: 21 });
 	assert.equal(JSON.stringify(request).includes("secret prompt"), false);
 	assert.equal(JSON.stringify(request).includes("private system prompt"), false);
+}
+
+{
+	const originalUser = process.env.USER;
+	const originalLogname = process.env.LOGNAME;
+	process.env.USER = "lgrossi";
+	delete process.env.LOGNAME;
+
+	try {
+		const request = extension.buildAuthorizeRequest(
+			{
+				payload: {
+					provider: "anthropic",
+					model: "claude-sonnet",
+					messages: [{ role: "user", content: "hello" }],
+				},
+			},
+			fakeContext({
+				model: {
+					provider: "anthropic",
+					id: "claude-sonnet",
+					api: "anthropic-messages",
+				},
+			}),
+			{
+				failMode: "fail_open",
+				noetherUrl: "http://127.0.0.1:4040",
+				version: "test",
+				includeBody: false,
+			},
+		);
+
+		assert.equal(request.subject, "user:lgrossi");
+		assert(request.entities.includes("user:lgrossi"));
+		assert.equal(request.metadata.request_surface, "messages");
+	} finally {
+		if (originalUser === undefined) {
+			delete process.env.USER;
+		} else {
+			process.env.USER = originalUser;
+		}
+		if (originalLogname === undefined) {
+			delete process.env.LOGNAME;
+		} else {
+			process.env.LOGNAME = originalLogname;
+		}
+	}
 }
 
 {
@@ -179,12 +258,35 @@ function deferred() {
 		NOET_PI_SUBJECT: "user:alice",
 		NOET_PI_BUDGET_ID: "project-noether",
 		NOET_PI_ENTITIES: " project:noether, user:alice, ,",
-	});
+	}, { loadFiles: false });
 	const request = extension.buildAuthorizeRequest({ payload: { model: "local" } }, fakeContext(), config);
 
 	assert.equal(config.noetherUrl, "http://127.0.0.1:4040");
 	assert.equal(request.budget_id, "project-noether");
 	assert.deepEqual(request.entities, ["project:noether", "user:alice"]);
+}
+
+{
+	const configRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-config-"));
+
+	try {
+		await mkdir(resolve(configRoot, ".pi"), { recursive: true });
+		await writeFile(
+			resolve(configRoot, ".pi/noether.json"),
+			JSON.stringify({
+				noetherUrl: "http://127.0.0.1:4051",
+			}),
+			"utf8",
+		);
+
+		const defaults = extension.extensionConfig({}, { loadFiles: false });
+		const persisted = extension.extensionConfig({}, { cwd: configRoot });
+
+		assert.equal(defaults.failMode, "fail_open");
+		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+	} finally {
+		await rm(configRoot, { recursive: true, force: true });
+	}
 }
 
 {
@@ -235,6 +337,61 @@ function deferred() {
 }
 
 {
+	const request = extension.buildAuthorizeRequest(
+		{ payload: { model: "gpt-5.5" } },
+		fakeContext({ cwd: "/repo/customer-search" }),
+		{
+			noetherUrl: "http://127.0.0.1:4040",
+			failMode: "fail_open",
+			includeBody: false,
+			version: "test",
+			authorizeTimeoutMs: 1000,
+			queueMaxItems: 10,
+			debugHooks: false,
+			projectFromCwd: true,
+		},
+		{ providerCallId: "call-1" },
+	);
+
+	assert.equal(request.project, "customer-search");
+	assert(request.entities.includes("project:customer-search"));
+}
+
+{
+	const request = extension.buildAuthorizeRequest(
+		{ payload: { model: "gpt-5.5" } },
+		fakeContext({ cwd: "/repo/noether" }),
+		{
+			noetherUrl: "http://127.0.0.1:4040",
+			failMode: "fail_open",
+			includeBody: false,
+			version: "test",
+			authorizeTimeoutMs: 1000,
+			queueMaxItems: 10,
+			debugHooks: false,
+			projectFromCwd: true,
+			synthetic: {
+				enabled: true,
+				users: 50,
+				teams: 6,
+				companies: 3,
+				workflows: ["coding", "review"],
+				surfaces: ["editor", "terminal"],
+			},
+		},
+		{ providerCallId: "call-2" },
+	);
+
+	assert.equal(request.project, "noether");
+	assert.match(request.subject, /^user:user-\d{2}$/);
+	assert(request.entities.includes("project:noether"));
+	assert(request.entities.some((value) => value.startsWith("org:company-")));
+	assert(request.entities.some((value) => value.startsWith("team:team-")));
+	assert(request.entities.some((value) => value.startsWith("workflow:")));
+	assert(request.entities.some((value) => value.startsWith("surface:")));
+}
+
+{
 	const usage = extension.extractUsage({
 		role: "assistant",
 		provider: "anthropic",
@@ -276,7 +433,14 @@ function deferred() {
 			return Response.json({
 				decision_id: "dec_1",
 				outcome: "deny",
-				explanations: [],
+				action: "block",
+				explanations: [
+					{ rule_id: "daily-cap", reason: "daily budget exceeded", severity: "deny" },
+				],
+				routing: {
+					rejected_budget_id: "project-noether",
+					rejected_budget_reason: "remaining budget is 0",
+				},
 				created_at: new Date().toISOString(),
 			});
 		}
@@ -285,6 +449,7 @@ function deferred() {
 
 	try {
 		let aborted = false;
+		const ui = captureUiSignals();
 		const handlers = new Map();
 		extension.default(
 			{
@@ -302,15 +467,367 @@ function deferred() {
 
 		await handlers.get("before_provider_request")(
 			{ payload: { model: "local", messages: [{ role: "user", content: "do not send" }] } },
-			fakeContext({ abort: () => { aborted = true; } }),
+			fakeContext({
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
 		);
 
 		assert.equal(aborted, true);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "error");
+		assert.match(ui.notifications[0].message, /daily budget exceeded/);
+		assert.match(ui.notifications[0].message, /decision dec_1/);
+		assert(
+			ui.statuses.some((status) => typeof status.text === "string" && status.text.includes("Noether blocked")),
+		);
 		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
 		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
 		assert.equal(typeof authorizeCall.body.metadata.trace_id, "string");
 		assert.equal(typeof authorizeCall.body.metadata.request_id, "string");
 		assert.equal(JSON.stringify(calls).includes("do not send"), false);
+		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize deny event");
+		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
+		assert.equal(authorizeEvent.body.payload.decision_action, "block");
+		assert.equal(authorizeEvent.body.payload.policy_action, "block");
+		assert.match(authorizeEvent.body.payload.decision_reason, /daily budget exceeded/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_warn",
+				outcome: "warn",
+				action: "warn",
+				explanations: [
+					{ rule_id: "restricted-model", reason: "model access requires a different budget", severity: "deny" },
+				],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
+		);
+
+		assert.equal(aborted, false);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "warning");
+		assert.match(ui.notifications[0].message, /Noether warned on this request/);
+		assert.match(ui.notifications[0].message, /model access requires a different budget/);
+		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize warn-mode event");
+		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
+		assert.equal(authorizeEvent.body.payload.decision_action, "warn");
+		assert.equal(authorizeEvent.body.payload.policy_action, "warn");
+		assert.match(authorizeEvent.body.payload.decision_reason, /different budget/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_model_block",
+				outcome: "deny",
+				action: "block",
+				explanations: [
+					{
+						rule_id: "personal-local",
+						reason: "requested provider/model is not allowed by requested budget",
+						severity: "deny",
+					},
+					{
+						rule_id: "no_fallback_budget",
+						reason: "no fallback budget can satisfy the request",
+						severity: "deny",
+					},
+					{
+						rule_id: "personal-local",
+						reason: "requested provider/model is not allowed by budget",
+						severity: "deny",
+					},
+				],
+				routing: {
+					rejected_budget_id: "personal-local",
+					rejected_budget_reason: "requested provider/model is not allowed by requested budget",
+					model_check: "denied",
+				},
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "gpt-5.4-mini" } },
+			fakeContext({
+				model: {
+					provider: "openai-codex",
+					id: "gpt-5.4-mini",
+					api: "openai-codex-responses",
+				},
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
+		);
+
+		assert.equal(aborted, true);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "error");
+		assert.match(ui.notifications[0].message, /openai-codex\/gpt-5\.4-mini/);
+		assert.match(ui.notifications[0].message, /not allowed on budget personal-local/);
+		assert.match(ui.notifications[0].message, /no fallback budget/);
+		assert.doesNotMatch(ui.notifications[0].message, /requested provider\/model is not allowed by budget/);
+		assert.doesNotMatch(ui.notifications[0].message, /requested provider\/model is not allowed by requested budget/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_user_approved",
+				outcome: "deny",
+				action: "ask",
+				explanations: [
+					{ rule_id: "restricted-tool", reason: "tool access requires explicit approval", severity: "deny" },
+				],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		ui.ui.confirm = async (title, message, options) => {
+			ui.confirms.push({ title, message, options });
+			return true;
+		};
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
+		);
+
+		assert.equal(aborted, false);
+		assert.equal(ui.confirms.length, 1);
+		assert.match(ui.confirms[0].title, /Noether requested approval/);
+		assert.match(ui.confirms[0].message, /tool access requires explicit approval/);
+		assert.match(ui.confirms[0].message, /Proceed anyway\?/);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "warning");
+		assert.match(ui.notifications[0].message, /approved proceeding/);
+		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize user-approved approval event");
+		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
+		assert.equal(authorizeEvent.body.payload.decision_action, "ask");
+		assert.equal(authorizeEvent.body.payload.policy_action, "approved");
+		assert.equal(authorizeEvent.body.payload.user_approval, "approved");
+		assert.match(authorizeEvent.body.payload.decision_reason, /explicit approval/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_user_rejected",
+				outcome: "deny",
+				action: "ask",
+				explanations: [
+					{ rule_id: "after-hours", reason: "after-hours policy requires manual override", severity: "deny" },
+				],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
+		);
+
+		assert.equal(aborted, true);
+		assert.equal(ui.confirms.length, 1);
+		assert.match(ui.confirms[0].message, /after-hours policy requires manual override/);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "error");
+		assert.match(ui.notifications[0].message, /you rejected proceeding/);
+		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize user-approved rejection event");
+		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
+		assert.equal(authorizeEvent.body.payload.decision_action, "ask");
+		assert.equal(authorizeEvent.body.payload.policy_action, "block");
+		assert.equal(authorizeEvent.body.payload.user_approval, "rejected");
+		assert.match(authorizeEvent.body.payload.decision_reason, /manual override/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_user_unavailable",
+				outcome: "deny",
+				action: "ask",
+				explanations: [
+					{ rule_id: "daily-cap", reason: "daily budget exceeded", severity: "deny" },
+				],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({
+				hasUI: false,
+				ui: ui.ui,
+				abort: () => {
+					aborted = true;
+				},
+			}),
+		);
+
+		assert.equal(aborted, true);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "error");
+		assert.match(ui.notifications[0].message, /would normally ask for approval here/);
+		assert.match(ui.notifications[0].message, /could not show an approval prompt/);
+		assert.doesNotMatch(ui.notifications[0].message, /policyMode=user_approved could not collect approval/);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

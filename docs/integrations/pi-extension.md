@@ -154,6 +154,7 @@ Noether authorization request:
     "request_id": "generated-request-id",
     "cwd": "/repo",
     "model_api": "openai-codex-responses",
+    "request_surface": "responses",
     "payload_kind": "object",
     "payload_keys": ["input", "instructions", "model", "stream"],
     "payload_summary": {
@@ -383,6 +384,7 @@ Configure the extension with environment variables:
 | `NOET_PI_BUDGET_ID` | unset | Explicit budget id sent to `/v1/authorize`. |
 | `NOET_PI_ENTITIES` | unset | Comma-separated trusted entities such as `project:noether,user:local`. |
 | `NOET_PI_FAIL_MODE` | `fail_open` | Use `fail_closed` to abort provider sends when Noether is unavailable. |
+| `NOET_PI_POLICY_MODE` | `enforce` | Deny handling for Noether policy decisions: `enforce` aborts, `user_approved` prompts the user to continue or block, `warn` continues with a user-visible warning, `monitor` continues with report-only handling. |
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |
 | `NOET_PI_AUTHORIZE_TIMEOUT_MS` | `1000` | Maximum time the hot-path authorization hook waits for Noether. |
@@ -416,7 +418,7 @@ only be used locally with logs you are willing to inspect and delete.
 
 ## Privacy posture
 
-The extension is bodyless by default. Its authorization request includes configured `subject` and `project`, provider/model from Pi context when available, estimated context tokens from `ctx.getContextUsage()` when available, and sanitized metadata such as cwd, model API, payload type, top-level payload keys, and shape summaries.
+The extension is bodyless by default. Its authorization request includes configured `subject` and `project`, or an OS-derived local subject plus cwd-derived project when those helpers are enabled, provider/model from Pi context when available, estimated context tokens from `ctx.getContextUsage()` when available, and sanitized metadata such as cwd, model API, request surface (`responses` / `chat` / `messages` when inferable), payload type, top-level payload keys, and shape summaries.
 
 It does **not** send prompt/body content by default. Prompt-like keys such as `messages`, `input`, `instructions`, `prompt`, and `system` are summarized by type/length only.
 
@@ -434,7 +436,12 @@ The extension runs on `before_provider_request`, calls Noether asynchronously, a
 
 - `allow`: return normally and Pi sends the provider request;
 - `warn`: return normally and Pi sends the provider request;
-- `deny`: call `ctx.abort()` before Pi sends the provider request.
+- `deny` + `policyMode=enforce`: show the deny reason and call `ctx.abort()` before Pi sends the provider request;
+- `deny` + `policyMode=user_approved`: show the deny reason in Pi's confirm dialog, ask whether to proceed anyway, continue only after explicit approval, and otherwise abort;
+- `deny` + `policyMode=warn`: show the deny reason as a warning and still let Pi send the provider request;
+- `deny` + `policyMode=monitor`: record/report the deny reason without warning or blocking.
+
+When Pi UI confirmation is unavailable, `policyMode=user_approved` blocks the request and reports that approval could not be collected.
 
 Pi extension errors are not a denial mechanism; Pi catches thrown handler errors and continues. The hard-deny mechanism for this integration is `ctx.abort()`, as validated in [`docs/integrations/pi-wrapper-research.md`](./pi-wrapper-research.md).
 
@@ -443,10 +450,14 @@ Noether unavailability is configurable:
 - default: `fail_open` so local development does not break when the sidecar is down;
 - strict: `fail_closed` so provider sends are aborted if authorization cannot be obtained.
 
+`failMode` only covers transport failures talking to Noether. `policyMode` only covers real
+Noether `deny` decisions.
+
 Current regression coverage covers:
 
 - `allow` continues without abort;
 - `deny` aborts before provider send;
+- `deny` in `policyMode=user_approved` continues after approval and aborts after rejection;
 - authorize timeout in `fail_open` and `fail_closed`;
 - immediate sidecar-unavailable failure in `fail_open` and `fail_closed`;
 - bounded retries for queued lifecycle delivery;
@@ -473,6 +484,7 @@ That is the default `fail_open` behavior. Set:
 
 ```bash
 export NOET_PI_FAIL_MODE=fail_closed
+export NOET_PI_POLICY_MODE=enforce
 ```
 
 if you want the provider send aborted when Noether cannot be reached.

@@ -102,7 +102,7 @@ pub struct SyntheticDemandRequest {
     pub entities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SimulationComparisonReport {
     pub name: Option<String>,
     pub seed: u64,
@@ -111,17 +111,18 @@ pub struct SimulationComparisonReport {
     pub strategies: Vec<SimulationStrategyReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SimulationStrategyReport {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub policy_moves: Vec<String>,
     pub total_requests: u64,
     pub allowed_requests: u64,
     pub warned_requests: u64,
     pub denied_requests: u64,
     pub fallback_count: u64,
-    pub guard_hit_count: u64,
+    pub limit_hit_count: u64,
     pub total_cost_usd: f64,
     pub unused_budget_usd: f64,
     pub useful_work_blocked_score: u64,
@@ -139,7 +140,7 @@ pub struct SimulationStrategyReport {
     pub decisions_report_path: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SimulationModelMixEntry {
     pub model_id: String,
     pub requests: u64,
@@ -338,7 +339,8 @@ pub fn compare_strategies(
 
     for strategy in &file.strategies {
         let strategy_slug = encode_path_component(&strategy.id, "simulation");
-        let strategy_dir = strategies_dir.join(&strategy_slug);
+        let strategy_dir_relative = PathBuf::from("strategies").join(&strategy_slug);
+        let strategy_dir = out_dir.join(&strategy_dir_relative);
         std::fs::create_dir_all(&strategy_dir)?;
         let db_path = strategy_dir.join("simulation.sqlite");
         if db_path.exists() {
@@ -349,12 +351,13 @@ pub fn compare_strategies(
         let mut report = SimulationStrategyReport {
             id: strategy.id.clone(),
             description: strategy.description.clone(),
+            policy_moves: strategy_policy_moves(&strategy.policy),
             total_requests: demand.len() as u64,
             allowed_requests: 0,
             warned_requests: 0,
             denied_requests: 0,
             fallback_count: 0,
-            guard_hit_count: 0,
+            limit_hit_count: 0,
             total_cost_usd: 0.0,
             unused_budget_usd: 0.0,
             useful_work_blocked_score: 0,
@@ -367,9 +370,9 @@ pub fn compare_strategies(
             model_mix: Vec::new(),
             carryover_liability_usd: 0.0,
             exhaustion_day: None,
-            db_path: db_path.clone(),
-            usage_report_path: strategy_dir.join("usage-report.json"),
-            decisions_report_path: strategy_dir.join("decisions-report.json"),
+            db_path: strategy_dir_relative.join("simulation.sqlite"),
+            usage_report_path: strategy_dir_relative.join("usage-report.json"),
+            decisions_report_path: strategy_dir_relative.join("decisions-report.json"),
         };
         let mut users_with_access = BTreeSet::new();
         let mut user_spend = BTreeMap::new();
@@ -378,10 +381,10 @@ pub fn compare_strategies(
         for request in &demand {
             let authorize = synthetic_authorize_request(request, &strategy.id);
             let decision = ledger.try_authorize(Some(&strategy.policy), &authorize)?;
-            let guard_hit_count = decision
+            let limit_hit_count = decision
                 .explanations
                 .iter()
-                .filter(|explanation| is_guard_rule_id(&explanation.rule_id))
+                .filter(|explanation| is_limit_rule_id(&explanation.rule_id))
                 .count() as u64;
             if decision
                 .explanations
@@ -390,7 +393,7 @@ pub fn compare_strategies(
             {
                 report.fallback_count += 1;
             }
-            report.guard_hit_count += guard_hit_count;
+            report.limit_hit_count += limit_hit_count;
             match decision.outcome {
                 DecisionOutcome::Allow => {
                     report.allowed_requests += 1;
@@ -403,7 +406,7 @@ pub fn compare_strategies(
                 DecisionOutcome::Deny => {
                     report.denied_requests += 1;
                     report.useful_work_blocked_score += request.useful_work_score as u64;
-                    if request.loop_risk || guard_hit_count > 0 {
+                    if request.loop_risk || limit_hit_count > 0 {
                         report.runaway_spend_prevented_usd += request.estimated_cost_usd;
                     }
                     if report.exhaustion_day.is_none()
@@ -516,11 +519,11 @@ pub fn compare_strategies(
             .map(|adoption| adoption.high_adopters.len() as u64)
             .unwrap_or_default();
         std::fs::write(
-            &report.usage_report_path,
+            out_dir.join(&report.usage_report_path),
             serde_json::to_vec_pretty(&usage)?,
         )?;
         std::fs::write(
-            &report.decisions_report_path,
+            out_dir.join(&report.decisions_report_path),
             serde_json::to_vec_pretty(&decisions)?,
         )?;
         strategies.push(report);
@@ -533,6 +536,132 @@ pub fn compare_strategies(
         total_requests: demand.len() as u64,
         strategies,
     })
+}
+
+fn strategy_policy_moves(policy: &PolicyFile) -> Vec<String> {
+    let budget_count = policy.budgets.len();
+    let total_limit = policy
+        .budgets
+        .iter()
+        .map(|budget| budget.limit_usd)
+        .sum::<f64>();
+    let mut moves = vec![format!(
+        "{} budget{} · ${total_limit:.2} total cap · scope {}",
+        budget_count,
+        if budget_count == 1 { "" } else { "s" },
+        summarize_budget_scope(policy)
+    )];
+    let mut has_explicit_controls = false;
+
+    for budget in &policy.budgets {
+        if let Some(allocation) = &budget.allocation
+            && allocation.standard == "protected_adoption_pool"
+        {
+            has_explicit_controls = true;
+            let by = allocation.by.as_deref().unwrap_or("entity");
+            let protected_amount = allocation.protected_amount_usd.unwrap_or_default();
+            let window = allocation.window.as_deref().unwrap_or("window");
+            let carryover = allocation
+                .carryover
+                .as_ref()
+                .map(|carryover| {
+                    format!(
+                        "{:.0}% carryover capped at ${:.2}",
+                        carryover.percent.unwrap_or_default(),
+                        carryover.cap_usd.unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| "no carryover".to_owned());
+            moves.push(format!(
+                "{} reserves ${protected_amount:.2} per {by} in each {window} window ({carryover}).",
+                budget.id
+            ));
+        }
+
+        if let Some(limit) = &budget.limits.request_cost {
+            has_explicit_controls = true;
+            moves.push(format!(
+                "{} {} requests above ${:.2} estimated cost.",
+                budget.id,
+                limit_action_label(limit.action),
+                limit.max_usd
+            ));
+        }
+
+        if let Some(limit) = &budget.limits.context_tokens {
+            has_explicit_controls = true;
+            moves.push(format!(
+                "{} {} requests above {} context tokens.",
+                budget.id,
+                limit_action_label(limit.action),
+                limit.max_tokens
+            ));
+        }
+
+        for limit in &budget.limits.spend {
+            has_explicit_controls = true;
+            moves.push(format!(
+                "{} {} bursts above ${:.2} in {}.",
+                budget.id,
+                limit_action_label(limit.action),
+                limit.max_usd,
+                limit.window
+            ));
+        }
+
+        if budget.limits.tool_calls.is_some()
+            || budget.limits.agent_steps.is_some()
+            || budget.limits.retries.is_some()
+        {
+            has_explicit_controls = true;
+            let mut controls = Vec::new();
+            if let Some(max_tool_calls) = budget.limits.tool_calls {
+                controls.push(format!("tool calls <= {max_tool_calls}"));
+            }
+            if let Some(max_agent_steps) = budget.limits.agent_steps {
+                controls.push(format!("agent steps <= {max_agent_steps}"));
+            }
+            if let Some(max_retries) = budget.limits.retries {
+                controls.push(format!("retries <= {max_retries}"));
+            }
+            moves.push(format!("{} enforces {}.", budget.id, controls.join(", ")));
+        }
+    }
+
+    if !has_explicit_controls {
+        moves.push("No extra controls beyond pooled caps and standard routing.".to_owned());
+    }
+
+    moves
+}
+
+fn summarize_budget_scope(policy: &PolicyFile) -> String {
+    let mut scopes = BTreeSet::new();
+    for budget in &policy.budgets {
+        for entity in &budget.eligible.entities {
+            scopes.insert(entity.clone());
+        }
+    }
+    if scopes.is_empty() {
+        return "all requests".to_owned();
+    }
+    let mut scope: Vec<_> = scopes.into_iter().collect();
+    if scope.len() > 3 {
+        let remaining = scope.len() - 3;
+        scope.truncate(3);
+        format!("{} +{} more", scope.join(", "), remaining)
+    } else {
+        scope.join(", ")
+    }
+}
+
+fn limit_action_label(action: crate::contract::PolicyAction) -> &'static str {
+    match action {
+        crate::contract::PolicyAction::Allow => "allows",
+        crate::contract::PolicyAction::Warn => "warns on",
+        crate::contract::PolicyAction::Block => "blocks",
+        crate::contract::PolicyAction::Ask => "asks approval for",
+    }
 }
 
 fn collect_ids<'a>(
@@ -716,13 +845,13 @@ fn synthetic_authorize_request(
     }
 }
 
-fn is_guard_rule_id(rule_id: &str) -> bool {
-    rule_id.contains(".max_estimated_request_cost_usd")
-        || rule_id.contains(".max_context_tokens")
+fn is_limit_rule_id(rule_id: &str) -> bool {
+    rule_id.contains(".request_cost")
+        || rule_id.contains(".context_tokens")
         || rule_id.contains(".spend_window.")
 }
 
-fn encode_path_component(value: &str, fallback: &str) -> String {
+pub(crate) fn encode_path_component(value: &str, fallback: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
         match byte {
@@ -898,26 +1027,37 @@ strategies:
     }
 
     #[test]
-    fn runaway_pressure_example_locks_guard_tradeoff() {
-        let report = compare_checked_in_simulation(
-            "examples/simulations/runaway-pressure.noet.yaml",
-        );
+    fn runaway_pressure_example_locks_limit_tradeoff() {
+        let report =
+            compare_checked_in_simulation("examples/simulations/runaway-pressure.noet.yaml");
 
         assert_eq!(report.total_requests, 115);
         let pooled = report
             .strategies
             .iter()
-            .find(|strategy| strategy.id == "pooled without guard")
+            .find(|strategy| strategy.id == "pooled without limit")
             .expect("pooled strategy");
         let guarded = report
             .strategies
             .iter()
-            .find(|strategy| strategy.id == "guarded team budget")
+            .find(|strategy| strategy.id == "limited team budget")
             .expect("guarded strategy");
 
         assert_eq!(pooled.exhaustion_day, Some(3));
         assert_eq!(guarded.exhaustion_day, None);
-        assert_eq!(guarded.guard_hit_count, guarded.denied_requests);
+        assert_eq!(guarded.limit_hit_count, guarded.denied_requests);
+        assert!(
+            pooled
+                .policy_moves
+                .iter()
+                .any(|entry| entry.contains("No extra controls beyond pooled caps"))
+        );
+        assert!(
+            guarded
+                .policy_moves
+                .iter()
+                .any(|entry| entry.contains("bursts above $1.20 in 5h"))
+        );
         assert!(guarded.denied_requests > pooled.denied_requests);
         assert!(guarded.total_cost_usd < pooled.total_cost_usd);
         assert!(guarded.unused_budget_usd > pooled.unused_budget_usd);
@@ -927,9 +1067,8 @@ strategies:
 
     #[test]
     fn adoption_pressure_example_locks_protected_adoption_tradeoff() {
-        let report = compare_checked_in_simulation(
-            "examples/simulations/adoption-pressure.noet.yaml",
-        );
+        let report =
+            compare_checked_in_simulation("examples/simulations/adoption-pressure.noet.yaml");
 
         assert_eq!(report.total_requests, 293);
         let pooled = report
@@ -947,6 +1086,12 @@ strategies:
         assert_eq!(pooled.high_adopter_count, 0);
         assert_eq!(protected.low_adopter_count, 3);
         assert_eq!(protected.high_adopter_count, 5);
+        assert!(
+            protected
+                .policy_moves
+                .iter()
+                .any(|entry| entry.contains("reserves $0.40 per user in each monthly window"))
+        );
         assert!(protected.unused_protected_opportunity_usd > 1.0);
         assert_eq!(protected.total_cost_usd, pooled.total_cost_usd);
         assert_eq!(protected.denied_requests, pooled.denied_requests);
@@ -1062,13 +1207,19 @@ strategies:
         let report = compare_strategies(&simulation, tempdir.path()).expect("compare strategies");
         assert_eq!(report.strategies.len(), 2);
         assert_ne!(report.strategies[0].db_path, report.strategies[1].db_path);
+        assert!(report.strategies[0].db_path.is_relative());
+        assert!(report.strategies[1].db_path.is_relative());
         assert_ne!(
             report.strategies[0].usage_report_path,
             report.strategies[1].usage_report_path
         );
+        assert!(report.strategies[0].usage_report_path.is_relative());
+        assert!(report.strategies[1].usage_report_path.is_relative());
         assert_ne!(
             report.strategies[0].decisions_report_path,
             report.strategies[1].decisions_report_path
         );
+        assert!(report.strategies[0].decisions_report_path.is_relative());
+        assert!(report.strategies[1].decisions_report_path.is_relative());
     }
 }

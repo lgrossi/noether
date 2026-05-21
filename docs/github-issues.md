@@ -44,17 +44,17 @@ Acceptance:
 - Decisions explain selected budget, rejected requested budget, matched entity, model check, and
   remaining budget.
 
-## 4. AI-native guardrails
+## 4. AI-native limits
 
 Prevent unhealthy AI usage patterns without relying only on money caps.
 
 Acceptance:
 
-- Guards can enforce or warn on max request cost.
-- Guards can enforce or warn on context size.
+- Limits can enforce or warn on max request cost.
+- Limits can enforce or warn on context size.
 - Spend windows such as 5h and 7d can catch fast burn.
-- Tool-call, retry, and agent-step guards are represented once lifecycle data supports them.
-- Static export dashboard and reporting highlight guard hits and risky runs.
+- Tool-call, retry, and agent-step limits are represented once lifecycle data supports them.
+- Static export dashboard and reporting highlight limit hits and risky runs.
 
 ## 5. Adoption governance
 
@@ -81,7 +81,7 @@ Acceptance:
 - Generated reports and the static export dashboard show the expected story without live provider
   traffic.
 - Initial scenarios cover individual local developer, team pooled budget, project budget fallback,
-  model-denial/fallback, runaway agent guard, and protected adoption pool.
+  model-denial/fallback, runaway agent limit, and protected adoption pool.
 - Scenario assertions can fail CI when behavior or report output drifts.
 
 ## 7. Strategy simulation lab

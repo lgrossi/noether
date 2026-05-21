@@ -1,10 +1,12 @@
 pub mod capture;
 pub mod cli;
 pub mod contract;
+pub mod dashboard;
 pub mod error;
 pub mod fixture;
 pub mod ledger;
 pub mod live_dashboard;
+pub mod local;
 pub mod mock;
 pub mod policy;
 pub mod proxy;

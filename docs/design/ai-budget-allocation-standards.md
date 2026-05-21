@@ -122,7 +122,7 @@ The initial allocation standards should be named and constrained:
 AI-specific controls should be explicit but small:
 
 - spend windows such as 5h and 7d caps to avoid burning a monthly budget too early;
-- runaway guards for unusually expensive requests, agent loops, retries, and tool storms;
+- runaway limits for unusually expensive requests, agent loops, retries, and tool storms;
 - adoption/underuse signals so unused budget is visible as opportunity loss, not only savings.
 
 Rationale: this borrows known allocation ideas while acknowledging AI-specific burn speed,
@@ -153,7 +153,7 @@ What Noether should avoid copying:
   can incentivize underspending or budget gaming;
 - waiting on inactive users for a full month before redistributing capacity.
 
-The design implication is to support multi-window spend guards and bounded protected opportunity,
+The design implication is to support multi-window spend limits and bounded protected opportunity,
 not to make active-user rolling redistribution a v1 allocation standard.
 
 ## Protected adoption carryover
@@ -240,15 +240,15 @@ budgets:
       carryover:
         percent: 10
         cap_usd: 50
-    guards:
-      spend_windows:
+    limits:
+      spend:
         - window: 5h
           max_usd: 10
         - window: 7d
           max_usd: 75
-      max_tool_calls: 30
-      max_agent_steps: 50
-      max_context_tokens: 120000
+      tool_calls: 30
+      agent_steps: 50
+      context_tokens: 120000
 ```
 
 ## Patterns to follow
@@ -287,5 +287,5 @@ charged slice so reports can explain behavior across both old and new policies.
   both?
 - What exact best-fit budget pressure score is simple enough for v1 while handling expiring budget,
   remaining capacity, and pacing health?
-- Which operational guards should be enforced in the hot authorization path first: request cost,
+- Which operational limits should be enforced in the hot authorization path first: request cost,
   context tokens, model allowlist, tool calls, agent steps, or retries?

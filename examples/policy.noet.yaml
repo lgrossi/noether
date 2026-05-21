@@ -8,7 +8,7 @@ budgets:
       project: noether
 policies:
   - id: require-project
-    effect: deny
+    action: block
     reason: project is required for budget attribution
     when:
       missing: project

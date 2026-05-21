@@ -18,13 +18,13 @@ pub struct DashboardUsageTotals {
     pub finalized_reservations: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct DashboardDecisionStats {
     pub allow: u64,
     pub warn: u64,
     pub deny: u64,
-    pub guard_hits: u64,
-    pub lifecycle_guardrails: u64,
+    pub limit_hits: u64,
+    pub lifecycle_limits: u64,
 }
 
 impl DashboardDecisionStats {
@@ -181,8 +181,8 @@ fn dashboard_summary(
         usage: usage_totals,
         sections: DashboardSectionVisibility {
             policy: decisions_summary.total() > 0
-                || decisions_summary.guard_hits > 0
-                || decisions_summary.lifecycle_guardrails > 0,
+                || decisions_summary.limit_hits > 0
+                || decisions_summary.lifecycle_limits > 0,
             spend: spend_section,
             evidence: trace.is_some()
                 || !observations.is_empty()
@@ -223,19 +223,19 @@ fn decision_stats(
         } else if item.kind.ends_with(".allow") {
             stats.allow += 1;
         }
-        stats.guard_hits += item
-            .guard_hits
+        stats.limit_hits += item
+            .limit_hits
             .as_ref()
             .map(|hits| hits.len() as u64)
             .unwrap_or(0);
     }
 
-    stats.lifecycle_guardrails = trace
+    stats.lifecycle_limits = trace
         .map(|trace| {
             trace
                 .items
                 .iter()
-                .filter(|item| item.kind.starts_with("guard.report_only."))
+                .filter(|item| item.kind.starts_with("limit.report_only."))
                 .count() as u64
         })
         .unwrap_or_default();
