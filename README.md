@@ -1,275 +1,368 @@
 # Noether
 
-**The local-first control plane for AI work.**
+**Not a proxy. Native governance for AI workflows.**
 
-Noether helps a team answer the questions that show up right after AI usage becomes real:
+<p align="center">
+  <img src="./assets/brand/noether-readme-hero-v2.svg" alt="Noether hero banner" width="100%">
+</p>
 
-- Which project or team should pay for this run?
-- Was that model request allowed before money was spent?
-- Which agent, tool burst, retry loop, or fallback caused the cost?
-- Are we only controlling spend, or also helping people adopt AI well?
+Noether is the local-first governance layer for AI work.
 
-It sits beside the tools a team already uses, makes a decision before spend when possible, ingests
-usage and lifecycle evidence afterward, and turns the result into an explainable ledger, reports,
-and static export dashboards.
+It is for:
 
-Noether is not another chat UI, prompt warehouse, or generic provider router. It is the missing
-layer between AI usage and AI accountability.
+- individual operators who want local guardrails, visibility, and spend control
+- teams that want attribution, approvals, and rollout safety
+- orgs that want governance beside their existing harnesses and gateways
 
-## Who Noether is for
+It works beside the workflow you already use:
 
-- **Teams using coding agents and AI-heavy workflows** that need visibility before spend becomes
-  confusing
-- **AI/platform teams introducing guardrails** without forcing everyone into one gateway or one UI
-- **Organizations that want adoption, not only cost control** and need a way to preserve useful
-  usage while blocking runaway behavior
+- coding-agent harnesses
+- subscription-backed tools
+- API-driven apps and SDKs
+- existing gateways and proxies
 
-## Why another AI tool?
+Noether helps answer the questions that show up as soon as AI usage becomes real:
 
-Most AI tooling solves one of two problems:
+- Should this request have been allowed before money was spent?
+- Which repo, project, user, or task should pay for this run?
+- Which tool burst, retry loop, or fallback path caused the cost?
+- Are we only controlling spend, or also protecting healthy adoption?
 
-- **Use models more easily**
-- **Route model traffic more centrally**
+Use your existing workflow. Keep your existing gateway if you have one. Use subscription-backed
+tools, API-driven apps, or both.
 
-Those are useful, but they still leave a practical gap for teams:
+## Why people use this
 
-- provider billing does not explain which run, task, project, or user caused spend
-- harness logs do not decide whether spend should have been allowed in the first place
-- simple quotas do not distinguish productive adoption from runaway waste
-- most teams want progressive governance: observe first, then warn, then enforce
+Most AI tooling is optimized for one of two jobs:
 
-Noether exists to make AI work legible before it becomes expensive, risky, or politically hard to
-untangle later.
+- make model access easier
+- route model traffic more centrally
 
-```text
-AI agent / app / gateway
-        |              \
-        | authorize     \ events + usage
-        v                v
-   allow / warn / deny   trace ingest
-          \             /
-           \           /
-      budget + policy + ledger + static export dashboard
+Those are useful, but they leave a governance gap:
+
+- billing pages do not explain which run caused the spend
+- harness logs do not decide whether the spend should have happened
+- quotas do not distinguish productive adoption from runaway waste
+- most people want progressive governance, not a forced platform rewrite
+
+**Noether is the missing layer between AI usage and AI accountability.**
+
+It is not trying to solve all of AI infrastructure.
+It is trying to solve a smaller set of workflow-governance problems well:
+
+- policy before spend
+- attribution after the fact
+- approval when needed
+- simulation before rollout
+- privacy by default throughout
+
+## What the product actually does
+
+- **Before spend:** allow, warn, block, ask, or fallback a request
+- **After spend:** reconcile usage, traces, tools, and policy outcomes
+- **For individuals:** keep local guardrails, visibility, and privacy without a platform rewrite
+- **For teams:** attribute spend and policy outcomes to the right work
+- **For rollout:** test policies in scenarios and simulations before enforcing them
+
+## From one operator to one org
+
+### For individuals
+
+- keep using your existing AI tools
+- add local guardrails and spend visibility
+- see what your agent actually did
+- keep prompts and workflow data local by default
+
+### For teams
+
+- add shared attribution and policy visibility
+- introduce approval and governance progressively
+- keep existing harnesses and gateways
+- model policy changes before rollout
+
+## See the product
+
+<table>
+  <tr>
+    <td width="50%">
+      <strong>Operating picture</strong><br>
+      Live overview of spend, decision pressure, exceptions, and control posture.
+    </td>
+    <td width="50%">
+      <strong>Strategy lab</strong><br>
+      Compare policy strategies before rollout instead of guessing.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <img src="./docs/showcase/live-overview.png" alt="Live Noether overview dashboard showing spend, exception queue, and control posture.">
+    </td>
+    <td valign="top">
+      <img src="./docs/showcase/live-strategy-runaway.png" alt="Live Noether strategy lab showing a guarded team budget compared with an unguarded alternative.">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>Guardrail trace review</strong><br>
+      Inspect policy outcomes, tool bursts, and request traces in one place.
+    </td>
+    <td width="50%">
+      <strong>Adoption view</strong><br>
+      See where usage is healthy, underused, or needs intervention.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <img src="./docs/showcase/live-traces-guardrail.png" alt="Live Noether trace explorer showing policy and tool events for a guarded request." height="420">
+    </td>
+    <td valign="top">
+      <img src="./docs/showcase/live-adoption.png" alt="Live Noether adoption dashboard showing queueing, health, and intervention surfaces.">
+    </td>
+  </tr>
+</table>
+
+These are current product surfaces from the live dashboard, not placeholder mockups.
+
+## Policy examples to copy
+
+### 1. Require project attribution
+
+Block AI work that cannot be charged to a real project:
+
+```yaml
+version: 0
+budgets:
+  - id: noether-dev-daily
+    limit_usd: 1.00
+    warn_at_fraction: 0.8
+    window_seconds: 86400
+    match:
+      project: noether
+policies:
+  - id: require-project
+    action: block
+    reason: project is required for budget attribution
+    when:
+      missing: project
 ```
 
-## What value it gives a team
+File: `examples/policy.noet.yaml`
 
-Noether is built for the point where AI use moves from personal experimentation to shared,
-budgeted, semi-governed work.
+### 2. Cap expensive single requests
 
-- **Before spend:** allow, warn, deny, or fallback a request using local policy and budget rules
-- **After spend:** reconcile what actually happened into a durable local ledger
-- **For humans:** explain usage in plain artifacts a team can inspect later
-- **For policy design:** run checked-in scenarios and simulations to prove claims before rollout
+Stop a runaway agent request before spend lands:
 
-That means Noether can help a team:
+```yaml
+limits:
+  request_cost:
+    max_usd: 1.0
+    action: block
+```
 
-- cap runaway usage without blocking everything
-- attribute spend to the right project, team, or user
-- preserve room for adoption instead of letting heavy users consume all budget
-- show evidence for a policy decision instead of relying on intuition
+Based on: `examples/scenarios/runaway-agent-limit.noet.yaml`
 
-## See the value locally in a few minutes
+### 3. Add burst and daily pacing
 
-### 1. Run a safe local demo
+Use both a rolling burst cap and a daily cap:
+
+```yaml
+limits:
+  spend:
+    - window: 5h
+      max_usd: 40
+      action: block
+    - window: 1d
+      max_usd: 100
+      action: block
+```
+
+Based on: `examples/scenarios/hybrid-budget-pacing-windows.noet.yaml`
+
+### 4. Restrict models per budget
+
+Allow only specific models on a budget:
+
+```yaml
+models:
+  allow:
+    - anthropic:claude-sonnet-*
+```
+
+Based on: `examples/scenarios/model-denial-fallback.noet.yaml`
+
+### 5. Fallback to the right budget
+
+Route requests to a more appropriate project budget:
+
+```yaml
+eligible:
+  entities: [project:noether]
+```
+
+Based on: `examples/scenarios/project-budget-fallback.noet.yaml`
+
+### 6. Protect adoption explicitly
+
+Reserve room for lower adopters instead of letting heavy users take the whole budget:
+
+```yaml
+allocation:
+  standard: protected_adoption_pool
+  by: user
+  protected_amount_usd: 25
+```
+
+Based on: `examples/scenarios/protected-adoption-pool.noet.yaml`
+
+## One full policy example
+
+Here is a more realistic policy that combines:
+
+- a monthly project budget
+- a warning threshold
+- project-scoped eligibility
+- a daily cap
+- a short rolling burst cap
+
+```yaml
+version: 0
+budgets:
+  - id: personal-primary
+    limit_usd: 1000
+    warn_at_fraction: 0.8
+    window_seconds: 2592000
+    window_mode: tumbling
+    window_anchor:
+      kind: first_seen
+    eligible:
+      entities: [project:noether]
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 100
+          action: block
+        - id: burst-5h
+          window: 5h
+          mode: rolling
+          max_usd: 40
+          action: block
+```
+
+This is the kind of policy a real operator or team would actually run: a normal monthly budget with
+extra protection against bursty agent behavior.
+
+You can run the checked-in scenario for it here:
+
+```bash
+cargo run --bin noet -- scenario run examples/scenarios/hybrid-budget-pacing-windows.noet.yaml
+```
+
+That scenario shows:
+
+- one request allowed normally
+- one request blocked by a 5-hour burst window
+- one request blocked by a daily cap
+
+It writes a local ledger, reports, traces, and a dashboard under:
+
+```text
+.noet/scenarios/hybrid-budget-pacing-windows/
+```
+
+And if you want to compare whole policy strategies before rollout:
+
+```bash
+cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
+```
+
+## HTTP or CLI, your choice
+
+### HTTP
+
+Ask Noether for a decision before spend:
+
+```bash
+curl -fsS http://127.0.0.1:4050/v1/authorize \
+  -H 'content-type: application/json' \
+  -d '{
+    "subject": "user:demo",
+    "project": "noether",
+    "provider": "openai-codex",
+    "model": "gpt-demo",
+    "estimated_tokens": 1200,
+    "estimated_cost_usd": 0.0024,
+    "metadata": {
+      "trace_id": "demo-trace-1",
+      "request_id": "demo-request-1",
+      "harness": "pi"
+    }
+  }'
+```
+
+### CLI
+
+Run the end-to-end local proof:
 
 ```bash
 ./examples/vertical-mvp-demo.sh
 ```
 
-Then generate a visual static export dashboard:
+Compare a policy strategy before rollout:
 
 ```bash
-cargo run --bin noet -- report \
-  --db-path .noet/demo/vertical-mvp.sqlite \
-  dashboard \
-  --out .noet/noether-dashboard.html
+cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
 ```
 
-Open the generated file in a browser:
+## Try it in 3 commands
+
+```bash
+./examples/vertical-mvp-demo.sh
+cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
+cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
+```
+
+Then open the generated dashboard artifact:
 
 ```bash
 xdg-open .noet/noether-dashboard.html
 ```
 
-### 2. Replay a scenario that proves a policy behavior
+## Works with the setup you already have
 
-```bash
-cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-guard.noet.yaml
-```
+Noether is designed to be useful whether or not it owns the model call.
 
-This generates a local ledger, JSON reports, traces, and an HTML static export dashboard under:
+### Harness-first
 
-```text
-.noet/scenarios/runaway-agent-guard/
-```
+Best fit when you want native workflow awareness:
 
-### 3. Compare strategies before adopting one
+- authorization before provider send
+- repo / project / session-aware attribution
+- tool, retry, and agent-step visibility
+- approval inside the workflow when policy says `ask`
 
-```bash
-cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
-```
+Current real integration:
 
-This writes a top-level simulation static export dashboard plus per-strategy dashboards under:
+- **Pi extension**
 
-```text
-.noet/simulations/adoption-pressure/
-```
+Planned near-term harness direction:
 
-The checked-in simulations are meant to show value quickly:
+- Claude Code
+- Codex
+- OpenCode
 
-- `synthetic-company.noet.yaml`: pooled caps vs protected adoption for a mixed team
-- `runaway-pressure.noet.yaml`: a spend-window guard preserving budget under loop-risk load
-- `adoption-pressure.noet.yaml`: protected adoption surfacing underused opportunity for low adopters
+### Gateway-sidecar
 
-## What the checked-in proof points already show
+Best fit when you already have central routing and want governance beside it:
 
-These are not marketing mockups. They come from deterministic examples in this repo.
+- keep your gateway
+- add policy decisions, attribution, approval semantics, and analysis
+- avoid turning Noether into another provider-compatibility product
 
-- In `runaway-pressure.noet.yaml`, the unguarded shared budget exhausts on simulated day 3, while
-  the guarded strategy blocks 107 risky requests, prevents about `$51.99` of runaway spend, and
-  still leaves about `$10.80` unused instead of letting one loop consume the month.
-- In `adoption-pressure.noet.yaml`, protected adoption surfaces about `$1.11` of unused protected
-  opportunity across 3 low adopters and 5 high adopters, which is exactly the kind of signal
-  ordinary billing pages do not provide.
-- In `synthetic-company.noet.yaml`, both strategies spend the same total amount, but the protected
-  adoption strategy still exposes preserved opportunity that pooled caps hide.
-
-## What it looks like
-
-<p>
-  <img src="./docs/showcase/simulation-runaway-pressure.png" alt="Runaway pressure simulation dashboard showing a guarded strategy preserving budget and preventing risky spend." width="49%">
-  <img src="./docs/showcase/simulation-adoption-pressure.png" alt="Adoption pressure simulation dashboard showing protected adoption surfacing unused opportunity for low adopters." width="49%">
-</p>
-
-<p>
-  <img src="./docs/showcase/scenario-runaway-agent-guard.png" alt="Scenario dashboard showing a denied risky run with an explainable guard hit." width="49%">
-</p>
-
-- **Runaway control:** the simulation dashboard shows the difference between a shared cap and a
-  guarded budget before a team adopts a policy.
-- **Adoption visibility:** the simulation dashboard exposes low-adopter and high-adopter behavior,
-  not only spend totals.
-- **Explainable decisions:** the run static export dashboard shows the exact deny outcome and guard
-  hit that stopped a risky request before spend.
-
-## What Noether does
-
-## Product pillars
-
-### Observe
-
-Make AI work visible before controlling it.
-
-- request decisions
-- provider/model usage
-- cost and token accounting
-- trace timelines
-- tool and agent activity
-- eval/annotation events
-- local SQLite ledger
-- static export dashboard HTML
-
-### Attribute
-
-Make usage belong somewhere.
-
-- user/project/team/org/purpose entities
-- explicit or inferred budget routing
-- project derivation helpers over time
-- missing-attribution warnings
-- selected-budget explanations
-
-### Control
-
-Apply lightweight, explainable governance.
-
-- allow / warn / deny
-- model allowlists
-- budget selection and reservation
-- spend windows such as 5h / 7d
-- request-cost and context-size limits
-- future tool-call, retry, and agent-step guards
-- fail-open or fail-closed deployment modes
-
-### Improve
-
-Help teams use AI better, not just cheaper.
-
-- low-adoption visibility
-- protected adoption pools
-- bounded carryover
-- underused budget as opportunity signal
-- context-heavy or tool-heavy run detection
-- model-denial and fallback reporting
-
-### Simulate
-
-Prove product claims with executable scenarios.
-
-- native end-to-end examples for common use cases
-- synthetic company simulations with user profiles and strategy comparisons
-- report and static export dashboard assertions for CI
-- reproducible examples that require no live provider credentials
-
-## What works today
-
-Noether is early but functional.
-
-Today it includes:
-
-- local `noet` sidecar;
-- `POST /v1/authorize`;
-- reservation finalization;
-- `POST /v1/events`;
-- SQLite-backed decision/usage/event ledger;
-- story-shaped CLI reports;
-- static HTML dashboard;
-- Pi extension integration;
-- bodyless authorization metadata by default;
-- opt-in raw hook debug logs;
-- vertical MVP demo with no provider credentials.
-
-The policy model is still v0. The next product phase is the entity-based AI budget model described
-in [`docs/design/ai-budget-allocation-standards.md`](./docs/design/ai-budget-allocation-standards.md).
-
-## Scenario examples
-
-Replay checked-in local scenarios with no provider credentials:
-
-```bash
-cargo run --bin noet -- scenario run examples/scenarios/local-developer.noet.yaml
-cargo run --bin noet -- scenario run examples/scenarios/team-pooled-budget.noet.yaml
-```
-
-Each run writes a fresh SQLite ledger, JSON reports, per-request traces, and an HTML static export
-dashboard under `.noet/scenarios/<scenario-name>/`.
-
-Additional checked-in scenarios cover:
-
-- project budget fallback
-- model-denial fallback
-- runaway-cost guard denial
-- protected adoption pool behavior
-
-## Simulation examples
-
-Compare checked-in strategies against deterministic synthetic demand:
-
-```bash
-cargo run --bin noet -- simulate examples/simulations/synthetic-company.noet.yaml
-cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
-cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
-```
-
-Each simulation writes a comparison report, a top-level simulation static export dashboard, and
-per-strategy dashboards under `.noet/simulations/<simulation-name>/`.
-
-- `synthetic-company.noet.yaml` compares pooled caps against protected adoption for a mixed team.
-- `runaway-pressure.noet.yaml` shows how a spend-window guard preserves budget under loop-risk load.
-- `adoption-pressure.noet.yaml` shows protected adoption surfacing unused opportunity for low adopters.
-
-## Use with Pi
+## Use with Pi today
 
 Start Noether:
 
@@ -288,10 +381,11 @@ NOET_PI_SUBJECT=user:local \
 NOET_PI_BUDGET_ID=project-noether \
 NOET_PI_ENTITIES=project:noether,user:local \
 NOET_PI_FAIL_MODE=fail_open \
+NOET_PI_POLICY_MODE=user_approved \
 pi --extension "$PWD/extensions/pi-noether"
 ```
 
-Inspect results:
+Inspect what happened:
 
 ```bash
 cargo run --bin noet -- report decisions
@@ -301,59 +395,67 @@ cargo run --bin noet -- report observations --kind tool --trace <trace_id>
 cargo run --bin noet -- report dashboard --out .noet/noether-dashboard.html
 ```
 
-## Privacy posture
+## Why this is different from a generic gateway
 
-Noether is local-first.
+Noether is strongest where generic gateways are weakest:
 
-- SQLite by default.
-- No cloud service required.
-- Normal Pi extension authorization is bodyless by default.
-- Prompt-like fields are summarized, not retained.
-- Raw hook logging is explicit debug mode only.
-- Capture/proxy modes are for controlled local inspection and redact credential-like fields.
+- harness-aware attribution
+- repo / project / task / session-aware budgeting
+- approval inside agent workflows
+- agent-native limits such as tools, retries, and steps
+- local-first policy iteration
+- scenario replay and strategy simulation before enforcement
 
-## Scenario emulator vision
+That is the boundary:
 
-Noether should ship with two kinds of executable examples:
+- **gateway**: transport, routing, provider compatibility
+- **Noether**: policy, attribution, approval, budgets, simulation
 
-1. **Native end-to-end scenarios**
-   - individual local developer
-   - team pooled budget
-   - project budget fallback
-   - model-denial/fallback
-   - runaway agent guard
-   - protected adoption pool
+## What exists today
 
-2. **Strategy simulations**
-   - synthetic company of hundreds or thousands of users
-   - different usage profiles such as power users, steady users, low adopters, and loop-risk agents
-   - strategy comparison across pooled caps, protected adoption pools, reserved/shared budgets, and
-     other future standards
+Noether is early, but real.
 
-The point is not only testing. It is evidence: every major public claim Noether makes should have a
-scenario that demonstrates it.
+Today it includes:
+
+- local `noet` sidecar
+- `POST /v1/authorize`
+- reservation finalization
+- `POST /v1/events`
+- SQLite-backed decision / usage / event ledger
+- served live dashboard
+- static export dashboards
+- story-shaped CLI reports
+- Pi extension integration
+- bodyless authorization metadata by default
+- checked-in scenarios and simulations
+
+## Privacy defaults
+
+Noether is local-first and privacy-secure by default:
+
+- SQLite by default
+- no cloud service required
+- normal Pi authorization is bodyless by default
+- prompt-like fields are summarized, not retained
+- raw hook logging is explicit debug mode only
 
 ## Documentation
 
 - [Product vision](./docs/product-vision.md)
 - [Roadmap](./docs/roadmap.md)
-- [Team deployment](./docs/team-deployment.md)
-- [Export and reporting API contract](./docs/export-reporting-api.md)
-- [AI budget allocation standards](./docs/design/ai-budget-allocation-standards.md)
 - [Control contract v0](./docs/control-contract-v0.md)
 - [Policy v0](./docs/policy-v0.md)
 - [Pi extension integration](./docs/integrations/pi-extension.md)
-- [Capture fixture schema v1](./docs/capture-fixtures.md)
-- [Transparent proxy mode](./docs/transparent-proxy.md)
+- [Export and reporting API contract](./docs/export-reporting-api.md)
+- [Team deployment](./docs/team-deployment.md)
 
 ## Non-goals
 
-- Rebuild LiteLLM.
-- Own provider protocol correctness as the product.
-- Store prompts by default.
-- Become a generic enterprise policy DSL.
-- Productize consumer-subscription tunneling.
-- Encode one company's quota policy as the product model.
+- Rebuild LiteLLM
+- Become a proxy product
+- Own provider protocol correctness as the product
+- Store prompts by default
+- Become a generic enterprise policy DSL
 
 ## License
 

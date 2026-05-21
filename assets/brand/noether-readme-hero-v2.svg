@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Noether README hero v2</title>
+  <desc id="desc">Hero banner for Noether describing workflow-native AI governance with local-first, privacy-default, HTTP and CLI integration messaging.</desc>
+  <defs>
+    <radialGradient id="bg" cx="20%" cy="18%" r="90%">
+      <stop offset="0" stop-color="#18284a"/>
+      <stop offset="0.48" stop-color="#0c1323"/>
+      <stop offset="1" stop-color="#06080d"/>
+    </radialGradient>
+    <radialGradient id="glowLeft" cx="0%" cy="0%" r="100%">
+      <stop offset="0" stop-color="#2a4c8c" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#2a4c8c" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowRight" cx="100%" cy="12%" r="100%">
+      <stop offset="0" stop-color="#7c5be2" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#7c5be2" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="220" y1="150" x2="640" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8f3ea"/>
+      <stop offset="0.24" stop-color="#e6d8c3"/>
+      <stop offset="0.5" stop-color="#b5c0f4"/>
+      <stop offset="0.76" stop-color="#8777d7"/>
+      <stop offset="1" stop-color="#f2ece2"/>
+    </linearGradient>
+    <linearGradient id="word" x1="620" y1="120" x2="1260" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff9ef"/>
+      <stop offset="0.5" stop-color="#ddd8cd"/>
+      <stop offset="1" stop-color="#b8c6f4"/>
+    </linearGradient>
+    <linearGradient id="pillStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#334f7c"/>
+      <stop offset="1" stop-color="#7160c6"/>
+    </linearGradient>
+    <linearGradient id="cardStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#37547f"/>
+      <stop offset="1" stop-color="#5b4fa0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="24" stdDeviation="26" flood-color="#000000" flood-opacity="0.30"/>
+    </filter>
+    <filter id="softShadow" x="-20%" y="-20%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000000" flood-opacity="0.20"/>
+    </filter>
+  </defs>
+
+  <rect x="20" y="20" width="1560" height="860" rx="54" fill="url(#bg)"/>
+  <rect x="20" y="20" width="1560" height="860" rx="54" fill="url(#glowLeft)"/>
+  <rect x="20" y="20" width="1560" height="860" rx="54" fill="url(#glowRight)"/>
+  <rect x="24" y="24" width="1552" height="852" rx="50" fill="none" stroke="#213052" stroke-width="4" opacity="0.92"/>
+
+  <path d="M 82 170 C 236 90 350 100 446 170 C 538 236 592 266 694 250" fill="none" stroke="#23385f" stroke-width="7" stroke-linecap="round" opacity="0.56"/>
+  <path d="M 70 740 C 206 796 346 782 456 704 C 556 634 612 594 714 582" fill="none" stroke="#272f51" stroke-width="7" stroke-linecap="round" opacity="0.48"/>
+  <path d="M 976 126 C 1144 92 1300 110 1510 222" fill="none" stroke="#213255" stroke-width="5" stroke-linecap="round" opacity="0.40"/>
+  <path d="M 1024 792 C 1182 742 1322 746 1512 818" fill="none" stroke="#30294e" stroke-width="5" stroke-linecap="round" opacity="0.40"/>
+
+  <g transform="translate(82 116) scale(0.62)" filter="url(#shadow)">
+    <circle cx="512" cy="468" r="358" fill="#0d1424" opacity="0.64"/>
+
+    <path
+      d="M 512 122 L 760 266 L 760 758 L 512 902 L 264 758 L 264 266 Z
+         M 512 188 L 702 298 L 702 726 L 512 836 L 322 726 L 322 298 Z"
+      fill="#0d1424"
+      fill-rule="evenodd"
+      stroke="url(#metal)"
+      stroke-width="12"
+      stroke-linejoin="round"/>
+
+    <path d="M 512 154 L 732 282 L 732 742 L 512 870 L 292 742 L 292 282 Z"
+      fill="none"
+      stroke="#12192c"
+      stroke-width="34"
+      stroke-linejoin="round"
+      opacity="0.78"/>
+
+    <path d="M 512 178 L 512 846" fill="none" stroke="#12192c" stroke-width="34" stroke-linecap="round" opacity="0.76"/>
+    <path d="M 512 178 L 512 846" fill="none" stroke="url(#metal)" stroke-width="24" stroke-linecap="round"/>
+    <path d="M 512 178 L 512 846" fill="none" stroke="#fbf7ef" stroke-width="7" stroke-linecap="round" opacity="0.72"/>
+
+    <path d="M 330 290 C 264 346 232 424 232 512 C 232 600 264 678 330 734" fill="none" stroke="#131a2d" stroke-width="76" stroke-linecap="round" opacity="0.82"/>
+    <path d="M 694 290 C 760 346 792 424 792 512 C 792 600 760 678 694 734" fill="none" stroke="#131a2d" stroke-width="76" stroke-linecap="round" opacity="0.82"/>
+    <path d="M 330 290 C 264 346 232 424 232 512 C 232 600 264 678 330 734" fill="none" stroke="url(#metal)" stroke-width="58" stroke-linecap="round"/>
+    <path d="M 694 290 C 760 346 792 424 792 512 C 792 600 760 678 694 734" fill="none" stroke="url(#metal)" stroke-width="58" stroke-linecap="round"/>
+
+    <path d="M 380 324 C 430 404 468 460 512 512" fill="none" stroke="url(#metal)" stroke-width="18" stroke-linecap="round"/>
+    <path d="M 644 324 C 594 404 556 460 512 512" fill="none" stroke="url(#metal)" stroke-width="18" stroke-linecap="round"/>
+    <path d="M 380 700 C 430 620 468 564 512 512" fill="none" stroke="url(#metal)" stroke-width="18" stroke-linecap="round"/>
+    <path d="M 644 700 C 594 620 556 564 512 512" fill="none" stroke="url(#metal)" stroke-width="18" stroke-linecap="round"/>
+
+    <circle cx="512" cy="512" r="86" fill="#0b1120" stroke="url(#metal)" stroke-width="18"/>
+    <circle cx="512" cy="512" r="46" fill="#06080d" stroke="#f7f1e8" stroke-width="10"/>
+    <circle cx="512" cy="512" r="12" fill="#8a7fff"/>
+  </g>
+
+  <g filter="url(#softShadow)">
+    <text x="604" y="228" fill="url(#word)" font-family="Georgia, 'Times New Roman', serif" font-size="126" font-weight="700" letter-spacing="-4">Noether</text>
+    <text x="608" y="292" fill="#d3dcf2" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700" letter-spacing="3.8">NOT A PROXY. NATIVE GOVERNANCE FOR AI WORKFLOWS.</text>
+    <text x="608" y="356" fill="#edf2ff" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="550">
+      Policy, attribution, approval, and simulation
+    </text>
+    <text x="608" y="398" fill="#edf2ff" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="550">
+      for the setup you already use.
+    </text>
+    <text x="608" y="458" fill="#a8b8db" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="450">
+      Works natively with harnesses, gateways, subscription-backed tools, and API apps.
+    </text>
+    <text x="608" y="492" fill="#a8b8db" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="450">
+      Local-first. Privacy-secure by default. Simple HTTP and CLI contracts.
+    </text>
+  </g>
+
+  <g font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" letter-spacing="1.3">
+    <g transform="translate(608 560)">
+      <rect x="0" y="0" width="160" height="42" rx="21" fill="#101b31" stroke="url(#pillStroke)"/>
+      <text x="28" y="27" fill="#f4efe5">LOCAL-FIRST</text>
+    </g>
+    <g transform="translate(784 560)">
+      <rect x="0" y="0" width="204" height="42" rx="21" fill="#12162b" stroke="url(#pillStroke)"/>
+      <text x="28" y="27" fill="#f4efe5">PRIVACY-DEFAULT</text>
+    </g>
+    <g transform="translate(1004 560)">
+      <rect x="0" y="0" width="186" height="42" rx="21" fill="#141525" stroke="url(#pillStroke)"/>
+      <text x="30" y="27" fill="#f4efe5">HTTP + CLI</text>
+    </g>
+    <g transform="translate(1208 560)">
+      <rect x="0" y="0" width="220" height="42" rx="21" fill="#171320" stroke="url(#pillStroke)"/>
+      <text x="28" y="27" fill="#f4efe5">WORKFLOW-NATIVE</text>
+    </g>
+  </g>
+
+  <g transform="translate(930 626)" filter="url(#softShadow)">
+    <rect x="0" y="0" width="540" height="196" rx="28" fill="#0f1628" fill-opacity="0.88" stroke="url(#cardStroke)"/>
+
+    <g font-family="Inter, Arial, sans-serif">
+      <text x="34" y="40" fill="#f3f5fb" font-size="20" font-weight="700" letter-spacing="1.2">WORK WITH WHAT YOU ALREADY HAVE</text>
+
+      <rect x="34" y="64" width="120" height="42" rx="18" fill="#131f37" stroke="#32527f"/>
+      <text x="58" y="91" fill="#e8eefc" font-size="16" font-weight="650">HARNESS</text>
+
+      <rect x="174" y="64" width="120" height="42" rx="18" fill="#14172d" stroke="#47508b"/>
+      <text x="204" y="91" fill="#e8eefc" font-size="16" font-weight="650">GATEWAY</text>
+
+      <rect x="314" y="64" width="120" height="42" rx="18" fill="#151425" stroke="#655cb0"/>
+      <text x="350" y="91" fill="#e8eefc" font-size="16" font-weight="650">APP / SDK</text>
+
+      <path d="M 94 124 V 142 H 270" fill="none" stroke="#7f8dc1" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M 234 124 V 142 H 270" fill="none" stroke="#7f8dc1" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M 374 124 V 142 H 270" fill="none" stroke="#7f8dc1" stroke-width="2.5" stroke-linecap="round"/>
+
+      <rect x="214" y="142" width="116" height="40" rx="18" fill="#1c2441" stroke="#8a7fe1"/>
+      <text x="243" y="167" fill="#f6f1e8" font-size="16" font-weight="700">NOETHER</text>
+
+      <g transform="translate(34 194)">
+        <rect x="0" y="0" width="108" height="58" rx="16" fill="#111a2e" stroke="#34527d"/>
+        <text x="16" y="24" fill="#edf2ff" font-size="15" font-weight="700">POLICY</text>
+        <text x="16" y="43" fill="#98aacd" font-size="12.5">allow / warn /</text>
+        <text x="16" y="57" fill="#98aacd" font-size="12.5">block / ask</text>
+      </g>
+
+      <g transform="translate(158 194)">
+        <rect x="0" y="0" width="108" height="58" rx="16" fill="#11182b" stroke="#40558a"/>
+        <text x="16" y="24" fill="#edf2ff" font-size="15" font-weight="700">ATTRIBUTION</text>
+        <text x="16" y="43" fill="#98aacd" font-size="12.5">repo / project /</text>
+        <text x="16" y="57" fill="#98aacd" font-size="12.5">session-aware</text>
+      </g>
+
+      <g transform="translate(282 194)">
+        <rect x="0" y="0" width="108" height="58" rx="16" fill="#121629" stroke="#5d58a3"/>
+        <text x="16" y="24" fill="#edf2ff" font-size="15" font-weight="700">APPROVAL</text>
+        <text x="16" y="43" fill="#98aacd" font-size="12.5">human review in</text>
+        <text x="16" y="57" fill="#98aacd" font-size="12.5">the workflow</text>
+      </g>
+
+      <g transform="translate(406 194)">
+        <rect x="0" y="0" width="108" height="58" rx="16" fill="#131424" stroke="#7b67cd"/>
+        <text x="16" y="24" fill="#edf2ff" font-size="15" font-weight="700">SIMULATION</text>
+        <text x="16" y="43" fill="#98aacd" font-size="12.5">test policy before</text>
+        <text x="16" y="57" fill="#98aacd" font-size="12.5">rollout</text>
+      </g>
+    </g>
+  </g>
+
+  <text x="80" y="822" fill="#96a8cc" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="500">
+    Subscription or API. Existing gateway or none. Native integration when it matters.
+  </text>
+</svg>

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
-  <title id="title">Noether README hero v1</title>
-  <desc id="desc">README hero banner for Noether using the approved invariant seal icon, wordmark, and product framing.</desc>
+  <title id="title">Noether README hero</title>
+  <desc id="desc">README hero banner for Noether using the invariant seal icon, wordmark, and workflow-native governance framing.</desc>
   <defs>
     <radialGradient id="bgHero" cx="22%" cy="18%" r="90%">
       <stop offset="0" stop-color="#182341"/>
@@ -134,16 +134,16 @@
 
   <g filter="url(#softTextShadow)">
     <text x="676" y="304" fill="url(#wordHero)" font-family="Georgia, 'Times New Roman', serif" font-size="124" font-weight="700" letter-spacing="-4">Noether</text>
-    <text x="680" y="364" fill="#c4d0ef" font-family="Inter, Arial, sans-serif" font-size="23" font-weight="650" letter-spacing="4.1">THE LOCAL-FIRST CONTROL PLANE</text>
-    <text x="680" y="398" fill="#c4d0ef" font-family="Inter, Arial, sans-serif" font-size="23" font-weight="650" letter-spacing="4.1">FOR AI WORK</text>
+    <text x="680" y="364" fill="#c4d0ef" font-family="Inter, Arial, sans-serif" font-size="23" font-weight="650" letter-spacing="4.1">NOT A PROXY. THE LOCAL-FIRST GOVERNANCE LAYER</text>
+    <text x="680" y="398" fill="#c4d0ef" font-family="Inter, Arial, sans-serif" font-size="23" font-weight="650" letter-spacing="4.1">FOR AI WORKFLOWS</text>
     <text x="680" y="466" fill="#d6dff0" font-family="Inter, Arial, sans-serif" font-size="30" font-weight="500">
-      Make AI work legible before it becomes
+      Work natively with the setup you already use:
     </text>
     <text x="680" y="506" fill="#d6dff0" font-family="Inter, Arial, sans-serif" font-size="30" font-weight="500">
-      expensive, risky, or politically hard to untangle.
+      harness, gateway, subscription, or API.
     </text>
     <text x="680" y="554" fill="#98aacd" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="450">
-      Observe usage. Attribute spend. Enforce policy. Preserve adoption.
+      Policy. Attribution. Approval. Simulation. Privacy by default.
     </text>
   </g>
 
@@ -172,12 +172,12 @@
     <g transform="translate(680 748)">
       <circle cx="16" cy="16" r="6" fill="#e6d8c3"/>
       <text x="34" y="24" fill="#e2e8f6" font-size="20" font-weight="650" letter-spacing="1.2">BEFORE SPEND</text>
-      <text x="34" y="54" fill="#98aacd" font-size="16" font-weight="500">Decide before cost lands.</text>
+      <text x="34" y="54" fill="#98aacd" font-size="16" font-weight="500">Decide before spend lands.</text>
     </g>
     <g transform="translate(948 748)">
       <circle cx="16" cy="16" r="6" fill="#b5c0f4"/>
       <text x="34" y="24" fill="#e2e8f6" font-size="20" font-weight="650" letter-spacing="1.2">AFTER SPEND</text>
-      <text x="34" y="54" fill="#98aacd" font-size="16" font-weight="500">Reconcile traces locally.</text>
+      <text x="34" y="54" fill="#98aacd" font-size="16" font-weight="500">Reconcile traces and attribution.</text>
     </g>
     <g transform="translate(1208 748)">
       <circle cx="16" cy="16" r="6" fill="#8777d7"/>

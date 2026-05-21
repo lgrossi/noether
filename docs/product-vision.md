@@ -2,8 +2,13 @@
 
 ## Thesis
 
-Noether is the local-first control plane for AI work: it observes agent usage, attributes it to the
-right work, controls risky spend/model behavior, and helps teams grow AI adoption safely.
+Noether is the local-first governance layer for agentic AI work: it observes agent usage,
+attributes it to the right work, controls risky spend/model behavior, and helps teams grow AI
+adoption safely without becoming their gateway.
+
+The simple framing is:
+
+> Noether is not a proxy. It works natively with your workflow.
 
 ## Problem
 
@@ -26,9 +31,20 @@ The missing layer is a small, auditable control plane that can answer:
 
 ## Product idea
 
-Noether runs locally for an individual or centrally for a team. It is not primarily an LLM router.
-It is the policy, budget, trace, and adoption companion that a harness, app, SDK, or gateway can
-call into.
+Noether runs locally for an individual or centrally for a team. It is not primarily an LLM router
+or gateway admin plane. It is the policy, budget, trace, approval, and simulation companion that a
+harness, app, SDK, or gateway can call into.
+
+It should work with:
+
+- subscription-backed harnesses;
+- API-driven apps and SDKs;
+- local-first personal workflows;
+- existing team gateways and proxies.
+
+Its default integrations should be strong, but its contracts should remain small and legible enough
+that teams can build their own adapters over HTTP or CLI without reverse-engineering internal
+behavior.
 
 ```text
 Harness / app / proxy / SDK
@@ -81,12 +97,12 @@ Make AI work belong somewhere:
 
 Apply lightweight governance:
 
-- allow/warn/deny decisions;
+- allow/warn/block/ask decisions;
 - model allowlists;
 - budget selection and reservation;
 - spend windows;
 - request-cost and context-size limits;
-- future tool-call, retry, and agent-step guards;
+- tool-call, retry, and agent-step limits;
 - fail-open and fail-closed modes.
 
 ### Improve
@@ -123,6 +139,31 @@ validate claims such as:
 - protected adoption pools carry over correctly;
 - reports, the live dashboard, and static export dashboards explain the scenario in human terms.
 
+## Product boundary
+
+Noether should be strongest where generic gateways are weakest:
+
+- harness-aware attribution;
+- repo/project/task/session-aware budgeting;
+- approval flows inside agent workflows;
+- agent-native limits such as tools, retries, and steps;
+- local-first policy iteration;
+- scenario replay and strategy simulation before enforcement.
+
+Noether should be deliberately weaker on generic gateway concerns:
+
+- provider routing breadth;
+- key management and endpoint administration;
+- generic request-log exploration as the center of the product;
+- broad gateway analytics dashboards;
+- provider protocol translation as a core competency.
+
+The intended stack is:
+
+- **Harnesses** own operator UX and agent execution.
+- **Gateways** own transport, routing, provider compatibility, and central request brokering.
+- **Noether** owns agent governance, attribution, approval, budgets, and simulation.
+
 ## Target users
 
 ### Individual operator
@@ -145,7 +186,7 @@ A team adopting AI agents but not ready for enterprise AI infrastructure.
 They need:
 
 - shared visibility;
-- model and budget guardrails;
+- model and budget limits;
 - project/team attribution;
 - understandable reports;
 - observe/warn modes before enforcement.
@@ -156,27 +197,66 @@ A team responsible for AI governance, enablement, budget discipline, and auditab
 
 They need:
 
-- centralized policy decisions;
+- centralized policy decisions where useful;
 - hard budget reservations and reconciliation;
 - team/project/user attribution;
 - low-friction integration with existing tools;
 - showback before chargeback;
 - adoption and underuse visibility.
 
-## Value proposition
+## Integration thesis
 
-Noether should be useful even when it does not own the model call:
+Noether should be useful even when it does not own the model call.
 
-- **With proxy/SDK integration**: it can hard-block requests before spend happens.
-- **With harness integration**: it can enforce local policy and capture workflow traces.
-- **With async-only ingestion**: it can still produce observability and insight, but not hard
-  enforcement.
+### Harness-first
 
-The product must make this enforcement level explicit.
+The primary integration shape is a native harness integration that can:
+
+- authorize before provider send;
+- attach project/session/task attribution;
+- request approval when policy says `ask`;
+- emit lifecycle, tool, and usage events asynchronously.
+
+Current and near-term harness targets:
+
+1. Pi
+2. Claude Code
+3. Codex
+4. OpenCode
+
+### Gateway-sidecar
+
+The secondary integration shape is a native sidecar integration for existing gateways. The gateway
+keeps transport and provider compatibility; Noether contributes policy decisions, attribution,
+approval semantics, and post-hoc analysis.
+
+Initial gateway targets:
+
+1. LiteLLM
+2. Portkey
+3. one additional native integration only after a clear user pull proves it is not just generic
+   overlap
+
+### Async-only
+
+With async-only ingestion, Noether can still produce attribution, observability, and simulation
+inputs, but not hard enforcement. The product must make this enforcement level explicit.
+
+## Product promise
+
+Noether should be able to say, honestly:
+
+- keep your existing workflow;
+- keep your existing gateway if you have one;
+- keep subscription-backed or API-driven setups;
+- keep data local by default;
+- adopt stronger governance progressively;
+- integrate through simple HTTP or CLI contracts when the built-in adapters are not enough.
 
 ## Non-goals
 
 - Rebuild LiteLLM in Rust.
+- Become a general-purpose gateway control plane.
 - Own full provider protocol correctness as the core product.
 - Productize consumer-subscription tunneling or browser automation.
 - Store prompts by default.
