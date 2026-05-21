@@ -1487,15 +1487,27 @@ mod tests {
             routing: Default::default(),
             budgets: vec![BudgetRule {
                 id: "tiny".to_owned(),
-                limit_usd: 0.01,
                 priority: 0,
-                warn_at_fraction: 0.8,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
                 eligible: Default::default(),
                 models: Default::default(),
-                limits: Default::default(),
+                limits: crate::contract::BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![crate::contract::SpendWindowLimit {
+                        id: Some("budget-cap".to_owned()),
+                        window: "60s".to_owned(),
+                        mode: Some(crate::contract::SpendWindowMode::Tumbling),
+                        anchor: Some(crate::contract::WindowAnchorPolicy {
+                            kind: crate::contract::WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 0.01,
+                        warn_at_fraction: 0.8,
+                        action: crate::contract::PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
                 allocation: None,
                 rule_match: RuleMatch::default(),
             }],
@@ -3045,7 +3057,15 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    limit_usd: 10
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 10
+          action: block
     eligible:
       entities: [project:noether]
 policies: []
@@ -3084,10 +3104,17 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    limit_usd: 10
     eligible:
       entities: [project:noether]
     limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 10
+          action: block
       context_tokens:
         max_tokens: 1
         action: block
@@ -3122,7 +3149,15 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    limit_usd: 10
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 10
+          action: block
     eligible:
       entities: [project:noether]
 policies: []

@@ -56,11 +56,27 @@ strategies:
       version: 0
       budgets:
         - id: team-platform
-          limit_usd: 250
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 250
+                action: block
           eligible:
             entities: [team:platform]
         - id: team-product
-          limit_usd: 350
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 350
+                action: block
           eligible:
             entities: [team:product]
   - id: protected-adoption
@@ -69,11 +85,27 @@ strategies:
       version: 0
       budgets:
         - id: team-platform
-          limit_usd: 250
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 250
+                action: block
           eligible:
             entities: [team:platform]
         - id: product-adoption
-          limit_usd: 350
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 350
+                action: block
           eligible:
             entities: [team:product]
           allocation:

@@ -4,11 +4,27 @@ policy:
   version: 0
   budgets:
     - id: team-shared
-      limit_usd: 50
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 50
+            action: block
       eligible:
         entities: [team:eng]
     - id: project-noether
-      limit_usd: 25
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 25
+            action: block
       eligible:
         entities: [project:noether]
 requests:

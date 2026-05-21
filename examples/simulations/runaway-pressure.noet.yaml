@@ -43,7 +43,15 @@ strategies:
       version: 0
       budgets:
         - id: eng-pooled
-          limit_usd: 12
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 12
+                action: block
           eligible:
             entities: [team:eng]
   - id: limited team budget
@@ -52,11 +60,19 @@ strategies:
       version: 0
       budgets:
         - id: eng-guarded
-          limit_usd: 12
-          eligible:
-            entities: [team:eng]
           limits:
             spend:
-              - window: 5h
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 12
+                action: block
+              - id: burst-5h
+                window: 5h
+                mode: rolling
                 max_usd: 1.2
                 action: block
+          eligible:
+            entities: [team:eng]

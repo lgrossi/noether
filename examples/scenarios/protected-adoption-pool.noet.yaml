@@ -4,7 +4,15 @@ policy:
   version: 0
   budgets:
     - id: ai-adoption
-      limit_usd: 2000
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 2000
+            action: block
       eligible:
         entities: [org:example]
       allocation:

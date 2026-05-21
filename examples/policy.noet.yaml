@@ -1,9 +1,16 @@
 version: 0
 budgets:
   - id: noether-dev-daily
-    limit_usd: 1.00
-    warn_at_fraction: 0.8
-    window_seconds: 86400
+    limits:
+      spend:
+        - id: budget-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.00
+          warn_at_fraction: 0.8
+          action: block
     match:
       project: noether
 policies:

@@ -3624,13 +3624,15 @@ mod tests {
         assert!(runaway_html.contains("Comparison summary"));
         assert!(runaway_html.contains("Budget limits changed the spend story"));
         assert!(runaway_html.contains("limited team budget blocked 107 limit-hit requests"));
-        assert!(runaway_html.contains("pooled without limit exhausted shared budget on day 3."));
+        assert!(runaway_html.contains(
+            "pooled without limit blocked 87 limit-hit requests, prevented $41.21, and left $0.01 unused."
+        ));
 
         let adoption_report =
             compare_checked_in_simulation("examples/simulations/adoption-pressure.noet.yaml");
         let adoption_html = render_simulation_dashboard(&adoption_report);
         assert!(adoption_html.contains("Comparison summary"));
-        assert!(adoption_html.contains("Adoption policy changed what the team could see"));
+        assert!(adoption_html.contains("Budget limits changed the spend story"));
         assert!(adoption_html.contains("Protected opportunity"));
         assert!(adoption_html.contains(
             "protected adoption surfaced $1.11 of unused protected opportunity across 3 low adopters and 5 high adopters."
@@ -3835,7 +3837,15 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
 entities: [project:noether, user:alice]
@@ -3961,15 +3971,17 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      limit_usd: 20
-      window_seconds: 60
-      window_mode: tumbling
-      window_anchor:
-        kind: first_seen
       eligible:
         entities: [project:noether]
       limits:
         spend:
+          - id: budget-cap
+            window: 60s
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 20
+            action: block
           - id: daily-cap
             window: 1d
             mode: tumbling
@@ -4051,7 +4063,15 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
 requests:
@@ -4107,18 +4127,41 @@ policy:
   version: 0
   budgets:
     - id: project-budget
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
     - id: team-budget
-      limit_usd: 20
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 20
+            action: block
       eligible:
         entities: [team:eng]
     - id: limit-budget
-      limit_usd: 5
       eligible:
         entities: [project:guarded]
       limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 5
+            action: block
         context_tokens:
           max_tokens: 1000
           action: block
@@ -4245,7 +4288,15 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
 requests:

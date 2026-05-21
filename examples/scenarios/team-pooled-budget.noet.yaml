@@ -4,7 +4,15 @@ policy:
   version: 0
   budgets:
     - id: team-pooled-ai
-      limit_usd: 100
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 100
+            action: block
       eligible:
         entities: [team:platform]
 entities: [team:platform]

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, BudgetWindowMode, DecisionExplanation, DecisionSeverity,
-    PolicyAction, PolicyRule, RuleMatch, SpendWindowLimit, SpendWindowMode,
+    AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionSeverity, PolicyAction, PolicyRule,
+    RuleMatch, SpendWindowLimit, SpendWindowMode,
 };
 use crate::error::NoetError;
 
@@ -65,31 +65,11 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
         if budget.id.trim().is_empty() {
             errors.push("budget id must not be empty".to_owned());
         }
-        if budget.limit_usd <= 0.0 {
-            errors.push(format!("budget {} limit_usd must be positive", budget.id));
-        }
-        if !(0.0..=1.0).contains(&budget.warn_at_fraction) {
+        if budget.limits.spend.is_empty() {
             errors.push(format!(
-                "budget {} warn_at_fraction must be between 0 and 1",
+                "budget {} must define at least one limits.spend window",
                 budget.id
             ));
-        }
-        if budget.window_seconds <= 0 {
-            errors.push(format!(
-                "budget {} window_seconds must be positive",
-                budget.id
-            ));
-        }
-        match (budget.window_mode, budget.window_anchor.as_ref()) {
-            (Some(BudgetWindowMode::Tumbling), None) => errors.push(format!(
-                "budget {} window_anchor is required when window_mode is tumbling",
-                budget.id
-            )),
-            (None, Some(_)) => errors.push(format!(
-                "budget {} window_anchor requires window_mode tumbling",
-                budget.id
-            )),
-            _ => {}
         }
         for entity in &budget.eligible.entities {
             if entity.trim().is_empty() {
@@ -149,6 +129,12 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                     budget.id
                 ));
             }
+            if !(0.0..=1.0).contains(&limit.warn_at_fraction) {
+                errors.push(format!(
+                    "budget {} limits.spend.warn_at_fraction must be between 0 and 1",
+                    budget.id
+                ));
+            }
             if !limit_action_is_supported(limit.action) {
                 errors.push(format!(
                     "budget {} limits.spend.action must be warn, ask, or block",
@@ -169,12 +155,17 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 }
             }
             match (limit.mode, limit.anchor.as_ref()) {
+                (None, _) => errors.push(format!(
+                    "budget {} limits.spend[{}].mode is required",
+                    budget.id,
+                    spend_window_label(limit)
+                )),
                 (Some(SpendWindowMode::Tumbling), None) => errors.push(format!(
                     "budget {} limits.spend[{}].anchor is required when mode is tumbling",
                     budget.id,
                     spend_window_label(limit)
                 )),
-                (Some(SpendWindowMode::Rolling) | None, Some(_)) => errors.push(format!(
+                (Some(SpendWindowMode::Rolling), Some(_)) => errors.push(format!(
                     "budget {} limits.spend[{}].anchor requires mode tumbling",
                     budget.id,
                     spend_window_label(limit)
@@ -272,28 +263,8 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
 }
 
 pub fn policy_validation_warnings(policy: &PolicyFile) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    for budget in &policy.budgets {
-        if budget.window_mode.is_none() && budget.window_anchor.is_none() {
-            warnings.push(format!(
-                "budget {} uses implicit legacy window semantics; set window_mode/window_anchor explicitly",
-                budget.id
-            ));
-        }
-
-        for limit in &budget.limits.spend {
-            if limit.mode.is_none() && limit.anchor.is_none() {
-                warnings.push(format!(
-                    "budget {} limits.spend[{}] uses implicit legacy rolling semantics; set id/mode/anchor explicitly",
-                    budget.id,
-                    spend_window_label(limit)
-                ));
-            }
-        }
-    }
-
-    warnings
+    let _ = policy;
+    Vec::new()
 }
 
 pub fn matching_policy_explanations(
@@ -482,9 +453,6 @@ mod tests {
 version: 0
 budgets:
   - id: dev-daily
-    limit_usd: 1.0
-    warn_at_fraction: 0.5
-    window_seconds: 60
     limits:
       request_cost:
         max_usd: 0.25
@@ -493,7 +461,17 @@ budgets:
         max_tokens: 120000
         action: block
       spend:
-        - window: 5h
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          warn_at_fraction: 0.5
+          action: block
+        - id: burst-5h
+          window: 5h
+          mode: rolling
           max_usd: 10
           action: warn
     match:
@@ -520,7 +498,6 @@ policies:
 version: 0
 budgets:
   - id: dev-daily
-    limit_usd: 1.0
     limits:
       request_cost:
         max_usd: 0
@@ -546,10 +523,11 @@ budgets:
 version: 0
 budgets:
   - id: dev-daily
-    limit_usd: 1.0
     limits:
       spend:
-        - window: 5x
+        - id: bad-window
+          window: 5x
+          mode: rolling
           max_usd: 0
           action: allow
 "#,
@@ -570,8 +548,6 @@ budgets:
 version: 0
 budgets:
   - id: explicit-budget
-    limit_usd: 1.0
-    window_mode: tumbling
     limits:
       spend:
         - id: rolling-with-anchor
@@ -586,6 +562,10 @@ budgets:
           mode: tumbling
           max_usd: 2
           action: block
+        - id: missing-mode
+          window: 30d
+          max_usd: 5
+          action: block
 "#,
         )
         .expect("policy parses");
@@ -593,12 +573,10 @@ budgets:
         let error = validate_policy(&policy).expect_err("mode/anchor mismatch should be invalid");
         let message = error.to_string();
         assert!(message.contains(
-            "budget explicit-budget window_anchor is required when window_mode is tumbling"
-        ));
-        assert!(message.contains(
             "budget explicit-budget limits.spend[rolling-with-anchor].anchor requires mode tumbling"
         ));
         assert!(message.contains("budget explicit-budget limits.spend[tumbling-without-anchor].anchor is required when mode is tumbling"));
+        assert!(message.contains("budget explicit-budget limits.spend[missing-mode].mode is required"));
     }
 
     #[test]
@@ -608,15 +586,18 @@ budgets:
 version: 0
 budgets:
   - id: duplicate-limits
-    limit_usd: 1.0
     limits:
       spend:
         - id: daily-cap
           window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
           max_usd: 1
           action: warn
         - id: daily-cap
           window: 5h
+          mode: rolling
           max_usd: 2
           action: block
 "#,
@@ -630,33 +611,28 @@ budgets:
     }
 
     #[test]
-    fn reports_legacy_window_warnings_for_implicit_budget_and_limit_semantics() {
+    fn no_policy_validation_warnings_for_explicit_windows_only_model() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
 version: 0
 budgets:
-  - id: legacy-budget
-    limit_usd: 1.0
+  - id: explicit-budget
     limits:
       spend:
-        - window: 1d
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
           max_usd: 1
           action: warn
 "#,
         )
         .expect("policy parses");
 
-        validate_policy(&policy).expect("legacy policy still validates");
+        validate_policy(&policy).expect("explicit policy validates");
         let warnings = policy_validation_warnings(&policy);
-        assert_eq!(warnings.len(), 2);
-        assert!(warnings.iter().any(|warning| {
-            warning.contains("budget legacy-budget uses implicit legacy window semantics")
-        }));
-        assert!(warnings.iter().any(|warning| {
-            warning.contains(
-                "budget legacy-budget limits.spend[1d] uses implicit legacy rolling semantics",
-            )
-        }));
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -666,8 +642,15 @@ budgets:
 version: 0
 budgets:
   - id: dev-daily
-    limit_usd: 1.0
     limits:
+      spend:
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
       tool_calls: 0
       agent_steps: 0
       retries: 0
@@ -689,9 +672,17 @@ budgets:
 version: 0
 budgets:
   - id: ai-adoption
-    limit_usd: 2000
     eligible:
       entities: [org:example]
+    limits:
+      spend:
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 2000
+          action: block
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -728,7 +719,15 @@ budgets:
 version: 0
 budgets:
   - id: ai-adoption
-    limit_usd: 2000
+    limits:
+      spend:
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 2000
+          action: block
     allocation:
       standard: protected_adoption_pool
       by: org
@@ -769,23 +768,63 @@ budgets:
 version: 0
 budgets:
   - id: project-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [project:noether]
   - id: user-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [user:alice]
   - id: team-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [team:core]
   - id: org-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [org:example]
   - id: global-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [global]
 "#,
@@ -810,11 +849,27 @@ budgets:
 version: 0
 budgets:
   - id: project-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [project:noether]
   - id: subject-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [user:alice]
 "#,
@@ -839,7 +894,15 @@ budgets:
 version: 0
 budgets:
   - id: v0-flat-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     match:
       project: noether
 "#,
@@ -859,7 +922,15 @@ budgets:
 version: 0
 budgets:
   - id: premium-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [project:noether]
     models:
@@ -892,7 +963,15 @@ budgets:
 version: 0
 budgets:
   - id: unrestricted-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [project:noether]
 "#,
@@ -912,7 +991,15 @@ budgets:
 version: 0
 budgets:
   - id: restricted-budget
-    limit_usd: 1.0
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.0
+          action: block
     eligible:
       entities: [project:noether]
     models:

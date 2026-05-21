@@ -12,11 +12,6 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    limit_usd: 1000
-    window_seconds: 2592000
-    window_mode: tumbling
-    window_anchor:
-      kind: first_seen
     eligible:
       entities: [global]
     models:
@@ -27,6 +22,14 @@ budgets:
         - anthropic:claude-haiku-*
     limits:
       spend:
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1000
+          warn_at_fraction: 0.8
+          action: block
         - id: daily-cap
           window: 1d
           mode: tumbling

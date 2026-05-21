@@ -4,10 +4,17 @@ policy:
   version: 0
   budgets:
     - id: runaway-budget
-      limit_usd: 50
       eligible:
         entities: [project:runaway]
       limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 50
+            action: block
         request_cost:
           max_usd: 1.0
           action: block

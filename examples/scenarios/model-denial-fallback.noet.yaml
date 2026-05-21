@@ -4,14 +4,30 @@ policy:
   version: 0
   budgets:
     - id: restricted-claude
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
       models:
         allow:
           - anthropic:claude-sonnet-*
     - id: openai-project
-      limit_usd: 25
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 25
+            action: block
       eligible:
         entities: [project:noether]
       models:

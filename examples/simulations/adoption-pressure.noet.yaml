@@ -67,7 +67,15 @@ strategies:
       version: 0
       budgets:
         - id: eng-pooled
-          limit_usd: 4
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 4
+                action: block
           eligible:
             entities: [team:eng]
   - id: protected adoption
@@ -76,7 +84,15 @@ strategies:
       version: 0
       budgets:
         - id: eng-adoption
-          limit_usd: 4
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 4
+                action: block
           eligible:
             entities: [team:eng]
           allocation:

@@ -8,9 +8,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::contract::{
-    AuthorizeDecision, AuthorizeRequest, BudgetRule, BudgetWindowMode, DecisionExplanation,
-    DecisionOutcome, DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction,
-    Reservation, ReservationStatus, RuleMatch, ToolEvent, TraceEvent, UsageObservation,
+    AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
+    DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction, Reservation,
+    ReservationStatus, RuleMatch, SpendWindowLimit, SpendWindowMode, ToolEvent, TraceEvent,
+    UsageObservation,
 };
 use crate::error::NoetError;
 use crate::policy::{
@@ -20,7 +21,6 @@ use crate::policy::{
 
 #[derive(Debug, Default)]
 pub struct BudgetLedger {
-    windows: HashMap<String, WindowState>,
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     reservations: HashMap<String, StoredReservation>,
@@ -74,6 +74,22 @@ struct LimitWindowReservationSpend {
     rule_id: String,
     limit_id: String,
     scope_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct SpendWindowProjection {
+    rule_id: String,
+    limit_id: String,
+    window_label: String,
+    action: PolicyAction,
+    limit_mode: SpendWindowMode,
+    window_started_at: Option<DateTime<Utc>>,
+    window_ends_at: Option<DateTime<Utc>>,
+    projected_spend_usd: f64,
+    max_usd: f64,
+    warn_at_fraction: f64,
+    scope_entity: Option<String>,
+    window_seconds: Duration,
 }
 
 #[derive(Default)]
@@ -244,7 +260,6 @@ impl BudgetLedger {
             conn: Some(conn),
             ..Self::default()
         };
-        ledger.load_windows()?;
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
@@ -301,7 +316,6 @@ impl BudgetLedger {
             Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
         };
         if reservation.is_some() {
-            self.persist_windows()?;
             self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
         }
@@ -343,11 +357,6 @@ impl BudgetLedger {
             .or_else(|| payload.usage.as_ref().and_then(|usage| usage.cost_usd));
         if let Some(actual_cost) = actual_cost {
             let delta = actual_cost - stored.estimated_cost_usd;
-            for rule_id in &stored.budget_rule_ids {
-                if let Some(window) = self.windows.get_mut(rule_id) {
-                    window.used_usd = (window.used_usd + delta).max(0.0);
-                }
-            }
             for spend in &stored.limit_window_spends {
                 let key = (
                     spend.rule_id.clone(),
@@ -674,14 +683,13 @@ impl BudgetLedger {
             let exhausted_rules = self.exhausted_budget_rules(policy, request, now);
             if !exhausted_rules.is_empty() {
                 *action = merge_policy_action(*action, PolicyAction::Block);
-                for (rule_id, projected, limit_usd) in exhausted_rules {
+                for hit in exhausted_rules {
                     explanations.push(DecisionExplanation {
-                        rule_id,
-                        reason: format!(
-                            "estimated cost ${projected:.6} exceeds fixed-window limit ${limit_usd:.6}"
-                        ),
-                        severity: DecisionSeverity::Deny,
+                        rule_id: hit.rule_id.clone(),
+                        reason: hit.reason.clone(),
+                        severity: hit.severity,
                     });
+                    limit_hits.push(hit);
                 }
                 return None;
             }
@@ -738,18 +746,6 @@ impl BudgetLedger {
         ) {
             return Some(rule.id.clone());
         }
-        let projected = self.window_used_usd(rule, now) + estimated_cost;
-        if projected >= rule.limit_usd * rule.warn_at_fraction {
-            *action = merge_policy_action(*action, PolicyAction::Warn);
-            explanations.push(DecisionExplanation {
-                rule_id: rule.id.clone(),
-                reason: format!(
-                    "estimated cost ${projected:.6} reaches warning threshold ${:.6}",
-                    rule.limit_usd * rule.warn_at_fraction
-                ),
-                severity: DecisionSeverity::Warn,
-            });
-        }
         Some(rule.id.clone())
     }
 
@@ -776,7 +772,7 @@ impl BudgetLedger {
                 }
                 explanations.push(DecisionExplanation {
                     rule_id: rule.id.clone(),
-                    reason: self.budget_rejection_reason(rule, request, now),
+                    reason: self.budget_rejection_reason(policy, rule, request, now),
                     severity: DecisionSeverity::Info,
                 });
             } else {
@@ -831,28 +827,29 @@ impl BudgetLedger {
             return None;
         }
         let estimated_cost = request.estimated_cost();
-        if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
-            && estimated_cost > available_usd
-        {
-            return None;
-        }
-        let projected = self.window_used_usd(rule, now) + estimated_cost;
-        if projected > rule.limit_usd {
-            return None;
-        }
         let (matched_entity, specificity_rank) =
             matched_entity_and_rank(rule, request, &specificity_order(policy));
+        let projections =
+            spend_window_projections(self, rule, matched_entity.as_deref(), estimated_cost, now);
         Some(BudgetCandidate {
             id: rule.id.clone(),
             matched_entity,
             specificity_rank,
             priority: rule.priority,
-            pressure_micros: ((projected / rule.limit_usd) * 1_000_000.0).round() as u64,
+            pressure_micros: projections
+                .iter()
+                .map(|projection| {
+                    ((projection.projected_spend_usd / projection.max_usd) * 1_000_000.0).round()
+                        as u64
+                })
+                .max()
+                .unwrap_or(0),
         })
     }
 
     fn budget_rejection_reason(
         &mut self,
+        policy: &PolicyFile,
         rule: &BudgetRule,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
@@ -863,20 +860,25 @@ impl BudgetLedger {
         if !budget_model_allowed(rule, request) {
             return "requested provider/model is not allowed by requested budget".to_owned();
         }
-        if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
-            && request.estimated_cost() > available_usd
+        let matched_entity = matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
+        if let Some(hit) = spend_window_projections(
+            self,
+            rule,
+            matched_entity.as_deref(),
+            request.estimated_cost(),
+            now,
+        )
+        .into_iter()
+        .filter(|projection| {
+            projection.projected_spend_usd > projection.max_usd
+                && matches!(projection.action, PolicyAction::Ask | PolicyAction::Block)
+        })
+        .max_by_key(|projection| {
+            ((projection.projected_spend_usd / projection.max_usd) * 1_000_000.0).round() as u64
+        })
+        .map(|projection| spend_limit_hit(&projection))
         {
-            return format!(
-                "estimated cost ${:.6} exceeds protected adoption balance ${available_usd:.6}",
-                request.estimated_cost()
-            );
-        }
-        let projected = self.window_used_usd(rule, now) + request.estimated_cost();
-        if projected > rule.limit_usd {
-            return format!(
-                "requested budget would exceed fixed-window limit: projected ${projected:.6} > ${:.6}",
-                rule.limit_usd
-            );
+            return hit.reason;
         }
         "requested budget is not valid for the request".to_owned()
     }
@@ -886,14 +888,26 @@ impl BudgetLedger {
         policy: &PolicyFile,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
-    ) -> Vec<(String, f64, f64)> {
+    ) -> Vec<DecisionLimitHitReport> {
         policy
             .budgets
             .iter()
             .filter(|rule| budget_rule_matches(rule, request))
-            .filter_map(|rule| {
-                let projected = self.window_used_usd(rule, now) + request.estimated_cost();
-                (projected > rule.limit_usd).then(|| (rule.id.clone(), projected, rule.limit_usd))
+            .flat_map(|rule| {
+                let matched_entity = matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
+                spend_window_projections(
+                    self,
+                    rule,
+                    matched_entity.as_deref(),
+                    request.estimated_cost(),
+                    now,
+                )
+                .into_iter()
+                .filter(|projection| {
+                    projection.projected_spend_usd > projection.max_usd
+                        && matches!(projection.action, PolicyAction::Ask | PolicyAction::Block)
+                })
+                .map(|projection| spend_limit_hit(&projection))
             })
             .collect()
     }
@@ -939,14 +953,23 @@ impl BudgetLedger {
         let mut limit_window_spends = Vec::new();
         let expires_at = matching_rules
             .iter()
-            .map(|rule| now + Duration::seconds(rule.window_seconds))
+            .flat_map(|rule| {
+                spend_window_projections(
+                    self,
+                    rule,
+                    matched_entity.as_deref(),
+                    amount_usd,
+                    now,
+                )
+                .into_iter()
+                .map(|projection| projection.window_ends_at.unwrap_or(now + projection.window_seconds))
+            })
             .min()
             .unwrap_or_else(|| now + Duration::hours(1));
 
         for rule in matching_rules {
-            self.window(rule, now).used_usd += amount_usd;
             for limit in &rule.limits.spend {
-                if !matches!(limit.mode, Some(crate::contract::SpendWindowMode::Tumbling)) {
+                if !matches!(limit.mode, Some(SpendWindowMode::Tumbling)) {
                     continue;
                 }
                 let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
@@ -989,37 +1012,6 @@ impl BudgetLedger {
         reservation
     }
 
-    fn window(&mut self, rule: &BudgetRule, now: DateTime<Utc>) -> &mut WindowState {
-        let window_seconds = Duration::seconds(rule.window_seconds);
-        let window = self.windows.entry(rule.id.clone()).or_insert(WindowState {
-            started_at: now,
-            used_usd: 0.0,
-        });
-
-        if now - window.started_at >= window_seconds {
-            window.started_at = match rule.window_mode {
-                Some(BudgetWindowMode::Tumbling) => {
-                    advance_tumbling_window_start(window.started_at, window_seconds, now)
-                }
-                None => now,
-            };
-            window.used_usd = 0.0;
-        }
-
-        window
-    }
-
-    fn window_used_usd(&self, rule: &BudgetRule, now: DateTime<Utc>) -> f64 {
-        let Some(window) = self.windows.get(&rule.id) else {
-            return 0.0;
-        };
-        if now - window.started_at >= Duration::seconds(rule.window_seconds) {
-            0.0
-        } else {
-            window.used_usd
-        }
-    }
-
     fn limit_window(
         &mut self,
         rule: &BudgetRule,
@@ -1060,6 +1052,16 @@ impl BudgetLedger {
         } else {
             window.used_usd
         }
+    }
+
+    fn biggest_spend_window_projection_for_budget(
+        &self,
+        rule: &BudgetRule,
+        matched_entity: Option<&str>,
+        estimated_cost: f64,
+        now: DateTime<Utc>,
+    ) -> Option<SpendWindowProjection> {
+        biggest_spend_window_projection(self, rule, matched_entity, estimated_cost, now)
     }
 
     fn persist_decision(
@@ -1206,16 +1208,21 @@ impl BudgetLedger {
             {
                 fields.matched_entity =
                     matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
-                fields.budget_window_remaining_usd = Some(
-                    (rule.limit_usd - self.window_used_usd(rule, decision.created_at)).max(0.0),
-                );
-                if let Some(BudgetWindowMode::Tumbling) = rule.window_mode
-                    && let Some(window) = self.windows.get(&rule.id)
-                {
-                    fields.budget_window_mode = Some("tumbling".to_owned());
-                    fields.budget_window_started_at = Some(window.started_at);
-                    fields.budget_window_ends_at =
-                        Some(window.started_at + Duration::seconds(rule.window_seconds));
+                if let Some(projection) = biggest_spend_window_projection(
+                    self,
+                    rule,
+                    fields.matched_entity.as_deref(),
+                    0.0,
+                    decision.created_at,
+                ) {
+                    fields.budget_window_remaining_usd =
+                        Some((projection.max_usd - projection.projected_spend_usd).max(0.0));
+                    fields.budget_window_mode = Some(match projection.limit_mode {
+                        SpendWindowMode::Rolling => "rolling".to_owned(),
+                        SpendWindowMode::Tumbling => "tumbling".to_owned(),
+                    });
+                    fields.budget_window_started_at = projection.window_started_at;
+                    fields.budget_window_ends_at = projection.window_ends_at;
                 }
                 fields.tool_calls = rule.limits.tool_calls;
                 fields.agent_steps = rule.limits.agent_steps;
@@ -1449,21 +1456,6 @@ impl BudgetLedger {
     }
 
     fn persist_windows(&self) -> Result<(), NoetError> {
-        let Some(conn) = &self.conn else {
-            return Ok(());
-        };
-        for (rule_id, window) in &self.windows {
-            conn.execute(
-                "
-                INSERT INTO budget_windows (rule_id, started_at, used_usd)
-                VALUES (?1, ?2, ?3)
-                ON CONFLICT(rule_id) DO UPDATE SET
-                    started_at = excluded.started_at,
-                    used_usd = excluded.used_usd
-                ",
-                params![rule_id, window.started_at.to_rfc3339(), window.used_usd],
-            )?;
-        }
         Ok(())
     }
 
@@ -1522,22 +1514,6 @@ impl BudgetLedger {
     }
 
     fn load_windows(&mut self) -> Result<(), NoetError> {
-        let Some(conn) = &self.conn else {
-            return Ok(());
-        };
-        let mut stmt = conn.prepare("SELECT rule_id, started_at, used_usd FROM budget_windows")?;
-        let windows: Vec<(String, WindowState)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    WindowState {
-                        started_at: parse_time(row.get::<_, String>(1)?),
-                        used_usd: row.get(2)?,
-                    },
-                ))
-            })?
-            .collect::<Result<_, _>>()?;
-        self.windows = windows.into_iter().collect();
         Ok(())
     }
 
@@ -2238,89 +2214,30 @@ fn apply_budget_limits(
         return true;
     }
 
-    for limit in &rule.limits.spend {
-        let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
-            continue;
-        };
-        let limit_id = spend_limit_identifier(limit);
-        let limit_mode = limit
-            .mode
-            .unwrap_or(crate::contract::SpendWindowMode::Rolling);
-        let current_spend = match limit_mode {
-            crate::contract::SpendWindowMode::Rolling => {
-                recent_spend_usd(ledger, &rule.id, matched_entity, now - window, now)
-            }
-            crate::contract::SpendWindowMode::Tumbling => ledger.limit_window_used_usd(
-                rule,
-                limit_id,
-                window,
-                &limit_scope_key(matched_entity),
-                now,
-            ),
-        };
-        let projected_spend = current_spend + estimated_cost;
-        if projected_spend > limit.max_usd {
-            let warn_reason = format!(
-                "projected spend ${projected_spend:.6} exceeds {} limit max ${:.6}",
-                limit.window, limit.max_usd
-            );
-            let deny_reason = format!(
-                "projected spend ${projected_spend:.6} exceeds enforced {} limit max ${:.6}",
-                limit.window, limit.max_usd
-            );
+    for projection in spend_window_projections(ledger, rule, matched_entity, estimated_cost, now) {
+        let warn_threshold = projection.max_usd * projection.warn_at_fraction;
+        if projection.warn_at_fraction < 1.0 && projection.projected_spend_usd >= warn_threshold {
+            *action = merge_policy_action(*action, PolicyAction::Warn);
+            explanations.push(DecisionExplanation {
+                rule_id: projection.rule_id.clone(),
+                reason: format!(
+                    "projected spend ${:.6} reaches warning threshold ${:.6} for {} window",
+                    projection.projected_spend_usd, warn_threshold, projection.window_label
+                ),
+                severity: DecisionSeverity::Warn,
+            });
+        }
+        if projection.projected_spend_usd > projection.max_usd {
+            let hit = spend_limit_hit(&projection);
             let denied = push_limit_explanation(
-                format!("{}.spend_window.{}", rule.id, limit_id),
-                warn_reason.clone(),
-                deny_reason.clone(),
-                limit.action,
+                hit.rule_id.clone(),
+                hit.reason.clone(),
+                hit.reason.clone(),
+                projection.action,
                 action,
                 explanations,
             );
-            let (window_started_at, window_ends_at) = match limit_mode {
-                crate::contract::SpendWindowMode::Rolling => (Some(now - window), Some(now)),
-                crate::contract::SpendWindowMode::Tumbling => {
-                    let key = (
-                        rule.id.clone(),
-                        limit_id.to_owned(),
-                        limit_scope_key(matched_entity),
-                    );
-                    let started_at = ledger
-                        .limit_windows
-                        .get(&key)
-                        .map(|state| {
-                            if now - state.started_at >= window {
-                                advance_tumbling_window_start(state.started_at, window, now)
-                            } else {
-                                state.started_at
-                            }
-                        })
-                        .unwrap_or(now);
-                    (Some(started_at), Some(started_at + window))
-                }
-            };
-            limit_hits.push(DecisionLimitHitReport {
-                rule_id: format!("{}.spend_window.{}", rule.id, limit_id),
-                reason: match limit.action {
-                    PolicyAction::Warn => warn_reason,
-                    PolicyAction::Ask | PolicyAction::Block => deny_reason,
-                    PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
-                },
-                severity: match limit.action {
-                    PolicyAction::Warn => DecisionSeverity::Warn,
-                    PolicyAction::Ask | PolicyAction::Block => DecisionSeverity::Deny,
-                    PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
-                },
-                window_id: Some(limit_id.to_owned()),
-                window_mode: Some(match limit_mode {
-                    crate::contract::SpendWindowMode::Rolling => "rolling".to_owned(),
-                    crate::contract::SpendWindowMode::Tumbling => "tumbling".to_owned(),
-                }),
-                window_started_at,
-                window_ends_at,
-                projected_spend_usd: Some(projected_spend),
-                max_usd: Some(limit.max_usd),
-                scope_entity: matched_entity.map(ToOwned::to_owned),
-            });
+            limit_hits.push(hit);
             if denied {
                 return true;
             }
@@ -2328,6 +2245,124 @@ fn apply_budget_limits(
     }
 
     false
+}
+
+fn spend_window_projections(
+    ledger: &BudgetLedger,
+    rule: &BudgetRule,
+    matched_entity: Option<&str>,
+    estimated_cost: f64,
+    now: DateTime<Utc>,
+) -> Vec<SpendWindowProjection> {
+    rule.limits
+        .spend
+        .iter()
+        .filter_map(|limit| {
+            let window_seconds = crate::policy::parse_limit_window(&limit.window)?;
+            let limit_id = spend_limit_identifier(limit).to_owned();
+            let limit_mode = limit.mode?;
+            let scope_key = limit_scope_key(matched_entity);
+            let (current_spend, window_started_at, window_ends_at) = match limit_mode {
+                SpendWindowMode::Rolling => (
+                    recent_spend_usd(ledger, &rule.id, matched_entity, now - window_seconds, now),
+                    Some(now - window_seconds),
+                    Some(now),
+                ),
+                SpendWindowMode::Tumbling => {
+                    let key = (rule.id.clone(), limit_id.clone(), scope_key.clone());
+                    let started_at = ledger
+                        .limit_windows
+                        .get(&key)
+                        .map(|state| {
+                            if now - state.started_at >= window_seconds {
+                                advance_tumbling_window_start(state.started_at, window_seconds, now)
+                            } else {
+                                state.started_at
+                            }
+                        })
+                        .unwrap_or(now);
+                    (
+                        ledger.limit_window_used_usd(
+                            rule,
+                            &limit_id,
+                            window_seconds,
+                            &scope_key,
+                            now,
+                        ),
+                        Some(started_at),
+                        Some(started_at + window_seconds),
+                    )
+                }
+            };
+            Some(SpendWindowProjection {
+                rule_id: format!("{}.spend_window.{}", rule.id, limit_id),
+                limit_id,
+                window_label: limit.window.clone(),
+                action: limit.action,
+                limit_mode,
+                window_started_at,
+                window_ends_at,
+                projected_spend_usd: current_spend + estimated_cost,
+                max_usd: limit.max_usd,
+                warn_at_fraction: limit.warn_at_fraction,
+                scope_entity: matched_entity.map(ToOwned::to_owned),
+                window_seconds,
+            })
+        })
+        .collect()
+}
+
+fn biggest_spend_window_projection(
+    ledger: &BudgetLedger,
+    rule: &BudgetRule,
+    matched_entity: Option<&str>,
+    estimated_cost: f64,
+    now: DateTime<Utc>,
+) -> Option<SpendWindowProjection> {
+    spend_window_projections(ledger, rule, matched_entity, estimated_cost, now)
+        .into_iter()
+        .max_by_key(|projection| projection.window_seconds.num_seconds())
+}
+
+fn biggest_spend_window_duration(rule: &BudgetRule) -> Option<Duration> {
+    rule.limits
+        .spend
+        .iter()
+        .filter_map(|limit| crate::policy::parse_limit_window(&limit.window))
+        .max_by_key(|window| window.num_seconds())
+}
+
+fn spend_limit_hit(projection: &SpendWindowProjection) -> DecisionLimitHitReport {
+    let reason = match projection.action {
+        PolicyAction::Warn => format!(
+            "projected spend ${:.6} exceeds {} limit max ${:.6}",
+            projection.projected_spend_usd, projection.window_label, projection.max_usd
+        ),
+        PolicyAction::Ask | PolicyAction::Block => format!(
+            "projected spend ${:.6} exceeds enforced {} limit max ${:.6}",
+            projection.projected_spend_usd, projection.window_label, projection.max_usd
+        ),
+        PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
+    };
+    DecisionLimitHitReport {
+        rule_id: projection.rule_id.clone(),
+        reason,
+        severity: match projection.action {
+            PolicyAction::Warn => DecisionSeverity::Warn,
+            PolicyAction::Ask | PolicyAction::Block => DecisionSeverity::Deny,
+            PolicyAction::Allow => unreachable!("limit validation forbids allow actions"),
+        },
+        window_id: Some(projection.limit_id.clone()),
+        window_mode: Some(match projection.limit_mode {
+            SpendWindowMode::Rolling => "rolling".to_owned(),
+            SpendWindowMode::Tumbling => "tumbling".to_owned(),
+        }),
+        window_started_at: projection.window_started_at,
+        window_ends_at: projection.window_ends_at,
+        projected_spend_usd: Some(projection.projected_spend_usd),
+        max_usd: Some(projection.max_usd),
+        scope_entity: projection.scope_entity.clone(),
+    }
 }
 
 fn push_limit_explanation(
@@ -2492,7 +2527,8 @@ fn rolled_allocation_bucket_state(
     if allocation.standard != "protected_adoption_pool" {
         return Some(bucket);
     }
-    if now - bucket.started_at < Duration::seconds(rule.window_seconds) {
+    let biggest_window = biggest_spend_window_duration(rule)?;
+    if now - bucket.started_at < biggest_window {
         return Some(bucket);
     }
     let protected_amount_usd = allocation.protected_amount_usd?;
@@ -3133,9 +3169,9 @@ mod tests {
     use chrono::TimeZone;
 
     use crate::contract::{
-        BudgetEligibility, BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, BudgetWindowMode,
-        ContextTokenLimit, RequestCostLimit, RuleMatch, SpendWindowLimit, SpendWindowMode,
-        WindowAnchorKind, WindowAnchorPolicy,
+        BudgetEligibility, BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, ContextTokenLimit,
+        RequestCostLimit, RuleMatch, SpendWindowLimit, SpendWindowMode, WindowAnchorKind,
+        WindowAnchorPolicy,
     };
 
     use super::*;
@@ -3146,15 +3182,27 @@ mod tests {
             routing: Default::default(),
             budgets: vec![BudgetRule {
                 id: "dev-budget".to_owned(),
-                limit_usd,
                 priority: 0,
-                warn_at_fraction,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
                 eligible: Default::default(),
                 models: Default::default(),
-                limits: Default::default(),
+                limits: BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![SpendWindowLimit {
+                        id: Some("budget-cap".to_owned()),
+                        window: "60s".to_owned(),
+                        mode: Some(SpendWindowMode::Tumbling),
+                        anchor: Some(WindowAnchorPolicy {
+                            kind: WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: limit_usd,
+                        warn_at_fraction,
+                        action: PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
                 allocation: None,
                 rule_match: RuleMatch {
                     project: Some("noether".to_owned()),
@@ -3179,6 +3227,71 @@ mod tests {
         }
     }
 
+    fn budget_cap_used(ledger: &BudgetLedger, budget_id: &str, scope_key: &str) -> f64 {
+        ledger
+            .limit_windows
+            .get(&(
+                budget_id.to_owned(),
+                "budget-cap".to_owned(),
+                scope_key.to_owned(),
+            ))
+            .map(|window| window.used_usd)
+            .unwrap_or(0.0)
+    }
+
+    fn has_budget_cap(ledger: &BudgetLedger, budget_id: &str, scope_key: &str) -> bool {
+        ledger.limit_windows.contains_key(&(
+            budget_id.to_owned(),
+            "budget-cap".to_owned(),
+            scope_key.to_owned(),
+        ))
+    }
+
+    fn protected_adoption_policy(cap_window: &str) -> PolicyFile {
+        PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "ai-adoption".to_owned(),
+                priority: 0,
+                eligible: BudgetEligibility {
+                    entities: vec!["org:example".to_owned()],
+                },
+                models: BudgetModelPolicy::default(),
+                limits: BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![SpendWindowLimit {
+                        id: Some("budget-cap".to_owned()),
+                        window: cap_window.to_owned(),
+                        mode: Some(SpendWindowMode::Tumbling),
+                        anchor: Some(WindowAnchorPolicy {
+                            kind: WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 2000.0,
+                        warn_at_fraction: 1.0,
+                        action: PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
+                allocation: Some(crate::contract::BudgetAllocationPolicy {
+                    standard: "protected_adoption_pool".to_owned(),
+                    by: Some("user".to_owned()),
+                    protected_amount_usd: Some(25.0),
+                    window: Some("monthly".to_owned()),
+                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
+                        percent: Some(10.0),
+                        cap_usd: Some(50.0),
+                    }),
+                }),
+                rule_match: RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        }
+    }
+
     #[test]
     fn budget_evaluator_allows_with_reservation_under_threshold() {
         let policy = policy(1.0, 0.8);
@@ -3199,7 +3312,8 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Warn);
         assert!(decision.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget" && explanation.severity == DecisionSeverity::Warn
+            explanation.rule_id == "dev-budget.spend_window.budget-cap"
+                && explanation.severity == DecisionSeverity::Warn
         }));
     }
 
@@ -3388,9 +3502,10 @@ mod tests {
             spend: vec![SpendWindowLimit {
                 id: None,
                 window: "5h".to_owned(),
-                mode: None,
+                mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Warn,
             }],
             tool_calls: None,
@@ -3421,9 +3536,10 @@ mod tests {
             spend: vec![SpendWindowLimit {
                 id: None,
                 window: "7d".to_owned(),
-                mode: None,
+                mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -3459,6 +3575,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Warn,
             }],
             tool_calls: None,
@@ -3494,6 +3611,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -3529,6 +3647,7 @@ mod tests {
                         kind: WindowAnchorKind::FirstSeen,
                     }),
                     max_usd: 10.0,
+                    warn_at_fraction: 1.0,
                     action: PolicyAction::Warn,
                 },
                 SpendWindowLimit {
@@ -3537,6 +3656,7 @@ mod tests {
                     mode: Some(SpendWindowMode::Rolling),
                     anchor: None,
                     max_usd: 10.0,
+                    warn_at_fraction: 1.0,
                     action: PolicyAction::Warn,
                 },
             ],
@@ -3576,6 +3696,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -3613,19 +3734,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_tumbling_budget_windows_advance_by_whole_multiples_after_idle_gap() {
+    fn tumbling_spend_windows_advance_by_whole_multiples_after_idle_gap() {
         let mut ledger = BudgetLedger::default();
-        let mut rule = budget("tumbling-budget", 10.0, 0, ["project:noether"]);
-        rule.window_mode = Some(BudgetWindowMode::Tumbling);
-        rule.window_anchor = Some(WindowAnchorPolicy {
-            kind: WindowAnchorKind::FirstSeen,
-        });
+        let rule = budget("tumbling-budget", 10.0, 0, ["project:noether"]);
         let started_at = Utc
             .with_ymd_and_hms(2026, 5, 20, 12, 0, 0)
             .single()
             .expect("valid time");
-        ledger.windows.insert(
-            rule.id.clone(),
+        ledger.limit_windows.insert(
+            (
+                rule.id.clone(),
+                "budget-cap".to_owned(),
+                "project:noether".to_owned(),
+            ),
             WindowState {
                 started_at,
                 used_usd: 4.0,
@@ -3633,32 +3754,15 @@ mod tests {
         );
 
         let now = started_at + Duration::seconds(130);
-        let window = ledger.window(&rule, now);
+        let window = ledger.limit_window(
+            &rule,
+            "budget-cap",
+            Duration::seconds(60),
+            "project:noether",
+            now,
+        );
 
         assert_eq!(window.started_at, started_at + Duration::seconds(120));
-        assert_eq!(window.used_usd, 0.0);
-    }
-
-    #[test]
-    fn legacy_budget_windows_still_reset_from_now_after_idle_gap() {
-        let mut ledger = BudgetLedger::default();
-        let rule = budget("legacy-budget", 10.0, 0, ["project:noether"]);
-        let started_at = Utc
-            .with_ymd_and_hms(2026, 5, 20, 12, 0, 0)
-            .single()
-            .expect("valid time");
-        ledger.windows.insert(
-            rule.id.clone(),
-            WindowState {
-                started_at,
-                used_usd: 4.0,
-            },
-        );
-
-        let now = started_at + Duration::seconds(130);
-        let window = ledger.window(&rule, now);
-
-        assert_eq!(window.started_at, now);
         assert_eq!(window.used_usd, 0.0);
     }
 
@@ -3676,8 +3780,8 @@ mod tests {
         let decision = ledger.authorize(Some(&policy), &request);
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
-        assert_eq!(ledger.windows.get("team-budget").unwrap().used_usd, 0.25);
-        assert!(!ledger.windows.contains_key("project-budget"));
+        assert_eq!(budget_cap_used(&ledger, "team-budget", "team:core"), 0.25);
+        assert!(!has_budget_cap(&ledger, "project-budget", "project:noether"));
         assert!(decision.explanations.iter().any(|explanation| {
             explanation.rule_id == "team-budget"
                 && explanation.reason == "selected requested budget"
@@ -3695,7 +3799,7 @@ mod tests {
         let decision = ledger.authorize(Some(&policy), &request);
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
-        assert_eq!(ledger.windows.get("project-budget").unwrap().used_usd, 0.25);
+        assert_eq!(budget_cap_used(&ledger, "project-budget", "project:noether"), 0.25);
         assert!(decision.explanations.iter().any(|explanation| {
             explanation.rule_id == "missing-budget"
                 && explanation.reason == "requested budget does not exist"
@@ -3719,8 +3823,8 @@ mod tests {
         let decision = ledger.authorize(Some(&policy), &request);
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
-        assert_eq!(ledger.windows.get("project-budget").unwrap().used_usd, 0.25);
-        assert!(!ledger.windows.contains_key("team-budget"));
+        assert_eq!(budget_cap_used(&ledger, "project-budget", "project:noether"), 0.25);
+        assert!(!has_budget_cap(&ledger, "team-budget", "team:core"));
     }
 
     #[test]
@@ -3738,10 +3842,10 @@ mod tests {
         let decision = ledger.authorize(Some(&policy), &request);
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
-        assert_eq!(ledger.windows.get("a-high-wide").unwrap().used_usd, 0.25);
-        assert!(!ledger.windows.contains_key("b-high-wide"));
-        assert!(!ledger.windows.contains_key("z-high-tight"));
-        assert!(!ledger.windows.contains_key("z-low-priority"));
+        assert_eq!(budget_cap_used(&ledger, "a-high-wide", "project:noether"), 0.25);
+        assert!(!has_budget_cap(&ledger, "b-high-wide", "project:noether"));
+        assert!(!has_budget_cap(&ledger, "z-high-tight", "project:noether"));
+        assert!(!has_budget_cap(&ledger, "z-low-priority", "project:noether"));
     }
 
     #[test]
@@ -3904,10 +4008,6 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("budget-window-report.sqlite");
         let mut policy = policy(5.0, 1.0);
-        policy.budgets[0].window_mode = Some(BudgetWindowMode::Tumbling);
-        policy.budgets[0].window_anchor = Some(WindowAnchorPolicy {
-            kind: WindowAnchorKind::FirstSeen,
-        });
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
 
         let decision = ledger.authorize(Some(&policy), &request(0.25));
@@ -3933,10 +4033,6 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("limit-window-report.sqlite");
         let mut policy = policy(20.0, 1.0);
-        policy.budgets[0].window_mode = Some(BudgetWindowMode::Tumbling);
-        policy.budgets[0].window_anchor = Some(WindowAnchorPolicy {
-            kind: WindowAnchorKind::FirstSeen,
-        });
         policy.budgets[0].limits = BudgetLimitPolicy {
             request_cost: None,
             context_tokens: None,
@@ -3948,6 +4044,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
+                warn_at_fraction: 1.0,
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -3974,7 +4071,7 @@ mod tests {
             routing.budget_window_ends_at,
             routing
                 .budget_window_started_at
-                .map(|started_at| started_at + Duration::seconds(60))
+                .map(|started_at| started_at + Duration::days(1))
         );
         assert_eq!(limit_hit.rule_id, "dev-budget.spend_window.daily-tumbling");
         assert_eq!(limit_hit.window_id.as_deref(), Some("daily-tumbling"));
@@ -4106,36 +4203,7 @@ mod tests {
     fn sqlite_persists_protected_adoption_buckets_across_reopen() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("protected-adoption.sqlite");
-        let policy = PolicyFile {
-            version: 0,
-            routing: Default::default(),
-            budgets: vec![BudgetRule {
-                id: "ai-adoption".to_owned(),
-                limit_usd: 2000.0,
-                priority: 0,
-                warn_at_fraction: 1.0,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
-                models: BudgetModelPolicy::default(),
-                limits: BudgetLimitPolicy::default(),
-                allocation: Some(crate::contract::BudgetAllocationPolicy {
-                    standard: "protected_adoption_pool".to_owned(),
-                    by: Some("user".to_owned()),
-                    protected_amount_usd: Some(25.0),
-                    window: Some("monthly".to_owned()),
-                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
-                        percent: Some(10.0),
-                        cap_usd: Some(50.0),
-                    }),
-                }),
-                rule_match: RuleMatch::default(),
-            }],
-            policies: Vec::new(),
-        };
+        let policy = protected_adoption_policy("60s");
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
         let mut request = request(0.25);
         request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
@@ -4188,36 +4256,7 @@ mod tests {
 
     #[test]
     fn protected_adoption_buckets_are_tracked_per_entity() {
-        let policy = PolicyFile {
-            version: 0,
-            routing: Default::default(),
-            budgets: vec![BudgetRule {
-                id: "ai-adoption".to_owned(),
-                limit_usd: 2000.0,
-                priority: 0,
-                warn_at_fraction: 1.0,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
-                models: BudgetModelPolicy::default(),
-                limits: BudgetLimitPolicy::default(),
-                allocation: Some(crate::contract::BudgetAllocationPolicy {
-                    standard: "protected_adoption_pool".to_owned(),
-                    by: Some("user".to_owned()),
-                    protected_amount_usd: Some(25.0),
-                    window: Some("monthly".to_owned()),
-                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
-                        percent: Some(10.0),
-                        cap_usd: Some(50.0),
-                    }),
-                }),
-                rule_match: RuleMatch::default(),
-            }],
-            policies: Vec::new(),
-        };
+        let policy = protected_adoption_policy("60s");
         let mut ledger = BudgetLedger::default();
         let mut alice_request = request(0.25);
         alice_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
@@ -4247,36 +4286,7 @@ mod tests {
     fn protected_adoption_spend_consumes_carryover_before_current_grant() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("carryover-first.sqlite");
-        let policy = PolicyFile {
-            version: 0,
-            routing: Default::default(),
-            budgets: vec![BudgetRule {
-                id: "ai-adoption".to_owned(),
-                limit_usd: 2000.0,
-                priority: 0,
-                warn_at_fraction: 1.0,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
-                models: BudgetModelPolicy::default(),
-                limits: BudgetLimitPolicy::default(),
-                allocation: Some(crate::contract::BudgetAllocationPolicy {
-                    standard: "protected_adoption_pool".to_owned(),
-                    by: Some("user".to_owned()),
-                    protected_amount_usd: Some(25.0),
-                    window: Some("monthly".to_owned()),
-                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
-                        percent: Some(10.0),
-                        cap_usd: Some(50.0),
-                    }),
-                }),
-                rule_match: RuleMatch::default(),
-            }],
-            policies: Vec::new(),
-        };
+        let policy = protected_adoption_policy("60s");
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
         let mut initial_request = request(0.25);
         initial_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
@@ -4315,36 +4325,7 @@ mod tests {
     fn protected_adoption_rollover_applies_before_next_window_spend() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("carryover-rollover.sqlite");
-        let policy = PolicyFile {
-            version: 0,
-            routing: Default::default(),
-            budgets: vec![BudgetRule {
-                id: "ai-adoption".to_owned(),
-                limit_usd: 2000.0,
-                priority: 0,
-                warn_at_fraction: 1.0,
-                window_seconds: 1,
-                window_mode: None,
-                window_anchor: None,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
-                models: BudgetModelPolicy::default(),
-                limits: BudgetLimitPolicy::default(),
-                allocation: Some(crate::contract::BudgetAllocationPolicy {
-                    standard: "protected_adoption_pool".to_owned(),
-                    by: Some("user".to_owned()),
-                    protected_amount_usd: Some(25.0),
-                    window: Some("monthly".to_owned()),
-                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
-                        percent: Some(10.0),
-                        cap_usd: Some(50.0),
-                    }),
-                }),
-                rule_match: RuleMatch::default(),
-            }],
-            policies: Vec::new(),
-        };
+        let policy = protected_adoption_policy("1s");
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
         let mut initial_request = request(0.25);
         initial_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
@@ -4383,36 +4364,7 @@ mod tests {
     fn usage_report_distinguishes_unused_opportunity_and_adoption_levels() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("adoption-report.sqlite");
-        let policy = PolicyFile {
-            version: 0,
-            routing: Default::default(),
-            budgets: vec![BudgetRule {
-                id: "ai-adoption".to_owned(),
-                limit_usd: 2000.0,
-                priority: 0,
-                warn_at_fraction: 1.0,
-                window_seconds: 60,
-                window_mode: None,
-                window_anchor: None,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
-                models: BudgetModelPolicy::default(),
-                limits: BudgetLimitPolicy::default(),
-                allocation: Some(crate::contract::BudgetAllocationPolicy {
-                    standard: "protected_adoption_pool".to_owned(),
-                    by: Some("user".to_owned()),
-                    protected_amount_usd: Some(25.0),
-                    window: Some("monthly".to_owned()),
-                    carryover: Some(crate::contract::ProtectedCarryoverPolicy {
-                        percent: Some(10.0),
-                        cap_usd: Some(50.0),
-                    }),
-                }),
-                rule_match: RuleMatch::default(),
-            }],
-            policies: Vec::new(),
-        };
+        let policy = protected_adoption_policy("60s");
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
         let mut alice_request = request(1.0);
         alice_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
@@ -4498,17 +4450,29 @@ mod tests {
     ) -> BudgetRule {
         BudgetRule {
             id: id.to_owned(),
-            limit_usd,
             priority,
-            warn_at_fraction: 1.0,
-            window_seconds: 60,
-            window_mode: None,
-            window_anchor: None,
             eligible: BudgetEligibility {
                 entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
             },
             models: BudgetModelPolicy::default(),
-            limits: BudgetLimitPolicy::default(),
+            limits: BudgetLimitPolicy {
+                request_cost: None,
+                context_tokens: None,
+                spend: vec![SpendWindowLimit {
+                    id: Some("budget-cap".to_owned()),
+                    window: "60s".to_owned(),
+                    mode: Some(SpendWindowMode::Tumbling),
+                    anchor: Some(WindowAnchorPolicy {
+                        kind: WindowAnchorKind::FirstSeen,
+                    }),
+                    max_usd: limit_usd,
+                    warn_at_fraction: 1.0,
+                    action: PolicyAction::Block,
+                }],
+                tool_calls: None,
+                agent_steps: None,
+                retries: None,
+            },
             allocation: None,
             rule_match: RuleMatch::default(),
         }

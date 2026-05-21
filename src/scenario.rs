@@ -337,7 +337,15 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      limit_usd: 10
+      limits:
+        spend:
+          - id: budget-cap
+            window: 30d
+            mode: tumbling
+            anchor:
+              kind: first_seen
+            max_usd: 10
+            action: block
       eligible:
         entities: [project:noether]
 requests:

@@ -167,17 +167,8 @@ pub struct EvalAnnotation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BudgetRule {
     pub id: String,
-    pub limit_usd: f64,
     #[serde(default)]
     pub priority: i64,
-    #[serde(default = "default_warn_at_fraction")]
-    pub warn_at_fraction: f64,
-    #[serde(default = "default_window_seconds")]
-    pub window_seconds: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_mode: Option<BudgetWindowMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_anchor: Option<WindowAnchorPolicy>,
     #[serde(default)]
     pub eligible: BudgetEligibility,
     #[serde(default)]
@@ -242,14 +233,13 @@ pub struct SpendWindowLimit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<WindowAnchorPolicy>,
     pub max_usd: f64,
+    #[serde(
+        default = "default_limit_warn_at_fraction",
+        skip_serializing_if = "is_default_limit_warn_at_fraction"
+    )]
+    pub warn_at_fraction: f64,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BudgetWindowMode {
-    Tumbling,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -351,16 +341,16 @@ pub struct PolicyCondition {
     pub rule_match: RuleMatch,
 }
 
-fn default_warn_at_fraction() -> f64 {
-    0.8
-}
-
-fn default_window_seconds() -> i64 {
-    86_400
-}
-
 fn default_limit_action() -> PolicyAction {
     PolicyAction::Block
+}
+
+fn default_limit_warn_at_fraction() -> f64 {
+    1.0
+}
+
+fn is_default_limit_warn_at_fraction(value: &f64) -> bool {
+    (*value - default_limit_warn_at_fraction()).abs() < f64::EPSILON
 }
 
 #[cfg(test)]
@@ -422,54 +412,50 @@ mod tests {
     }
 
     #[test]
-    fn budget_rule_contract_preserves_legacy_window_shape() {
+    fn budget_rule_requires_limits_only_shape() {
         let rule: BudgetRule = serde_yaml::from_str(
             r#"
 id: legacy-budget
-limit_usd: 10
-window_seconds: 3600
-"#,
-        )
-        .expect("legacy rule parses");
-
-        let encoded = serde_yaml::to_string(&rule).expect("legacy rule serializes");
-        assert!(!encoded.contains("window_mode:"));
-        assert!(!encoded.contains("window_anchor:"));
-        assert_eq!(rule.window_mode, None);
-        assert_eq!(rule.window_anchor, None);
-    }
-
-    #[test]
-    fn budget_rule_contract_round_trips_explicit_window_shape() {
-        let rule: BudgetRule = serde_yaml::from_str(
-            r#"
-id: explicit-budget
-limit_usd: 10
-window_seconds: 3600
-window_mode: tumbling
-window_anchor:
-  kind: first_seen
 limits:
   spend:
-    - id: daily-cap
-      window: 1d
+    - id: monthly-cap
+      window: 30d
       mode: tumbling
       anchor:
         kind: first_seen
-      max_usd: 2
-      action: warn
+      max_usd: 10
+"#,
+        )
+        .expect("limits-only rule parses");
+
+        let encoded = serde_yaml::to_string(&rule).expect("limits-only rule serializes");
+        assert!(!encoded.contains("limit_usd:"));
+        assert!(!encoded.contains("window_seconds:"));
+    }
+
+    #[test]
+    fn budget_rule_contract_round_trips_explicit_spend_windows() {
+        let rule: BudgetRule = serde_yaml::from_str(
+            r#"
+id: explicit-budget
+limits:
+  spend:
+    - id: monthly-cap
+      window: 30d
+      mode: tumbling
+      anchor:
+        kind: first_seen
+      max_usd: 10
+      warn_at_fraction: 0.8
+      action: block
 "#,
         )
         .expect("explicit rule parses");
 
-        assert_eq!(rule.window_mode, Some(BudgetWindowMode::Tumbling));
         assert_eq!(
-            rule.window_anchor,
-            Some(WindowAnchorPolicy {
-                kind: WindowAnchorKind::FirstSeen,
-            })
+            rule.limits.spend[0].id.as_deref(),
+            Some("monthly-cap")
         );
-        assert_eq!(rule.limits.spend[0].id.as_deref(), Some("daily-cap"));
         assert_eq!(rule.limits.spend[0].mode, Some(SpendWindowMode::Tumbling));
         assert_eq!(
             rule.limits.spend[0].anchor,
@@ -477,13 +463,14 @@ limits:
                 kind: WindowAnchorKind::FirstSeen,
             })
         );
+        assert_eq!(rule.limits.spend[0].warn_at_fraction, 0.8);
 
         let encoded = serde_yaml::to_string(&rule).expect("explicit rule serializes");
         let decoded: BudgetRule = serde_yaml::from_str(&encoded).expect("explicit rule re-parses");
-        assert_eq!(decoded.window_mode, Some(BudgetWindowMode::Tumbling));
         assert_eq!(
             decoded.limits.spend[0].mode,
             Some(SpendWindowMode::Tumbling)
         );
+        assert_eq!(decoded.limits.spend[0].warn_at_fraction, 0.8);
     }
 }

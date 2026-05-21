@@ -1,9 +1,17 @@
 version: 0
 budgets:
   - id: team-platform
-    limit_usd: 420
     priority: 1
-    warn_at_fraction: 0.65
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 420
+          warn_at_fraction: 0.65
+          action: block
     eligible:
       entities: [team:platform]
     models:
@@ -12,9 +20,17 @@ budgets:
         - anthropic:*
 
   - id: team-product
-    limit_usd: 320
     priority: 1
-    warn_at_fraction: 0.65
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 320
+          warn_at_fraction: 0.65
+          action: block
     eligible:
       entities: [team:product]
     models:
@@ -23,9 +39,17 @@ budgets:
         - anthropic:*
 
   - id: team-security
-    limit_usd: 240
     priority: 1
-    warn_at_fraction: 0.6
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 240
+          warn_at_fraction: 0.6
+          action: block
     eligible:
       entities: [team:security]
     models:
@@ -34,9 +58,17 @@ budgets:
         - anthropic:*
 
   - id: team-revenue
-    limit_usd: 210
     priority: 1
-    warn_at_fraction: 0.62
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 210
+          warn_at_fraction: 0.62
+          action: block
     eligible:
       entities: [team:revenue]
     models:
@@ -45,9 +77,17 @@ budgets:
         - anthropic:*
 
   - id: team-support
-    limit_usd: 160
     priority: 1
-    warn_at_fraction: 0.68
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 160
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:support]
     models:
@@ -56,9 +96,17 @@ budgets:
         - anthropic:*
 
   - id: platform-premium
-    limit_usd: 180
     priority: 10
-    warn_at_fraction: 0.55
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 180
+          warn_at_fraction: 0.55
+          action: block
     eligible:
       entities: [project:noether]
     models:
@@ -67,9 +115,17 @@ budgets:
         - anthropic:claude-sonnet-*
 
   - id: search-burst
-    limit_usd: 150
     priority: 9
-    warn_at_fraction: 0.5
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 150
+          warn_at_fraction: 0.5
+          action: block
     eligible:
       entities: [project:search]
     models:
@@ -78,25 +134,41 @@ budgets:
         - anthropic:*
 
   - id: security-incident
-    limit_usd: 120
     priority: 9
-    warn_at_fraction: 0.5
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 120
+          warn_at_fraction: 0.5
+          action: block
+        - id: burst-12h
+          window: 12h
+          mode: rolling
+          max_usd: 18
+          action: warn
     eligible:
       entities: [project:incident]
     models:
       allow:
         - openai:*
         - anthropic:*
-    limits:
-      spend:
-        - window: 12h
-          max_usd: 18
-          action: warn
 
   - id: revenue-pricing
-    limit_usd: 110
     priority: 9
-    warn_at_fraction: 0.58
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 110
+          warn_at_fraction: 0.58
+          action: block
     eligible:
       entities: [project:pricing]
     models:
@@ -105,9 +177,17 @@ budgets:
         - anthropic:*
 
   - id: editor-claude
-    limit_usd: 90
     priority: 9
-    warn_at_fraction: 0.55
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 90
+          warn_at_fraction: 0.55
+          action: block
     eligible:
       entities: [project:editor]
     models:
@@ -115,9 +195,17 @@ budgets:
         - anthropic:claude-sonnet-*
 
   - id: editor-openai-fallback
-    limit_usd: 140
     priority: 8
-    warn_at_fraction: 0.6
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 140
+          warn_at_fraction: 0.6
+          action: block
     eligible:
       entities: [project:editor]
     models:
@@ -125,9 +213,17 @@ budgets:
         - openai:*
 
   - id: product-adoption
-    limit_usd: 240
     priority: 7
-    warn_at_fraction: 0.7
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 240
+          warn_at_fraction: 0.7
+          action: block
     eligible:
       entities: [team:product]
     allocation:
@@ -140,9 +236,17 @@ budgets:
         cap_usd: 50
 
   - id: support-adoption
-    limit_usd: 110
     priority: 7
-    warn_at_fraction: 0.7
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 110
+          warn_at_fraction: 0.7
+          action: block
     eligible:
       entities: [team:support]
     allocation:
@@ -155,15 +259,22 @@ budgets:
         cap_usd: 20
 
   - id: runaway-sandbox
-    limit_usd: 90
     priority: 11
-    warn_at_fraction: 0.5
-    eligible:
-      entities: [project:labs]
     limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 90
+          warn_at_fraction: 0.5
+          action: block
       request_cost:
         max_usd: 12
         action: block
       tool_calls: 6
       agent_steps: 2
       retries: 1
+    eligible:
+      entities: [project:labs]

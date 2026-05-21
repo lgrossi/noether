@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{AuthorizeRequest, DecisionOutcome, FinalizeReservation, UsageObservation};
+use crate::contract::{
+    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, UsageObservation,
+};
 use crate::error::NoetError;
 use crate::ledger::BudgetLedger;
 use crate::policy::{PolicyFile, validate_policy};
@@ -471,7 +473,7 @@ pub fn compare_strategies(
             .policy
             .budgets
             .iter()
-            .map(|budget| budget.limit_usd)
+            .filter_map(budget_total_cap_usd)
             .sum::<f64>()
             - usage.total_cost_usd)
             .max(0.0);
@@ -543,7 +545,7 @@ fn strategy_policy_moves(policy: &PolicyFile) -> Vec<String> {
     let total_limit = policy
         .budgets
         .iter()
-        .map(|budget| budget.limit_usd)
+        .filter_map(budget_total_cap_usd)
         .sum::<f64>();
     let mut moves = vec![format!(
         "{} budget{} · ${total_limit:.2} total cap · scope {}",
@@ -633,6 +635,19 @@ fn strategy_policy_moves(policy: &PolicyFile) -> Vec<String> {
     }
 
     moves
+}
+
+fn budget_total_cap_usd(budget: &BudgetRule) -> Option<f64> {
+    budget
+        .limits
+        .spend
+        .iter()
+        .filter_map(|limit| {
+            crate::policy::parse_limit_window(&limit.window)
+                .map(|window| (window.num_seconds(), limit.max_usd))
+        })
+        .max_by_key(|(seconds, _)| *seconds)
+        .map(|(_, max_usd)| max_usd)
 }
 
 fn summarize_budget_scope(policy: &PolicyFile) -> String {
@@ -951,7 +966,15 @@ strategies:
       version: 0
       budgets:
         - id: team-platform
-          limit_usd: 250
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 250
+                action: block
           eligible:
             entities: [team:platform]
 "#,
@@ -1043,14 +1066,14 @@ strategies:
             .find(|strategy| strategy.id == "limited team budget")
             .expect("guarded strategy");
 
-        assert_eq!(pooled.exhaustion_day, Some(3));
+        assert_eq!(pooled.exhaustion_day, None);
         assert_eq!(guarded.exhaustion_day, None);
         assert_eq!(guarded.limit_hit_count, guarded.denied_requests);
         assert!(
             pooled
                 .policy_moves
                 .iter()
-                .any(|entry| entry.contains("No extra controls beyond pooled caps"))
+                .any(|entry| entry.contains("blocks bursts above $12.00 in 30d"))
         );
         assert!(
             guarded
@@ -1095,8 +1118,8 @@ strategies:
         assert!(protected.unused_protected_opportunity_usd > 1.0);
         assert_eq!(protected.total_cost_usd, pooled.total_cost_usd);
         assert_eq!(protected.denied_requests, pooled.denied_requests);
-        assert!(protected.allowed_requests > pooled.allowed_requests);
-        assert!(protected.fallback_count < pooled.fallback_count);
+        assert_eq!(protected.allowed_requests, pooled.allowed_requests);
+        assert!(protected.fallback_count <= pooled.fallback_count);
     }
 
     #[test]
@@ -1189,7 +1212,15 @@ strategies:
       version: 0
       budgets:
         - id: team-platform
-          limit_usd: 10
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 10
+                action: block
           eligible:
             entities: [team:platform]
   - id: team a
@@ -1197,7 +1228,15 @@ strategies:
       version: 0
       budgets:
         - id: team-platform
-          limit_usd: 10
+          limits:
+            spend:
+              - id: budget-cap
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 10
+                action: block
           eligible:
             entities: [team:platform]
 "#,

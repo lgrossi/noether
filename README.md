@@ -133,9 +133,16 @@ Block AI work that cannot be charged to a real project:
 version: 0
 budgets:
   - id: noether-dev-daily
-    limit_usd: 1.00
-    warn_at_fraction: 0.8
-    window_seconds: 86400
+    limits:
+      spend:
+        - id: budget-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1.00
+          warn_at_fraction: 0.8
+          action: block
     match:
       project: noether
 policies:
@@ -228,16 +235,18 @@ Here is a more realistic policy that combines:
 version: 0
 budgets:
   - id: personal-primary
-    limit_usd: 1000
-    warn_at_fraction: 0.8
-    window_seconds: 2592000
-    window_mode: tumbling
-    window_anchor:
-      kind: first_seen
     eligible:
       entities: [project:noether]
     limits:
       spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1000
+          warn_at_fraction: 0.8
+          action: block
         - id: daily-cap
           window: 1d
           mode: tumbling
@@ -252,7 +261,7 @@ budgets:
           action: block
 ```
 
-This is the kind of policy a real operator or team would actually run: a normal monthly budget with
+This is the kind of policy a real operator or team would actually run: a broad `30d` spend cap with
 extra protection against bursty agent behavior.
 
 You can run the checked-in scenario for it here:

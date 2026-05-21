@@ -4,100 +4,170 @@ routing:
   specificity: [project, user, team, org, workflow, surface, global]
 budgets:
   - id: org-company-01
-    limit_usd: 2600
     priority: 5
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 2600
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [org:company-01]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: org-company-02
-    limit_usd: 2200
     priority: 5
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 2200
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [org:company-02]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: org-company-03
-    limit_usd: 1800
     priority: 5
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1800
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [org:company-03]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-01
-    limit_usd: 760
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 760
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-01]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-02
-    limit_usd: 710
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 710
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-02]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-03
-    limit_usd: 660
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 660
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-03]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-04
-    limit_usd: 620
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 620
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-04]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-05
-    limit_usd: 560
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 560
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-05]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-06
-    limit_usd: 520
     priority: 15
-    warn_at_fraction: 0.68
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 520
+          warn_at_fraction: 0.68
+          action: block
     eligible:
       entities: [team:team-06]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: team-01-adoption
-    limit_usd: 280
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 280
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-01]
     allocation:
@@ -110,10 +180,17 @@ budgets:
         cap_usd: 36
 
   - id: team-02-adoption
-    limit_usd: 260
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 260
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-02]
     allocation:
@@ -126,10 +203,17 @@ budgets:
         cap_usd: 32
 
   - id: team-03-adoption
-    limit_usd: 250
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 250
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-03]
     allocation:
@@ -142,10 +226,17 @@ budgets:
         cap_usd: 32
 
   - id: team-04-adoption
-    limit_usd: 240
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 240
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-04]
     allocation:
@@ -158,10 +249,17 @@ budgets:
         cap_usd: 28
 
   - id: team-05-adoption
-    limit_usd: 220
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 220
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-05]
     allocation:
@@ -174,10 +272,17 @@ budgets:
         cap_usd: 24
 
   - id: team-06-adoption
-    limit_usd: 210
     priority: 25
-    warn_at_fraction: 0.72
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 210
+          warn_at_fraction: 0.72
+          action: block
     eligible:
       entities: [team:team-06]
     allocation:
@@ -190,82 +295,130 @@ budgets:
         cap_usd: 24
 
   - id: project-noether
-    limit_usd: 720
     priority: 35
-    warn_at_fraction: 0.62
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 720
+          warn_at_fraction: 0.62
+          action: block
     eligible:
       entities: [project:noether]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: project-search
-    limit_usd: 680
     priority: 34
-    warn_at_fraction: 0.62
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 680
+          warn_at_fraction: 0.62
+          action: block
     eligible:
       entities: [project:search]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: project-editor
-    limit_usd: 600
     priority: 34
-    warn_at_fraction: 0.62
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 600
+          warn_at_fraction: 0.62
+          action: block
     eligible:
       entities: [project:editor]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: project-pricing
-    limit_usd: 540
     priority: 34
-    warn_at_fraction: 0.62
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 540
+          warn_at_fraction: 0.62
+          action: block
     eligible:
       entities: [project:pricing]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: project-incident
-    limit_usd: 500
     priority: 36
-    warn_at_fraction: 0.58
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 500
+          warn_at_fraction: 0.58
+          action: block
+        - id: burst-12h
+          window: 12h
+          mode: rolling
+          max_usd: 32
+          action: warn
     eligible:
       entities: [project:incident]
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
-    limits:
-      spend:
-        - window: 12h
-          max_usd: 32
-          action: warn
 
   - id: project-labs
-    limit_usd: 420
     priority: 38
-    warn_at_fraction: 0.55
-    window_seconds: 2592000
-    eligible:
-      entities: [project:labs]
-    models:
-      allow: [openai:*, openai-codex:*, anthropic:*]
     limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 420
+          warn_at_fraction: 0.55
+          action: block
       request_cost:
         max_usd: 18
         action: block
       tool_calls: 10
       agent_steps: 6
       retries: 2
+    eligible:
+      entities: [project:labs]
+    models:
+      allow: [openai:*, openai-codex:*, anthropic:*]
 
   - id: global-fallback
-    limit_usd: 3600
     priority: 0
-    warn_at_fraction: 0.8
-    window_seconds: 2592000
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 3600
+          warn_at_fraction: 0.8
+          action: block
     eligible:
       entities: [global]
     models:

@@ -25,20 +25,21 @@ One budget can combine:
 
 Those semantics must be explicit in policy and visible in decision/report output.
 
-## Decision 1: make window semantics explicit, additive, and v0-compatible
-
-First implementation should extend the current v0 schema instead of replacing it:
+## Decision 1: make window semantics explicit and additive under `limits.spend[]`
 
 ```yaml
 budgets:
   - id: personal-primary
-    limit_usd: 1000
-    window_seconds: 2592000
-    window_mode: tumbling
-    window_anchor:
-      kind: first_seen
     limits:
       spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1000
+          warn_at_fraction: 0.8
+          action: block
         - id: daily-cap
           window: 1d
           mode: tumbling

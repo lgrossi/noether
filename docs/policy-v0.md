@@ -29,13 +29,7 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: dev-daily
-    limit_usd: 1.00
     priority: 0
-    warn_at_fraction: 0.8
-    window_seconds: 86400
-    window_mode: tumbling
-    window_anchor:
-      kind: first_seen
     eligible:
       entities: [project:noether]
     models:
@@ -43,25 +37,26 @@ budgets:
         - openai:gpt-4.1
         - anthropic:claude-sonnet-*
     limits:
-      request_cost:
-        max_usd: 0.50
-        action: warn
-      context_tokens:
-        max_tokens: 120000
-        action: block
       spend:
-        - id: daily-cap
+        - id: budget-cap
           window: 1d
           mode: tumbling
           anchor:
             kind: first_seen
-          max_usd: 10
+          max_usd: 1.00
+          warn_at_fraction: 0.8
           action: block
         - id: burst-5h
           window: 5h
           mode: rolling
           max_usd: 40
           action: block
+      request_cost:
+        max_usd: 0.50
+        action: warn
+      context_tokens:
+        max_tokens: 120000
+        action: block
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -97,15 +92,15 @@ The v0 evaluator is an in-memory fixed-window budget:
   deny when one request's estimated cost exceeds its threshold;
 - `limits.context_tokens` defines a per-budget context limit that can warn or deny when
   authorize-time context/input token estimates exceed its threshold;
-- `window_mode: tumbling` plus `window_anchor.kind: first_seen` makes the budget cap window
-  explicit instead of relying on legacy activity-anchored resets;
-- omitted `window_mode` / `window_anchor` keeps legacy behavior and `noet policy check` warns
-  about that implicit default;
-- `limits.spend[]` now supports explicit `id`, `mode`, and `anchor` for additional pacing
-  and burst spend limits on the same budget:
+- `limits.spend[]` is the only money/window constraint model:
+  - every spend window defines its own `window`, `mode`, `anchor`, `max_usd`,
+    `warn_at_fraction`, and `action`;
+  - all spend windows compose with AND semantics;
+  - if reporting needs one derived broad budget view, Noether uses the biggest window;
+- `limits.spend[]` supports explicit `id`, `mode`, and `anchor` for pacing and burst limits on
+  the same budget:
   - `mode: tumbling` uses persisted bucket state and requires `anchor.kind: first_seen`;
   - `mode: rolling` keeps trailing recent-spend behavior and must omit `anchor`;
-  - omitted `mode` / `anchor` keeps the legacy rolling limit behavior and `policy check` warns;
 - spend-window ids must be unique within one budget so report output can distinguish, for example,
   a `1d tumbling` pacing limit from a `1d rolling` burst limit;
 - if a request does not include `estimated_tokens`, `limits.context_tokens` does not fire and the
@@ -130,6 +125,6 @@ Reservations are finalized through `POST /v1/reservations/{id}/finalize`.
 See `examples/scenarios/hybrid-budget-pacing-windows.noet.yaml` for a runnable end-to-end example
 that demonstrates:
 
-- a `30d` tumbling budget cap;
+- a `30d` tumbling spend cap;
 - a `1d` tumbling pacing limit deny;
 - a `5h` rolling burst limit deny.
