@@ -388,9 +388,19 @@ Configure the extension with environment variables:
 | `NOET_PI_INCLUDE_BODY` | unset | Set to `1` or `true` only to include sanitized body-shaped metadata. |
 | `NOET_PI_EXTENSION_VERSION` | `dev` | Version metadata for events/authorization. |
 | `NOET_PI_AUTHORIZE_TIMEOUT_MS` | `1000` | Maximum time the hot-path authorization hook waits for Noether. |
+| `NOET_PI_AUTO_START_LOCAL` | auto | When `NOET_URL=http://127.0.0.1:4051`, ensure the local sidecar is running from `session_start`, and stop it on `session_shutdown` only after the last active Pi session releases it. |
+| `NOET_PI_LOCAL_BIN` | auto | Binary used for `local up`; defaults to `target/debug/noet` under `NOET_PI_LOCAL_ROOT`/cwd when present, otherwise `noet` on `PATH`. |
+| `NOET_PI_LOCAL_ROOT` | current cwd | Root path passed to `noet local up --root ...` when local auto-start is used. |
+| `NOET_PI_LOCAL_START_TIMEOUT_MS` | `3000` | How long the extension waits for the auto-started local sidecar to become healthy. |
 | `NOET_PI_QUEUE_MAX_ITEMS` | `100` | Bound applied to both concurrent async deliveries and queued backlog for events, finalization, and debug logs. |
 | `NOET_PI_DEBUG_HOOKS` | unset | Set to `raw` to enable local raw hook dump mode. |
 | `NOET_PI_DEBUG_HOOK_LOG_DIR` | unset | Directory for raw debug hook JSONL files when debug mode is enabled. |
+
+When the extension is pointed at the standard local URL `http://127.0.0.1:4051`, it now treats
+that as the personal sidecar path and ensures `noet local up` is healthy during `session_start`.
+The extension keeps a lease for the life of the Pi session and stops the managed sidecar on
+`session_shutdown` only when no other active Pi sessions still hold a lease. Remote/shared Noether
+URLs are not auto-started.
 
 Queued event/finalization delivery currently uses internal bounded retries with short backoff and a
 bounded per-attempt timeout. Those values are intentionally internal for now; the public runtime
@@ -488,6 +498,10 @@ export NOET_PI_POLICY_MODE=enforce
 ```
 
 if you want the provider send aborted when Noether cannot be reached.
+
+If you are using the standard personal setup on `http://127.0.0.1:4051`, the extension now tries to
+start `noet local up` during `session_start` before any provider traffic, then applies
+`fail_open` or `fail_closed` normally if the sidecar still cannot be reached.
 
 ### Pi stalls before provider send
 

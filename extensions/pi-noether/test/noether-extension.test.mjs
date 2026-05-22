@@ -283,9 +283,141 @@ function deferred() {
 		const persisted = extension.extensionConfig({}, { cwd: configRoot });
 
 		assert.equal(defaults.failMode, "fail_open");
+		assert.equal(defaults.autoStartLocal, false);
 		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(persisted.autoStartLocal, true);
 	} finally {
 		await rm(configRoot, { recursive: true, force: true });
+	}
+}
+
+{
+	const config = extension.extensionConfig({
+		NOET_URL: "http://127.0.0.1:4051",
+		NOET_PI_LOCAL_BIN: "/repo/target/debug/noet",
+	}, { loadFiles: false });
+
+	assert.equal(config.autoStartLocal, true);
+	assert.equal(config.localBin, "/repo/target/debug/noet");
+}
+
+{
+	const calls = [];
+	let healthy = false;
+	let starts = 0;
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init?.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/health")) {
+			return new Response(healthy ? "ok" : "down", { status: healthy ? 200 : 503 });
+		}
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_boot",
+				outcome: "allow",
+				reservation: { id: "res_boot" },
+				explanations: [],
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				autoStartLocal: true,
+				localRoot,
+				localStartTimeoutMs: 1000,
+				startLocalNoether: async () => {
+					starts += 1;
+					healthy = true;
+					return process.pid;
+				},
+			},
+		);
+
+		await handlers.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext());
+
+		assert.equal(starts, 1);
+		assert.equal(calls.some((call) => call.url.endsWith("/health")), true);
+		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
+	}
+}
+
+{
+	const calls = [];
+	let healthy = false;
+	let starts = 0;
+	let stops = 0;
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-shutdown-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init?.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/health")) {
+			return new Response(healthy ? "ok" : "down", { status: healthy ? 200 : 503 });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlersA = new Map();
+		const handlersB = new Map();
+		const config = {
+			noetherUrl: "http://127.0.0.1:4051",
+			failMode: "fail_open",
+			includeBody: false,
+			version: "test",
+			autoStartLocal: true,
+			localRoot,
+			localStartTimeoutMs: 1000,
+			startLocalNoether: async () => {
+				starts += 1;
+				healthy = true;
+				return process.pid;
+			},
+			stopLocalNoether: async () => {
+				stops += 1;
+				healthy = false;
+			},
+		};
+
+		extension.default(
+			{ on(event, handler) { handlersA.set(event, handler); } },
+			config,
+		);
+		extension.default(
+			{ on(event, handler) { handlersB.set(event, handler); } },
+			config,
+		);
+
+		await handlersA.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+		await handlersB.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+		assert.equal(starts, 1);
+
+		await handlersA.get("session_shutdown")({ reason: "quit" }, fakeContext({ cwd: localRoot }));
+		assert.equal(stops, 0);
+
+		await handlersB.get("session_shutdown")({ reason: "quit" }, fakeContext({ cwd: localRoot }));
+		assert.equal(stops, 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
 	}
 }
 

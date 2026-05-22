@@ -1,5 +1,6 @@
 // @ts-ignore: Pi runs extensions in Node; this package intentionally avoids a local @types/node dependency.
-import { appendFile, mkdir } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, join } from "node:path";
@@ -7,12 +8,17 @@ import { basename, join } from "node:path";
 declare const process: {
 	env: Record<string, string | undefined>;
 	cwd: () => string;
+	pid: number;
+	kill: (pid: number, signal?: string | number) => boolean;
 };
 
 const DEFAULT_NOETHER_URL = "http://127.0.0.1:4040";
+const DEFAULT_LOCAL_NOETHER_URL = "http://127.0.0.1:4051";
 const EXTENSION_NAME = "noether-pi";
 const DEFAULT_FAIL_MODE = "fail_open";
 const DEFAULT_AUTHORIZE_TIMEOUT_MS = 1_000;
+const DEFAULT_LOCAL_START_TIMEOUT_MS = 3_000;
+const HEALTH_CACHE_TTL_MS = 5_000;
 const DEFAULT_QUEUE_MAX_ITEMS = 100;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 1_000;
 const DEFAULT_DELIVERY_MAX_ATTEMPTS = 3;
@@ -56,9 +62,15 @@ type NoetherConfig = {
 	includeBody: boolean;
 	version: string;
 	authorizeTimeoutMs: number;
+	autoStartLocal: boolean;
+	localBin?: string;
+	localRoot?: string;
+	localStartTimeoutMs: number;
 	queueMaxItems: number;
 	debugHooks: boolean;
 	debugHookLogDir?: string;
+	startLocalNoether?: (params: { cwd: string; bind: string; url: string }) => Promise<number>;
+	stopLocalNoether?: (params: { pid: number; cwd: string; bind: string; url: string }) => Promise<void>;
 };
 
 type SyntheticPopulationConfig = {
@@ -70,7 +82,7 @@ type SyntheticPopulationConfig = {
 	surfaces: string[];
 };
 
-type PersistedNoetherConfig = Partial<Omit<NoetherConfig, "synthetic">> & {
+type PersistedNoetherConfig = Partial<Omit<NoetherConfig, "synthetic" | "startLocalNoether" | "stopLocalNoether">> & {
 	synthetic?: Partial<SyntheticPopulationConfig>;
 };
 
@@ -151,6 +163,30 @@ type MutableAuthorizeRequest = ReturnType<typeof buildAuthorizeRequest> & {
 	metadata?: Record<string, unknown>;
 };
 
+type LocalSidecarOwner =
+	| {
+			state: "starting";
+			owner_pid: number;
+			cwd: string;
+			bind: string;
+			url: string;
+			started_at: string;
+	  }
+	| {
+			state: "running";
+			pid: number;
+			cwd: string;
+			bind: string;
+			url: string;
+			started_at: string;
+	  };
+
+type LocalSidecarLease = {
+	session_id: string;
+	client_pid: number;
+	acquired_at: string;
+};
+
 export function extensionConfig(
 	env: Record<string, string | undefined> = process.env,
 	options: { cwd?: string; loadFiles?: boolean } = {},
@@ -181,6 +217,15 @@ export function extensionConfig(
 		version: env.NOET_PI_EXTENSION_VERSION || fileConfig.version || "dev",
 		authorizeTimeoutMs:
 			positiveInteger(env.NOET_PI_AUTHORIZE_TIMEOUT_MS) || fileConfig.authorizeTimeoutMs || DEFAULT_AUTHORIZE_TIMEOUT_MS,
+		autoStartLocal:
+			booleanOverride(env.NOET_PI_AUTO_START_LOCAL, fileConfig.autoStartLocal) ??
+			stripTrailingSlash(env.NOET_URL || fileConfig.noetherUrl || DEFAULT_NOETHER_URL) === DEFAULT_LOCAL_NOETHER_URL,
+		localBin: emptyToUndefined(env.NOET_PI_LOCAL_BIN) || fileConfig.localBin,
+		localRoot: emptyToUndefined(env.NOET_PI_LOCAL_ROOT) || fileConfig.localRoot,
+		localStartTimeoutMs:
+			positiveInteger(env.NOET_PI_LOCAL_START_TIMEOUT_MS) ||
+			fileConfig.localStartTimeoutMs ||
+			DEFAULT_LOCAL_START_TIMEOUT_MS,
 		queueMaxItems: positiveInteger(env.NOET_PI_QUEUE_MAX_ITEMS) || fileConfig.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS,
 		debugHooks: env.NOET_PI_DEBUG_HOOKS === "raw" || fileConfig.debugHooks || false,
 		debugHookLogDir: emptyToUndefined(env.NOET_PI_DEBUG_HOOK_LOG_DIR) || fileConfig.debugHookLogDir,
@@ -213,6 +258,10 @@ function positiveInteger(value: string | undefined): number | undefined {
 	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function normalizeFailMode(value: unknown): FailMode | undefined {
 	return value === "fail_closed" || value === "fail_open" ? value : undefined;
 }
@@ -226,6 +275,54 @@ function parseEntities(value: string | undefined): string[] | undefined {
 		.map((entity) => entity.trim())
 		.filter((entity) => entity.length > 0);
 	return entities.length > 0 ? entities : undefined;
+}
+
+function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function localSidecarStateDir(root: string): string {
+	return join(root, ".noether", "pi-sidecar");
+}
+
+function localSidecarLeaseDir(root: string): string {
+	return join(localSidecarStateDir(root), "leases");
+}
+
+function localSidecarOwnerPath(root: string): string {
+	return join(localSidecarStateDir(root), "owner.json");
+}
+
+function localSidecarLeasePath(root: string, sessionId: string): string {
+	return join(localSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
+}
+
+function readLocalSidecarOwner(root: string): LocalSidecarOwner | undefined {
+	const path = localSidecarOwnerPath(root);
+	if (!existsSync(path)) {
+		return undefined;
+	}
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as LocalSidecarOwner;
+	} catch {
+		return undefined;
+	}
+}
+
+function readLocalSidecarLease(path: string): LocalSidecarLease | undefined {
+	if (!existsSync(path)) {
+		return undefined;
+	}
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as LocalSidecarLease;
+	} catch {
+		return undefined;
+	}
 }
 
 function normalizeSyntheticConfig(
@@ -742,6 +839,156 @@ async function authorize(
 			signal.removeEventListener("abort", abortFromParent);
 		}
 	}
+}
+
+function isDefaultLocalNoetherUrl(noetherUrl: string): boolean {
+	return stripTrailingSlash(noetherUrl) === DEFAULT_LOCAL_NOETHER_URL;
+}
+
+function localNoetherBindForUrl(noetherUrl: string): string | undefined {
+	try {
+		const url = new URL(noetherUrl);
+		if (url.protocol !== "http:") {
+			return undefined;
+		}
+		if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
+			return undefined;
+		}
+		return `${url.hostname}:${url.port || "80"}`;
+	} catch {
+		return undefined;
+	}
+}
+
+function localNoetherBinary(cwd: string, configured?: string): string {
+	if (configured) {
+		return configured;
+	}
+	const repoDebugBinary = join(cwd, "target/debug/noet");
+	if (existsSync(repoDebugBinary)) {
+		return repoDebugBinary;
+	}
+	return "noet";
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+	const controller = new AbortController();
+	const abortFromParent = () => controller.abort(signal?.reason);
+	if (signal) {
+		if (signal.aborted) {
+			controller.abort(signal.reason);
+		} else {
+			signal.addEventListener("abort", abortFromParent, { once: true });
+		}
+	}
+	const timeout = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
+	try {
+		return await fetch(url, { signal: controller.signal });
+	} finally {
+		clearTimeout(timeout);
+		if (signal) {
+			signal.removeEventListener("abort", abortFromParent);
+		}
+	}
+}
+
+async function noetherHealthcheck(noetherUrl: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+	try {
+		const response = await fetchWithTimeout(`${noetherUrl}/health`, timeoutMs, signal);
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+async function spawnLocalNoether(params: { cwd: string; bind: string; command: string }): Promise<number> {
+	return await new Promise<number>((resolve, reject) => {
+		const child = spawn(params.command, ["local", "up", "--root", params.cwd, "--bind", params.bind], {
+			cwd: params.cwd,
+			detached: true,
+			stdio: "ignore",
+			env: process.env,
+		});
+		child.once("error", reject);
+		child.once("spawn", () => {
+			child.unref();
+			if (!child.pid) {
+				reject(new Error("Noether local sidecar spawned without a pid"));
+				return;
+			}
+			resolve(child.pid);
+		});
+	});
+}
+
+async function stopLocalNoetherProcess(params: { pid: number }): Promise<void> {
+	try {
+		process.kill(params.pid, "SIGTERM");
+	} catch {
+		// Best-effort stop only.
+	}
+}
+
+async function ensureLocalSidecarLeaseDirs(root: string): Promise<void> {
+	await mkdir(localSidecarLeaseDir(root), { recursive: true });
+}
+
+async function writeLocalSidecarOwner(root: string, owner: LocalSidecarOwner): Promise<void> {
+	await mkdir(localSidecarStateDir(root), { recursive: true });
+	await writeFile(localSidecarOwnerPath(root), JSON.stringify(owner), "utf8");
+}
+
+async function tryWriteStartingLocalSidecarOwner(root: string, owner: LocalSidecarOwner): Promise<boolean> {
+	try {
+		await mkdir(localSidecarStateDir(root), { recursive: true });
+		await writeFile(localSidecarOwnerPath(root), JSON.stringify(owner), { encoding: "utf8", flag: "wx" });
+		return true;
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+			return false;
+		}
+		throw error;
+	}
+}
+
+async function clearLocalSidecarOwner(root: string): Promise<void> {
+	await rm(localSidecarOwnerPath(root), { force: true });
+}
+
+async function listActiveLocalSidecarLeases(root: string): Promise<string[]> {
+	await ensureLocalSidecarLeaseDirs(root);
+	const entries = await readdir(localSidecarLeaseDir(root)).catch(() => [] as string[]);
+	const active: string[] = [];
+	for (const entry of entries) {
+		const path = join(localSidecarLeaseDir(root), entry);
+		const lease = readLocalSidecarLease(path);
+		if (!lease || !processExists(lease.client_pid)) {
+			await rm(path, { force: true });
+			continue;
+		}
+		active.push(path);
+	}
+	return active;
+}
+
+async function acquireLocalSidecarLease(root: string, sessionId: string): Promise<string> {
+	await ensureLocalSidecarLeaseDirs(root);
+	const path = localSidecarLeasePath(root, sessionId);
+	await writeFile(
+		path,
+		JSON.stringify({
+			session_id: sessionId,
+			client_pid: process.pid,
+			acquired_at: new Date().toISOString(),
+		} satisfies LocalSidecarLease),
+		"utf8",
+	);
+	return path;
+}
+
+async function releaseLocalSidecarLease(root: string, sessionId: string): Promise<number> {
+	await rm(localSidecarLeasePath(root, sessionId), { force: true });
+	return (await listActiveLocalSidecarLeases(root)).length;
 }
 
 function normalizeDecisionAction(value: unknown): DecisionAction | undefined {
@@ -1370,6 +1617,8 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		...config,
 		failMode: normalizeFailMode(config.failMode) || DEFAULT_FAIL_MODE,
 		authorizeTimeoutMs: config.authorizeTimeoutMs || DEFAULT_AUTHORIZE_TIMEOUT_MS,
+		autoStartLocal: config.autoStartLocal ?? isDefaultLocalNoetherUrl(config.noetherUrl),
+		localStartTimeoutMs: config.localStartTimeoutMs || DEFAULT_LOCAL_START_TIMEOUT_MS,
 		queueMaxItems: config.queueMaxItems || DEFAULT_QUEUE_MAX_ITEMS,
 		debugHooks: config.debugHooks || false,
 	};
@@ -1378,6 +1627,9 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	let agentRunId = makeTraceId();
 	let latestProviderCall: ActiveRequest | undefined;
 	let pendingAgentContext: Record<string, unknown> | undefined;
+	let lastHealthyAt = 0;
+	let localStartInFlight: Promise<void> | undefined;
+	let localLeaseRoot: string | undefined;
 	const completedReservations = new Set<string>();
 	const toolStartedAt = new Map<string, number>();
 	const providerCallsById = new Map<string, ActiveRequest>();
@@ -1490,14 +1742,133 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		return { status: "unmatched" };
 	}
 
+	async function ensureNoetherReady(ctx: ExtensionContext): Promise<void> {
+		if (!config.autoStartLocal || !isDefaultLocalNoetherUrl(config.noetherUrl)) {
+			return;
+		}
+		const cwd = config.localRoot || ctx.cwd || process.cwd();
+		const bind = localNoetherBindForUrl(config.noetherUrl);
+		if (!bind) {
+			throw new Error(`unsupported local Noether URL ${config.noetherUrl}`);
+		}
+		const now = Date.now();
+		if (now - lastHealthyAt < HEALTH_CACHE_TTL_MS) {
+			return;
+		}
+		const healthTimeoutMs = Math.min(config.authorizeTimeoutMs, 250);
+		if (await noetherHealthcheck(config.noetherUrl, healthTimeoutMs, ctx.signal)) {
+			lastHealthyAt = Date.now();
+			return;
+		}
+		if (!localStartInFlight) {
+			localStartInFlight = (async () => {
+				const deadline = Date.now() + config.localStartTimeoutMs;
+				while (Date.now() < deadline) {
+					const owner = readLocalSidecarOwner(cwd);
+					if (owner?.state === "running" && !processExists(owner.pid)) {
+						await clearLocalSidecarOwner(cwd);
+						continue;
+					}
+					if (owner?.state === "starting" && !processExists(owner.owner_pid)) {
+						await clearLocalSidecarOwner(cwd);
+						continue;
+					}
+					if (await noetherHealthcheck(config.noetherUrl, healthTimeoutMs, ctx.signal)) {
+						lastHealthyAt = Date.now();
+						return;
+					}
+					if (!owner) {
+						const claimed = await tryWriteStartingLocalSidecarOwner(cwd, {
+							state: "starting",
+							owner_pid: process.pid,
+							cwd,
+							bind,
+							url: config.noetherUrl,
+							started_at: new Date().toISOString(),
+						});
+						if (claimed) {
+							try {
+								const sidecarPid = config.startLocalNoether
+									? await config.startLocalNoether({ cwd, bind, url: config.noetherUrl })
+									: await spawnLocalNoether({ cwd, bind, command: localNoetherBinary(cwd, config.localBin) });
+								await writeLocalSidecarOwner(cwd, {
+									state: "running",
+									pid: sidecarPid,
+									cwd,
+									bind,
+									url: config.noetherUrl,
+									started_at: new Date().toISOString(),
+								});
+							} catch (error) {
+								await clearLocalSidecarOwner(cwd);
+								throw error;
+							}
+						}
+					}
+					await sleep(50);
+				}
+				throw new Error(`Noether local sidecar did not become healthy within ${config.localStartTimeoutMs}ms`);
+			})().finally(() => {
+				localStartInFlight = undefined;
+			});
+		}
+		await localStartInFlight;
+	}
+
+	async function ensureNoetherSession(ctx: ExtensionContext): Promise<void> {
+		await ensureNoetherReady(ctx);
+		if (!config.autoStartLocal || !isDefaultLocalNoetherUrl(config.noetherUrl)) {
+			return;
+		}
+		localLeaseRoot = config.localRoot || ctx.cwd || process.cwd();
+		await acquireLocalSidecarLease(localLeaseRoot, sessionId);
+	}
+
+	async function releaseNoetherSession(): Promise<void> {
+		if (!localLeaseRoot) {
+			return;
+		}
+		const leaseRoot = localLeaseRoot;
+		localLeaseRoot = undefined;
+		const remainingLeases = await releaseLocalSidecarLease(leaseRoot, sessionId);
+		if (remainingLeases > 0) {
+			return;
+		}
+		const owner = readLocalSidecarOwner(leaseRoot);
+		if (owner?.state !== "running" || !processExists(owner.pid)) {
+			await clearLocalSidecarOwner(leaseRoot);
+			return;
+		}
+		const bind = localNoetherBindForUrl(config.noetherUrl);
+		if (!bind) {
+			return;
+		}
+		if (config.stopLocalNoether) {
+			await config.stopLocalNoether({
+				pid: owner.pid,
+				cwd: owner.cwd,
+				bind,
+				url: config.noetherUrl,
+			});
+		} else {
+			await stopLocalNoetherProcess({ pid: owner.pid });
+		}
+		await clearLocalSidecarOwner(leaseRoot);
+	}
+
 	pi.on("before_agent_start", (event) => {
 		agentRunId = makeTraceId();
 		pendingAgentContext = summarizeAgentContext(event);
 	});
 
-	pi.on("session_start", () => {
+	pi.on("session_start", async (_event, ctx) => {
 		traceId = makeTraceId();
 		agentRunId = makeTraceId();
+		await ensureNoetherSession(ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		await releaseNoetherSession();
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
@@ -1536,6 +1907,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		rememberProviderCall(span);
 
 		try {
+			await ensureNoetherReady(ctx);
 			const decision = await authorize(config.noetherUrl, request, config.authorizeTimeoutMs, ctx.signal);
 			span.decisionId = decision.decision_id;
 			span.reservationId = decision.reservation?.id;

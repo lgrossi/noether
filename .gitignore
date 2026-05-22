@@ -1,4 +1,5 @@
 /target
 .noet/
+.noether/
 /**/node_modules
 /test-results
