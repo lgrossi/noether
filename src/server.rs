@@ -2625,6 +2625,14 @@ mod tests {
         assert!(js.contains("/v1/dashboard/filters"));
         assert!(js.contains("/v1/dashboard/overview"));
         assert!(js.contains("/v1/dashboard/strategy-lab"));
+        assert!(js.contains("closeTraceDrawerIfUnfocused"));
+        assert!(js.contains("closeTraceSpansDrawerIfUnfocused"));
+        assert!(js.contains("data-trace-drawer"));
+        assert!(js.contains("data-trace-spans-drawer"));
+        assert!(js.contains("trace-request-main-pane"));
+        assert!(js.contains("traceSpanCardTimeline"));
+        assert!(js.contains("rememberTraceSpansScroll"));
+        assert!(js.contains("data-trace-spans-body"));
         assert!(!js.contains("<html"));
 
         let css_response = app
@@ -2645,6 +2653,11 @@ mod tests {
         assert!(css.contains(".metric-grid"));
         assert!(css.contains(".trace-layout"));
         assert!(css.contains(".trace-lane-rail"));
+        assert!(css.contains(".trace-drawer-shell"));
+        assert!(css.contains(".trace-drawer-backdrop"));
+        assert!(css.contains(".trace-spans-drawer-shell"));
+        assert!(css.contains(".trace-spans-drawer-backdrop"));
+        assert!(css.contains(".trace-span-card"));
         assert!(css.contains(".tradeoff-grid"));
 
         let icon_response = app

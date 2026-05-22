@@ -14,6 +14,7 @@ const state = {
   selectedStrategy: "",
   selectedTraceSpan: "",
   traceRequestScrollTop: 0,
+  traceSpansScrollTop: 0,
   traceLoading: false,
   strategyObjective: "balanced",
   budgetSort: "pressure",
@@ -1206,7 +1207,9 @@ function hydrateTraceRequestList(traces) {
     windowEl.querySelectorAll("[data-trace-id]").forEach((button) => {
       button.addEventListener("click", () => {
         const next = button.dataset.traceId || "";
+        if (state.filters.trace !== next) state.traceSpansScrollTop = 0;
         state.filters.trace = state.filters.trace === next ? "" : next;
+        if (!state.filters.trace) state.traceSpansScrollTop = 0;
         state.selectedTraceSpan = "";
         state.traceLoading = Boolean(state.filters.trace);
         renderTraces(cache.traces);
@@ -1582,6 +1585,48 @@ function traceSpanTimeline(traceData) {
   `;
 }
 
+function traceSpanCardTimeline(traceData) {
+  if (!traceData.events.length) return emptyState("No correlated trace events are available.");
+  const selectedSpan = activeTraceSpan(traceData);
+  const rows = [];
+  let previousCategory = "";
+  for (const event of traceData.events) {
+    if (event.category !== previousCategory) {
+      rows.push(`
+        <div class="trace-span-group">
+          <span>${escapeHtml(traceSpanGroupLabel(event))}</span>
+        </div>
+      `);
+      previousCategory = event.category;
+    }
+    const meta = [
+      traceSpanKind(event) || traceSpanSubline(event),
+      traceSpanDuration(event),
+      traceSpanUsage(event),
+    ].filter(Boolean).join(" · ");
+    rows.push(`
+      <button class="trace-span-card ${event.tone} ${selectedSpan?.index === event.index ? "active" : ""}" type="button" data-trace-span="${escapeHtml(String(event.index))}">
+        <span class="trace-span-card-time">
+          <strong>${escapeHtml(`+${durationLabel(event.offsetMs)}`)}</strong>
+          <small>${escapeHtml(shortDate(event.occurred_at))}</small>
+        </span>
+        <span class="trace-span-card-main">
+          <span class="trace-span-order">${number(event.index)}</span>
+          <strong>${escapeHtml(event.title)}</strong>
+        </span>
+        <span class="trace-span-card-status ${event.tone}"><span class="trace-status-dot ${event.tone}"></span>${escapeHtml(traceSpanStatus(event))}</span>
+        <span class="trace-span-card-meta">${escapeHtml(meta || "No metadata")}</span>
+        <span class="trace-span-card-waterfall">${traceSpanWaterfall(traceData, event)}</span>
+      </button>
+    `);
+  }
+  return `
+    <div class="trace-span-card-list">
+      ${rows.join("")}
+    </div>
+  `;
+}
+
 function traceSpanInspector(data, traceData) {
   const span = activeTraceSpan(traceData);
   if (!span) return "";
@@ -1639,8 +1684,40 @@ function traceDrawer(data, traceData) {
   return `
     <div class="trace-drawer-shell" data-trace-drawer>
       <button class="trace-drawer-backdrop" type="button" data-trace-span-close aria-label="Close span drawer"></button>
-      <aside class="trace-drawer">
+      <aside class="trace-drawer" tabindex="-1" aria-label="Trace span inspector">
         ${traceSpanInspector(data, traceData)}
+      </aside>
+    </div>
+  `;
+}
+
+function traceSpansDrawer(data, traceData, contextTone, hasSelectedTrace) {
+  if (!hasSelectedTrace) return "";
+  const selected = (data.traces || []).find((trace) => trace.trace_id === state.filters.trace) || {};
+  return `
+    <div class="trace-spans-drawer-shell" data-trace-spans-drawer>
+      <button class="trace-spans-drawer-backdrop" type="button" data-trace-detail-close aria-label="Close trace spans"></button>
+      <aside class="trace-spans-drawer trace-detail-pane ${contextTone}" tabindex="-1" aria-label="Trace spans">
+        <div class="trace-spans-drawer-head">
+          <div>
+            <div class="page-overline">Selected request</div>
+            <h3 class="rail-title" title="${escapeHtml(state.filters.trace)}">${escapeHtml(state.filters.trace)}</h3>
+            <div class="trace-detail-subline">${number(selected.decisions || 0)} decisions · ${number(selected.tool_events || 0)} tools · ${money(selected.spend_usd || 0)}</div>
+          </div>
+          <button class="trace-close-button" type="button" data-trace-detail-close aria-label="Close trace spans">×</button>
+        </div>
+        <div class="trace-spans-drawer-body" data-trace-spans-body>
+          ${state.traceLoading ? `
+            <div class="trace-loading-state">Loading ${escapeHtml(state.filters.trace)}…</div>
+          ` : `
+            <div class="trace-spans-summary">${traceSnapshot(data, traceData)}</div>
+            <div class="trace-spans-intro">
+              <span>${number(traceData.events.length)} spans</span>
+              <p>Ordered events inside the selected request. Click any span to open its inspector.</p>
+            </div>
+            <div class="trace-spans-table">${traceSpanCardTimeline(traceData)}</div>
+          `}
+        </div>
       </aside>
     </div>
   `;
@@ -1718,11 +1795,18 @@ function traceCategoryBreakdown(traceData) {
   `;
 }
 
+function rememberTraceSpansScroll() {
+  const body = document.querySelector("[data-trace-spans-body]");
+  if (body) state.traceSpansScrollTop = body.scrollTop;
+}
+
 function renderTraces(data) {
+  rememberTraceSpansScroll();
   cache.traces = data;
-  state.traceLoading = false;
   const hasSelectedTrace = Boolean(state.filters.trace);
-  const traceData = hasSelectedTrace ? inspectTrace(data.timeline || []) : inspectTrace([]);
+  const hasLoadedSelectedTrace = hasSelectedTrace && data.selected_trace_id === state.filters.trace;
+  state.traceLoading = hasSelectedTrace && !hasLoadedSelectedTrace;
+  const traceData = hasLoadedSelectedTrace ? inspectTrace(data.timeline || []) : inspectTrace([]);
   const selectedSpan = activeTraceSpan(traceData);
   const contextTone = traceContextTone(traceData);
   setChromePills({
@@ -1740,30 +1824,26 @@ function renderTraces(data) {
         </div>
       </div>
       <section class="trace-explorer-shell">
-        <aside class="trace-request-pane">
+        <section class="trace-request-main-pane">
           <div class="trace-pane-head">
             <h3 class="rail-title">Requests</h3>
-            <div class="panel-note">Each row is one full request. Pick one to inspect its spans.</div>
+            <div class="panel-note">Each row is one trace root. Click a request to open its spans.</div>
           </div>
           ${traceRequestList(data.traces || [])}
-        </aside>
-        <section class="trace-detail-pane ${contextTone}">
-          ${state.traceLoading && hasSelectedTrace ? `
-            <div class="trace-loading-state">Loading ${escapeHtml(state.filters.trace)}…</div>
-          ` : hasSelectedTrace ? `
-            ${traceSnapshot(data, traceData)}
-            <div class="trace-pane-head">
-              <h3 class="rail-title">Spans</h3>
-              <div class="panel-note">Ordered spans inside the selected request. Click a span to open the inspector.</div>
-            </div>
-            ${traceSpanTimeline(traceData)}
-          ` : `<div class="trace-empty-state">Pick a request from the left to inspect its spans.</div>`}
         </section>
       </section>
+      ${traceSpansDrawer(data, traceData, contextTone, hasSelectedTrace)}
       ${traceDrawer(data, traceData)}
     </div>
   `;
   hydrateTraceRequestList(data.traces || []);
+  const spansBody = document.querySelector("[data-trace-spans-body]");
+  if (spansBody) {
+    spansBody.scrollTop = Math.min(state.traceSpansScrollTop, Math.max(spansBody.scrollHeight - spansBody.clientHeight, 0));
+    spansBody.addEventListener("scroll", () => {
+      state.traceSpansScrollTop = spansBody.scrollTop;
+    }, { passive: true });
+  }
   document.querySelectorAll("[data-trace-span]").forEach((button) => {
     button.addEventListener("click", () => {
       const next = button.dataset.traceSpan || "";
@@ -1777,12 +1857,54 @@ function renderTraces(data) {
       renderTraces(cache.traces);
     });
   });
+  document.querySelectorAll("[data-trace-detail-close]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.filters.trace = "";
+      state.selectedTraceSpan = "";
+      state.traceSpansScrollTop = 0;
+      renderTraces(cache.traces);
+    });
+  });
   document.querySelectorAll("[data-trace-span-close]").forEach((button) => {
     button.addEventListener("click", () => {
       state.selectedTraceSpan = "";
       renderTraces(cache.traces);
     });
   });
+  const drawer = document.querySelector("[data-trace-drawer] .trace-drawer");
+  if (drawer) drawer.focus({ preventScroll: true });
+  const spansDrawer = document.querySelector("[data-trace-spans-drawer] .trace-spans-drawer");
+  if (spansDrawer) spansDrawer.focus({ preventScroll: true });
+}
+
+function traceDrawerContainsTarget(target) {
+  if (!target || typeof target.closest !== "function") return false;
+  return Boolean(target.closest("[data-trace-drawer]") || target.closest("[data-trace-span]"));
+}
+
+function closeTraceDrawerIfUnfocused(target) {
+  if (state.page !== "traces" || !state.selectedTraceSpan) return;
+  if (traceDrawerContainsTarget(target)) return;
+  state.selectedTraceSpan = "";
+  if (cache.traces) renderTraces(cache.traces);
+}
+
+function traceSpansDrawerContainsTarget(target) {
+  if (!target || typeof target.closest !== "function") return false;
+  return Boolean(
+    target.closest("[data-trace-spans-drawer]")
+      || target.closest("[data-trace-drawer]")
+      || target.closest("[data-trace-id]")
+  );
+}
+
+function closeTraceSpansDrawerIfUnfocused(target) {
+  if (state.page !== "traces" || !state.filters.trace) return;
+  if (traceSpansDrawerContainsTarget(target)) return;
+  state.filters.trace = "";
+  state.selectedTraceSpan = "";
+  state.traceSpansScrollTop = 0;
+  if (cache.traces) renderTraces(cache.traces);
 }
 
 function normalize(value, values) {
@@ -2183,6 +2305,7 @@ function wireControls() {
     state.filters.entity = "";
     state.filters.trace = "";
     state.selectedTraceSpan = "";
+    state.traceSpansScrollTop = 0;
     state.selectedAdoption = "";
     state.selectedBudget = "";
     loadCurrentPage();
@@ -2192,6 +2315,7 @@ function wireControls() {
     state.filters.entity = event.target.value || "";
     state.filters.trace = "";
     state.selectedTraceSpan = "";
+    state.traceSpansScrollTop = 0;
     state.selectedAdoption = "";
     state.selectedBudget = "";
     loadCurrentPage();
@@ -2200,6 +2324,7 @@ function wireControls() {
   el("dashboard-trace-select").addEventListener("change", (event) => {
     state.filters.trace = event.target.value || "";
     state.selectedTraceSpan = "";
+    state.traceSpansScrollTop = 0;
     loadCurrentPage();
   });
 
@@ -2220,9 +2345,21 @@ function wireControls() {
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
-    if (state.page !== "traces" || !state.selectedTraceSpan) return;
+    if (state.page !== "traces" || (!state.selectedTraceSpan && !state.filters.trace)) return;
     state.selectedTraceSpan = "";
+    state.filters.trace = "";
+    state.traceSpansScrollTop = 0;
     if (cache.traces) renderTraces(cache.traces);
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    closeTraceSpansDrawerIfUnfocused(event.target);
+    closeTraceDrawerIfUnfocused(event.target);
+  });
+
+  document.addEventListener("focusin", (event) => {
+    closeTraceSpansDrawerIfUnfocused(event.target);
+    closeTraceDrawerIfUnfocused(event.target);
   });
 }
 

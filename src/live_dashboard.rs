@@ -25,7 +25,7 @@ pub fn dashboard_shell(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Noether dashboard</title>
     <link rel="icon" type="image/svg+xml" href="/dashboard/brand/icon.svg">
-    <link rel="stylesheet" href="/dashboard/app.css">
+    <link rel="stylesheet" href="/dashboard/app.css?v=trace-span-scroll">
   </head>
   <body>
     <div class="app" id="dashboard-app-shell">
@@ -124,7 +124,7 @@ pub fn dashboard_shell(
     </div>
 
     <script>window.NOETHER_DASHBOARD_BOOTSTRAP = {bootstrap};</script>
-    <script src="/dashboard/app.js"></script>
+    <script src="/dashboard/app.js?v=trace-span-scroll"></script>
   </body>
 </html>"###,
         bootstrap = bootstrap,
