@@ -65,8 +65,8 @@ strategies:
                   kind: first_seen
                 max_usd: 250
                 action: block
-          eligible:
-            entities: [team:platform]
+          match:
+            team: platform
         - id: team-product
           limits:
             spend:
@@ -77,8 +77,8 @@ strategies:
                   kind: first_seen
                 max_usd: 350
                 action: block
-          eligible:
-            entities: [team:product]
+          match:
+            team: product
   - id: protected-adoption
     description: Product team keeps a protected adoption pool for individual users.
     policy:
@@ -94,8 +94,8 @@ strategies:
                   kind: first_seen
                 max_usd: 250
                 action: block
-          eligible:
-            entities: [team:platform]
+          match:
+            team: platform
         - id: product-adoption
           limits:
             spend:
@@ -106,8 +106,8 @@ strategies:
                   kind: first_seen
                 max_usd: 350
                 action: block
-          eligible:
-            entities: [team:product]
+          match:
+            team: product
           allocation:
             standard: protected_adoption_pool
             by: user

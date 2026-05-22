@@ -76,8 +76,8 @@ strategies:
                   kind: first_seen
                 max_usd: 4
                 action: block
-          eligible:
-            entities: [team:eng]
+          match:
+            team: eng
   - id: protected adoption
     description: Protected per-user budget surfaces low adopters and preserves explicit opportunity.
     policy:
@@ -93,8 +93,8 @@ strategies:
                   kind: first_seen
                 max_usd: 4
                 action: block
-          eligible:
-            entities: [team:eng]
+          match:
+            team: eng
           allocation:
             standard: protected_adoption_pool
             by: user

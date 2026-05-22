@@ -3846,8 +3846,8 @@ policy:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
 entities: [project:noether, user:alice]
 requests:
   - id: req-1
@@ -3971,8 +3971,8 @@ policy:
   version: 0
   budgets:
     - id: project-noether
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
       limits:
         spend:
           - id: budget-cap
@@ -4072,8 +4072,8 @@ policy:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
 requests:
   - id: req-1
     authorize:
@@ -4136,8 +4136,8 @@ policy:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
     - id: team-budget
       limits:
         spend:
@@ -4148,11 +4148,11 @@ policy:
               kind: first_seen
             max_usd: 20
             action: block
-      eligible:
-        entities: [team:eng]
+      match:
+        team: eng
     - id: limit-budget
-      eligible:
-        entities: [project:guarded]
+      match:
+        project: guarded
       limits:
         spend:
           - id: budget-cap
@@ -4297,8 +4297,8 @@ policy:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
 requests:
   - id: req/1
     authorize:

@@ -346,8 +346,8 @@ policy:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
 requests:
   - id: req-1
     authorize:

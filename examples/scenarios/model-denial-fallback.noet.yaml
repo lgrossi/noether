@@ -7,14 +7,15 @@ policy:
       limits:
         spend:
           - id: budget-cap
+            by: project
             window: 30d
             mode: tumbling
             anchor:
               kind: first_seen
             max_usd: 10
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
       models:
         allow:
           - anthropic:claude-sonnet-*
@@ -22,14 +23,15 @@ policy:
       limits:
         spend:
           - id: budget-cap
+            by: project
             window: 30d
             mode: tumbling
             anchor:
               kind: first_seen
             max_usd: 25
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
       models:
         allow:
           - openai:*

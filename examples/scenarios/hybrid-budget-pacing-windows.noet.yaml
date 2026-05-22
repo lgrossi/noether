@@ -4,11 +4,11 @@ policy:
   version: 0
   budgets:
     - id: personal-primary
-      eligible:
-        entities: [project:noether]
+      match: {}
       limits:
         spend:
           - id: budget-cap
+            by: global
             window: 30d
             mode: tumbling
             anchor:
@@ -17,6 +17,7 @@ policy:
             warn_at_fraction: 0.8
             action: block
           - id: daily-cap
+            by: user
             window: 1d
             mode: tumbling
             anchor:
@@ -24,6 +25,7 @@ policy:
             max_usd: 100
             action: block
           - id: burst-5h
+            by: user
             window: 5h
             mode: rolling
             max_usd: 40

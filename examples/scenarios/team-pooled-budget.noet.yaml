@@ -7,14 +7,15 @@ policy:
       limits:
         spend:
           - id: budget-cap
+            by: team
             window: 30d
             mode: tumbling
             anchor:
               kind: first_seen
             max_usd: 100
             action: block
-      eligible:
-        entities: [team:platform]
+      match:
+        team: platform
 entities: [team:platform]
 requests:
   - id: req-1

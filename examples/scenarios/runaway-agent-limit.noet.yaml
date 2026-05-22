@@ -4,11 +4,12 @@ policy:
   version: 0
   budgets:
     - id: runaway-budget
-      eligible:
-        entities: [project:runaway]
+      match:
+        project: runaway
       limits:
         spend:
           - id: budget-cap
+            by: project
             window: 30d
             mode: tumbling
             anchor:

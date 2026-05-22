@@ -6,7 +6,7 @@ use tokio::fs;
 
 use crate::contract::{
     AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionSeverity, PolicyAction, PolicyRule,
-    RuleMatch, SpendWindowLimit, SpendWindowMode,
+    RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode,
 };
 use crate::error::NoetError;
 
@@ -71,14 +71,7 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 budget.id
             ));
         }
-        for entity in &budget.eligible.entities {
-            if entity.trim().is_empty() {
-                errors.push(format!(
-                    "budget {} eligible.entities must not contain empty values",
-                    budget.id
-                ));
-            }
-        }
+        validate_rule_match(&format!("budget {}", budget.id), &budget.rule_match, &mut errors);
         for pattern in &budget.models.allow {
             if pattern.trim().is_empty() {
                 errors.push(format!(
@@ -122,6 +115,9 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                     "budget {} limits.spend.window must use <number><s|m|h|d>, got {}",
                     budget.id, limit.window
                 ));
+            }
+            if matches!(limit.by, SpendWindowBy::User) && budget.allocation.is_some() {
+                // allowed; protected adoption and spend scoping can both be user-based
             }
             if !limit.max_usd.is_finite() || limit.max_usd <= 0.0 {
                 errors.push(format!(
@@ -302,14 +298,6 @@ pub fn budget_rule_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> boo
 }
 
 pub fn budget_scope_matches(rule: &BudgetRule, request: &AuthorizeRequest) -> bool {
-    if !rule.eligible.entities.is_empty() {
-        return rule
-            .eligible
-            .entities
-            .iter()
-            .any(|eligible_entity| request_matches_entity(request, eligible_entity));
-    }
-
     rule_match_matches(&rule.rule_match, request)
 }
 
@@ -333,10 +321,26 @@ pub fn budget_model_allowed(rule: &BudgetRule, request: &AuthorizeRequest) -> bo
 }
 
 pub fn rule_match_matches(rule_match: &RuleMatch, request: &AuthorizeRequest) -> bool {
-    matches_optional(&rule_match.subject, &request.subject)
-        && matches_optional(&rule_match.project, &request.project)
+    let base_match = matches_optional(&rule_match.subject, &request.subject)
+        && matches_user_optional(&rule_match.user, request)
+        && matches_project_optional(&rule_match.project, request)
+        && matches_entity_kind_optional(request, "team", &rule_match.team)
+        && matches_entity_kind_optional(request, "group", &rule_match.group)
+        && matches_entity_kind_optional(request, "org", &rule_match.org)
+        && matches_entity_kind_optional(request, "workflow", &rule_match.workflow)
+        && matches_entity_kind_optional(request, "surface", &rule_match.surface)
         && matches_optional(&rule_match.provider, &request.provider)
-        && matches_optional(&rule_match.model, &request.model)
+        && matches_optional(&rule_match.model, &request.model);
+    let any_match = rule_match.any.is_empty()
+        || rule_match
+            .any
+            .iter()
+            .any(|nested| rule_match_matches(nested, request));
+    let not_match = rule_match
+        .not
+        .as_deref()
+        .is_none_or(|nested| !rule_match_matches(nested, request));
+    base_match && any_match && not_match
 }
 
 fn model_pattern_matches(pattern: &str, provider_model: &str) -> bool {
@@ -402,6 +406,69 @@ fn matches_optional(expected: &Option<String>, actual: &Option<String>) -> bool 
             .as_ref()
             .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
     })
+}
+
+fn matches_user_optional(expected: &Option<String>, request: &AuthorizeRequest) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return true;
+    };
+    request_matches_entity(request, &format!("user:{expected}"))
+        || request.subject.as_deref().is_some_and(|subject| {
+            subject.eq_ignore_ascii_case(expected)
+                || subject.eq_ignore_ascii_case(&format!("user:{expected}"))
+        })
+}
+
+fn matches_project_optional(expected: &Option<String>, request: &AuthorizeRequest) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return true;
+    };
+    request_matches_entity(request, &format!("project:{expected}"))
+        || request
+            .project
+            .as_deref()
+            .is_some_and(|project| project.eq_ignore_ascii_case(expected))
+}
+
+fn matches_entity_kind_optional(
+    request: &AuthorizeRequest,
+    kind: &str,
+    expected: &Option<String>,
+) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return true;
+    };
+    request_matches_entity(request, &format!("{kind}:{expected}"))
+}
+
+fn validate_rule_match(prefix: &str, rule_match: &RuleMatch, errors: &mut Vec<String>) {
+    for (label, value) in [
+        ("subject", rule_match.subject.as_deref()),
+        ("user", rule_match.user.as_deref()),
+        ("project", rule_match.project.as_deref()),
+        ("team", rule_match.team.as_deref()),
+        ("group", rule_match.group.as_deref()),
+        ("org", rule_match.org.as_deref()),
+        ("workflow", rule_match.workflow.as_deref()),
+        ("surface", rule_match.surface.as_deref()),
+        ("provider", rule_match.provider.as_deref()),
+        ("model", rule_match.model.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            errors.push(format!("{prefix} {label} must not be empty"));
+        }
+    }
+    if rule_match.subject.is_some() && rule_match.user.is_some() {
+        errors.push(format!(
+            "{prefix} match.subject and match.user cannot both be set"
+        ));
+    }
+    for (index, nested) in rule_match.any.iter().enumerate() {
+        validate_rule_match(&format!("{prefix} match.any[{index}]"), nested, errors);
+    }
+    if let Some(nested) = rule_match.not.as_deref() {
+        validate_rule_match(&format!("{prefix} match.not"), nested, errors);
+    }
 }
 
 fn default_routing_mode() -> String {
@@ -672,8 +739,8 @@ budgets:
 version: 0
 budgets:
   - id: ai-adoption
-    eligible:
-      entities: [org:example]
+    match:
+      org: example
     limits:
       spend:
         - id: monthly-cap
@@ -777,8 +844,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
   - id: user-budget
     limits:
       spend:
@@ -789,8 +856,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [user:alice]
+    match:
+      user: alice
   - id: team-budget
     limits:
       spend:
@@ -801,8 +868,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [team:core]
+    match:
+      team: core
   - id: org-budget
     limits:
       spend:
@@ -813,8 +880,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [org:example]
+    match:
+      org: example
   - id: global-budget
     limits:
       spend:
@@ -825,8 +892,6 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [global]
 "#,
         )
         .expect("policy parses");
@@ -858,8 +923,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
   - id: subject-budget
     limits:
       spend:
@@ -870,8 +935,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [user:alice]
+    match:
+      user: alice
 "#,
         )
         .expect("policy parses");
@@ -931,8 +996,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow:
         - openai:gpt-4.1
@@ -972,8 +1037,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
 "#,
         )
         .expect("policy parses");
@@ -1000,8 +1065,8 @@ budgets:
             kind: first_seen
           max_usd: 1.0
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow: [openai:gpt-4.1]
 "#,

@@ -52,8 +52,8 @@ strategies:
                   kind: first_seen
                 max_usd: 12
                 action: block
-          eligible:
-            entities: [team:eng]
+          match:
+            team: eng
   - id: limited team budget
     description: A short spend window denies bursty runaway requests before they consume the month.
     policy:
@@ -74,5 +74,5 @@ strategies:
                 mode: rolling
                 max_usd: 1.2
                 action: block
-          eligible:
-            entities: [team:eng]
+          match:
+            team: eng

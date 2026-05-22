@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
     DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction, Reservation,
-    ReservationStatus, RuleMatch, SpendWindowLimit, SpendWindowMode, ToolEvent, TraceEvent,
-    UsageObservation,
+    ReservationStatus, RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode, ToolEvent,
+    TraceEvent, UsageObservation,
 };
 use crate::error::NoetError;
 use crate::policy::{
@@ -88,7 +88,7 @@ struct SpendWindowProjection {
     projected_spend_usd: f64,
     max_usd: f64,
     warn_at_fraction: f64,
-    scope_entity: Option<String>,
+    scope_key: String,
     window_seconds: Duration,
 }
 
@@ -737,7 +737,6 @@ impl BudgetLedger {
             self,
             rule,
             request,
-            candidate.matched_entity.as_deref(),
             estimated_cost,
             now,
             action,
@@ -829,8 +828,7 @@ impl BudgetLedger {
         let estimated_cost = request.estimated_cost();
         let (matched_entity, specificity_rank) =
             matched_entity_and_rank(rule, request, &specificity_order(policy));
-        let projections =
-            spend_window_projections(self, rule, matched_entity.as_deref(), estimated_cost, now);
+        let projections = spend_window_projections(self, rule, request, estimated_cost, now).ok()?;
         Some(BudgetCandidate {
             id: rule.id.clone(),
             matched_entity,
@@ -855,19 +853,15 @@ impl BudgetLedger {
         now: DateTime<Utc>,
     ) -> String {
         if !budget_scope_matches(rule, request) {
-            return "requested budget is not eligible for request entities".to_owned();
+            return "requested budget does not match the request".to_owned();
         }
         if !budget_model_allowed(rule, request) {
             return "requested provider/model is not allowed by requested budget".to_owned();
         }
-        let matched_entity = matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
-        if let Some(hit) = spend_window_projections(
-            self,
-            rule,
-            matched_entity.as_deref(),
-            request.estimated_cost(),
-            now,
-        )
+        if let Some(hit) = spend_window_projections(self, rule, request, request.estimated_cost(), now)
+        .ok()
+        .into_iter()
+        .flatten()
         .into_iter()
         .filter(|projection| {
             projection.projected_spend_usd > projection.max_usd
@@ -879,6 +873,9 @@ impl BudgetLedger {
         .map(|projection| spend_limit_hit(&projection))
         {
             return hit.reason;
+        }
+        if let Err(reason) = spend_window_projections(self, rule, request, request.estimated_cost(), now) {
+            return reason;
         }
         "requested budget is not valid for the request".to_owned()
     }
@@ -894,14 +891,8 @@ impl BudgetLedger {
             .iter()
             .filter(|rule| budget_rule_matches(rule, request))
             .flat_map(|rule| {
-                let matched_entity = matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
-                spend_window_projections(
-                    self,
-                    rule,
-                    matched_entity.as_deref(),
-                    request.estimated_cost(),
-                    now,
-                )
+                spend_window_projections(self, rule, request, request.estimated_cost(), now)
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|projection| {
                     projection.projected_spend_usd > projection.max_usd
@@ -957,10 +948,11 @@ impl BudgetLedger {
                 spend_window_projections(
                     self,
                     rule,
-                    matched_entity.as_deref(),
+                    request,
                     amount_usd,
                     now,
                 )
+                .expect("selected budget has valid spend window scopes")
                 .into_iter()
                 .map(|projection| projection.window_ends_at.unwrap_or(now + projection.window_seconds))
             })
@@ -969,16 +961,16 @@ impl BudgetLedger {
 
         for rule in matching_rules {
             for limit in &rule.limits.spend {
-                if !matches!(limit.mode, Some(SpendWindowMode::Tumbling)) {
-                    continue;
-                }
-                let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
-                    continue;
-                };
                 let limit_id = spend_limit_identifier(limit).to_owned();
-                let scope_key = limit_scope_key(matched_entity.as_deref());
-                self.limit_window(rule, &limit_id, window, &scope_key, now)
-                    .used_usd += amount_usd;
+                let scope_key = spend_limit_scope_key(limit.by, request)
+                    .expect("selected budget has valid spend window scopes");
+                if matches!(limit.mode, Some(SpendWindowMode::Tumbling)) {
+                    let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
+                        continue;
+                    };
+                    self.limit_window(rule, &limit_id, window, &scope_key, now)
+                        .used_usd += amount_usd;
+                }
                 limit_window_spends.push(LimitWindowReservationSpend {
                     rule_id: rule.id.clone(),
                     limit_id,
@@ -1054,16 +1046,6 @@ impl BudgetLedger {
         }
     }
 
-    fn biggest_spend_window_projection_for_budget(
-        &self,
-        rule: &BudgetRule,
-        matched_entity: Option<&str>,
-        estimated_cost: f64,
-        now: DateTime<Utc>,
-    ) -> Option<SpendWindowProjection> {
-        biggest_spend_window_projection(self, rule, matched_entity, estimated_cost, now)
-    }
-
     fn persist_decision(
         &self,
         policy: Option<&PolicyFile>,
@@ -1137,6 +1119,11 @@ impl BudgetLedger {
             ],
         )?;
         if let Some(reservation) = &decision.reservation {
+            let limit_window_spends = self
+                .reservations
+                .get(&reservation.id)
+                .map(|stored| stored.limit_window_spends.as_slice())
+                .unwrap_or_default();
             let budget_rule_ids = self
                 .reservations
                 .get(&reservation.id)
@@ -1160,13 +1147,7 @@ impl BudgetLedger {
                     reservation.created_at.to_rfc3339(),
                     reservation.expires_at.to_rfc3339(),
                     serde_json::to_string(budget_rule_ids)?,
-                    serde_json::to_string(
-                        &self
-                            .reservations
-                            .get(&reservation.id)
-                            .map(|stored| stored.limit_window_spends.as_slice())
-                            .unwrap_or_default(),
-                    )?,
+                    serde_json::to_string(&limit_window_spends)?,
                     serde_json::to_string(
                         &self
                             .reservations
@@ -1176,6 +1157,21 @@ impl BudgetLedger {
                     )?,
                 ],
             )?;
+            for spend in limit_window_spends {
+                conn.execute(
+                    "
+                    INSERT INTO reservation_limit_scopes (
+                        reservation_id, rule_id, limit_id, scope_key
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    params![
+                        reservation.id.as_str(),
+                        spend.rule_id.as_str(),
+                        spend.limit_id.as_str(),
+                        spend.scope_key.as_str()
+                    ],
+                )?;
+            }
         }
         Ok(())
     }
@@ -1211,7 +1207,7 @@ impl BudgetLedger {
                 if let Some(projection) = biggest_spend_window_projection(
                     self,
                     rule,
-                    fields.matched_entity.as_deref(),
+                    request,
                     0.0,
                     decision.created_at,
                 ) {
@@ -1687,6 +1683,15 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             limit_window_spends_json TEXT NOT NULL DEFAULT '[]',
             allocation_spends_json TEXT NOT NULL DEFAULT '[]'
         );
+
+        CREATE TABLE IF NOT EXISTS reservation_limit_scopes (
+            reservation_id TEXT NOT NULL REFERENCES reservations(id),
+            rule_id TEXT NOT NULL,
+            limit_id TEXT NOT NULL,
+            scope_key TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_lookup
+            ON reservation_limit_scopes(rule_id, limit_id, scope_key);
 
         CREATE TABLE IF NOT EXISTS usage_observations (
             id TEXT PRIMARY KEY,
@@ -2166,7 +2171,6 @@ fn apply_budget_limits(
     ledger: &BudgetLedger,
     rule: &BudgetRule,
     request: &AuthorizeRequest,
-    matched_entity: Option<&str>,
     estimated_cost: f64,
     now: DateTime<Utc>,
     action: &mut PolicyAction,
@@ -2214,7 +2218,10 @@ fn apply_budget_limits(
         return true;
     }
 
-    for projection in spend_window_projections(ledger, rule, matched_entity, estimated_cost, now) {
+    for projection in
+        spend_window_projections(ledger, rule, request, estimated_cost, now)
+            .expect("selected budget has valid spend window scopes")
+    {
         let warn_threshold = projection.max_usd * projection.warn_at_fraction;
         if projection.warn_at_fraction < 1.0 && projection.projected_spend_usd >= warn_threshold {
             *action = merge_policy_action(*action, PolicyAction::Warn);
@@ -2250,21 +2257,35 @@ fn apply_budget_limits(
 fn spend_window_projections(
     ledger: &BudgetLedger,
     rule: &BudgetRule,
-    matched_entity: Option<&str>,
+    request: &AuthorizeRequest,
     estimated_cost: f64,
     now: DateTime<Utc>,
-) -> Vec<SpendWindowProjection> {
+) -> Result<Vec<SpendWindowProjection>, String> {
     rule.limits
         .spend
         .iter()
-        .filter_map(|limit| {
-            let window_seconds = crate::policy::parse_limit_window(&limit.window)?;
+        .map(|limit| {
+            let window_seconds = crate::policy::parse_limit_window(&limit.window)
+                .expect("validated spend window");
             let limit_id = spend_limit_identifier(limit).to_owned();
-            let limit_mode = limit.mode?;
-            let scope_key = limit_scope_key(matched_entity);
+            let limit_mode = limit.mode.expect("validated spend window mode");
+            let scope_key = spend_limit_scope_key(limit.by, request).ok_or_else(|| {
+                format!(
+                    "request is missing {} scope required by spend window {}",
+                    spend_window_by_label(limit.by),
+                    spend_limit_identifier(limit)
+                )
+            })?;
             let (current_spend, window_started_at, window_ends_at) = match limit_mode {
                 SpendWindowMode::Rolling => (
-                    recent_spend_usd(ledger, &rule.id, matched_entity, now - window_seconds, now),
+                    recent_spend_usd(
+                        ledger,
+                        &rule.id,
+                        &limit_id,
+                        &scope_key,
+                        now - window_seconds,
+                        now,
+                    ),
                     Some(now - window_seconds),
                     Some(now),
                 ),
@@ -2294,7 +2315,7 @@ fn spend_window_projections(
                     )
                 }
             };
-            Some(SpendWindowProjection {
+            Ok(SpendWindowProjection {
                 rule_id: format!("{}.spend_window.{}", rule.id, limit_id),
                 limit_id,
                 window_label: limit.window.clone(),
@@ -2305,7 +2326,7 @@ fn spend_window_projections(
                 projected_spend_usd: current_spend + estimated_cost,
                 max_usd: limit.max_usd,
                 warn_at_fraction: limit.warn_at_fraction,
-                scope_entity: matched_entity.map(ToOwned::to_owned),
+                scope_key,
                 window_seconds,
             })
         })
@@ -2315,11 +2336,12 @@ fn spend_window_projections(
 fn biggest_spend_window_projection(
     ledger: &BudgetLedger,
     rule: &BudgetRule,
-    matched_entity: Option<&str>,
+    request: &AuthorizeRequest,
     estimated_cost: f64,
     now: DateTime<Utc>,
 ) -> Option<SpendWindowProjection> {
-    spend_window_projections(ledger, rule, matched_entity, estimated_cost, now)
+    spend_window_projections(ledger, rule, request, estimated_cost, now)
+        .ok()?
         .into_iter()
         .max_by_key(|projection| projection.window_seconds.num_seconds())
 }
@@ -2361,7 +2383,7 @@ fn spend_limit_hit(projection: &SpendWindowProjection) -> DecisionLimitHitReport
         window_ends_at: projection.window_ends_at,
         projected_spend_usd: Some(projection.projected_spend_usd),
         max_usd: Some(projection.max_usd),
-        scope_entity: projection.scope_entity.clone(),
+        scope_entity: Some(projection.scope_key.clone()),
     }
 }
 
@@ -2426,8 +2448,57 @@ pub(crate) fn binding_limit_hit(
     })
 }
 
-fn limit_scope_key(matched_entity: Option<&str>) -> String {
-    matched_entity.unwrap_or("").to_owned()
+fn spend_limit_scope_key(by: SpendWindowBy, request: &AuthorizeRequest) -> Option<String> {
+    match by {
+        SpendWindowBy::Global => Some("global".to_owned()),
+        SpendWindowBy::Project => request
+            .project
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|project| format!("project:{project}"))
+            .or_else(|| first_request_entity(request, "project")),
+        SpendWindowBy::User => request
+            .entities
+            .iter()
+            .find(|entity| entity.starts_with("user:"))
+            .cloned()
+            .or_else(|| {
+                request.subject.as_deref().filter(|value| !value.is_empty()).map(|subject| {
+                    if subject.contains(':') {
+                        subject.to_owned()
+                    } else {
+                        format!("user:{subject}")
+                    }
+                })
+            }),
+        SpendWindowBy::Team => first_request_entity(request, "team"),
+        SpendWindowBy::Group => first_request_entity(request, "group"),
+        SpendWindowBy::Org => first_request_entity(request, "org"),
+        SpendWindowBy::Workflow => first_request_entity(request, "workflow"),
+        SpendWindowBy::Surface => first_request_entity(request, "surface"),
+    }
+}
+
+fn spend_window_by_label(by: SpendWindowBy) -> &'static str {
+    match by {
+        SpendWindowBy::Global => "global",
+        SpendWindowBy::Project => "project",
+        SpendWindowBy::User => "user",
+        SpendWindowBy::Team => "team",
+        SpendWindowBy::Group => "group",
+        SpendWindowBy::Org => "org",
+        SpendWindowBy::Workflow => "workflow",
+        SpendWindowBy::Surface => "surface",
+    }
+}
+
+fn first_request_entity(request: &AuthorizeRequest, kind: &str) -> Option<String> {
+    let prefix = format!("{kind}:");
+    request
+        .entities
+        .iter()
+        .find(|entity| entity.starts_with(&prefix))
+        .cloned()
 }
 
 fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -> Option<String> {
@@ -2545,49 +2616,33 @@ fn rolled_allocation_bucket_state(
 fn recent_spend_usd(
     ledger: &BudgetLedger,
     rule_id: &str,
-    matched_entity: Option<&str>,
+    limit_id: &str,
+    scope_key: &str,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> f64 {
     if let Some(conn) = &ledger.conn {
-        let sql = if matched_entity.is_some() {
+        let value = conn.query_row(
             "
             SELECT COALESCE(SUM(r.amount_usd), 0)
             FROM reservations r
+            JOIN reservation_limit_scopes s ON s.reservation_id = r.id
             JOIN decisions d ON d.decision_id = r.decision_id
-            WHERE d.selected_budget_id = ?1
-              AND d.matched_entity = ?2
-              AND d.created_at >= ?3
-              AND d.created_at <= ?4
-            "
-        } else {
-            "
-            SELECT COALESCE(SUM(r.amount_usd), 0)
-            FROM reservations r
-            JOIN decisions d ON d.decision_id = r.decision_id
-            WHERE d.selected_budget_id = ?1
-              AND d.created_at >= ?2
-              AND d.created_at <= ?3
-            "
-        };
-        let value = if let Some(matched_entity) = matched_entity {
-            conn.query_row(
-                sql,
-                params![
-                    rule_id,
-                    matched_entity,
-                    since.to_rfc3339(),
-                    now.to_rfc3339()
-                ],
-                |row| row.get::<_, f64>(0),
-            )
-        } else {
-            conn.query_row(
-                sql,
-                params![rule_id, since.to_rfc3339(), now.to_rfc3339()],
-                |row| row.get::<_, f64>(0),
-            )
-        };
+            WHERE s.rule_id = ?1
+              AND s.limit_id = ?2
+              AND s.scope_key = ?3
+              AND d.created_at >= ?4
+              AND d.created_at <= ?5
+            ",
+            params![
+                rule_id,
+                limit_id,
+                scope_key,
+                since.to_rfc3339(),
+                now.to_rfc3339()
+            ],
+            |row| row.get::<_, f64>(0),
+        );
         return value.unwrap_or(0.0);
     }
 
@@ -2595,14 +2650,13 @@ fn recent_spend_usd(
         .reservations
         .values()
         .filter(|stored| {
-            stored
-                .budget_rule_ids
-                .iter()
-                .any(|stored_rule_id| stored_rule_id == rule_id)
+            stored.limit_window_spends.iter().any(|spend| {
+                spend.rule_id == rule_id
+                    && spend.limit_id == limit_id
+                    && spend.scope_key == scope_key
+            })
                 && stored.reservation.created_at >= since
                 && stored.reservation.created_at <= now
-                && matched_entity
-                    .is_none_or(|entity| stored.matched_entity.as_deref() == Some(entity))
         })
         .map(|stored| stored.reservation.amount_usd)
         .sum()
@@ -2624,28 +2678,49 @@ fn matched_entity_and_rank(
 }
 
 fn candidate_matched_entities(rule: &BudgetRule, request: &AuthorizeRequest) -> Vec<String> {
-    if !rule.eligible.entities.is_empty() {
-        return rule
-            .eligible
-            .entities
-            .iter()
-            .filter(|entity| request_entity_matches(request, entity))
-            .cloned()
-            .collect();
-    }
+    matched_entities_from_rule_match(&rule.rule_match, request)
+}
 
+fn matched_entities_from_rule_match(rule_match: &RuleMatch, request: &AuthorizeRequest) -> Vec<String> {
     let mut entities = Vec::new();
-    if let Some(project) = rule.rule_match.project.as_deref() {
+    if let Some(project) = rule_match.project.as_deref()
+        && request_entity_matches(request, &format!("project:{project}"))
+    {
         entities.push(format!("project:{project}"));
     }
-    if let Some(subject) = rule.rule_match.subject.as_deref() {
-        entities.push(if subject.contains(':') {
+    if let Some(user) = rule_match.user.as_deref()
+        && request_entity_matches(request, &format!("user:{user}"))
+    {
+        entities.push(format!("user:{user}"));
+    }
+    if let Some(subject) = rule_match.subject.as_deref() {
+        let entity = if subject.contains(':') {
             subject.to_owned()
         } else {
             format!("user:{subject}")
-        });
+        };
+        if request_entity_matches(request, &entity) {
+            entities.push(entity);
+        }
     }
-    if entities.is_empty() && rule.rule_match == RuleMatch::default() {
+    for (kind, value) in [
+        ("team", rule_match.team.as_deref()),
+        ("group", rule_match.group.as_deref()),
+        ("org", rule_match.org.as_deref()),
+        ("workflow", rule_match.workflow.as_deref()),
+        ("surface", rule_match.surface.as_deref()),
+    ] {
+        if let Some(value) = value {
+            let entity = format!("{kind}:{value}");
+            if request_entity_matches(request, &entity) {
+                entities.push(entity);
+            }
+        }
+    }
+    for nested in &rule_match.any {
+        entities.extend(matched_entities_from_rule_match(nested, request));
+    }
+    if entities.is_empty() && rule_match == &RuleMatch::default() {
         entities.push("global".to_owned());
     }
     entities
@@ -3169,8 +3244,8 @@ mod tests {
     use chrono::TimeZone;
 
     use crate::contract::{
-        BudgetEligibility, BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, ContextTokenLimit,
-        RequestCostLimit, RuleMatch, SpendWindowLimit, SpendWindowMode, WindowAnchorKind,
+        BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, ContextTokenLimit, RequestCostLimit,
+        RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode, WindowAnchorKind,
         WindowAnchorPolicy,
     };
 
@@ -3183,12 +3258,12 @@ mod tests {
             budgets: vec![BudgetRule {
                 id: "dev-budget".to_owned(),
                 priority: 0,
-                eligible: Default::default(),
                 models: Default::default(),
                 limits: BudgetLimitPolicy {
                     request_cost: None,
                     context_tokens: None,
                     spend: vec![SpendWindowLimit {
+                        by: SpendWindowBy::Project,
                         id: Some("budget-cap".to_owned()),
                         window: "60s".to_owned(),
                         mode: Some(SpendWindowMode::Tumbling),
@@ -3254,15 +3329,13 @@ mod tests {
             budgets: vec![BudgetRule {
                 id: "ai-adoption".to_owned(),
                 priority: 0,
-                eligible: BudgetEligibility {
-                    entities: vec!["org:example".to_owned()],
-                },
                 models: BudgetModelPolicy::default(),
                 limits: BudgetLimitPolicy {
                     request_cost: None,
                     context_tokens: None,
                     spend: vec![SpendWindowLimit {
                         id: Some("budget-cap".to_owned()),
+                        by: SpendWindowBy::Org,
                         window: cap_window.to_owned(),
                         mode: Some(SpendWindowMode::Tumbling),
                         anchor: Some(WindowAnchorPolicy {
@@ -3286,7 +3359,10 @@ mod tests {
                         cap_usd: Some(50.0),
                     }),
                 }),
-                rule_match: RuleMatch::default(),
+                rule_match: RuleMatch {
+                    org: Some("example".to_owned()),
+                    ..RuleMatch::default()
+                },
             }],
             policies: Vec::new(),
         }
@@ -3500,6 +3576,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: None,
                 window: "5h".to_owned(),
                 mode: Some(SpendWindowMode::Rolling),
@@ -3534,6 +3611,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: None,
                 window: "7d".to_owned(),
                 mode: Some(SpendWindowMode::Rolling),
@@ -3568,6 +3646,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: Some("daily-tumbling".to_owned()),
                 window: "1d".to_owned(),
                 mode: Some(SpendWindowMode::Tumbling),
@@ -3604,6 +3683,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: Some("daily-tumbling".to_owned()),
                 window: "1d".to_owned(),
                 mode: Some(SpendWindowMode::Tumbling),
@@ -3640,6 +3720,7 @@ mod tests {
             context_tokens: None,
             spend: vec![
                 SpendWindowLimit {
+                    by: SpendWindowBy::Project,
                     id: Some("daily-tumbling".to_owned()),
                     window: "1d".to_owned(),
                     mode: Some(SpendWindowMode::Tumbling),
@@ -3651,6 +3732,7 @@ mod tests {
                     action: PolicyAction::Warn,
                 },
                 SpendWindowLimit {
+                    by: SpendWindowBy::Project,
                     id: Some("daily-rolling".to_owned()),
                     window: "1d".to_owned(),
                     mode: Some(SpendWindowMode::Rolling),
@@ -3689,6 +3771,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: Some("daily-tumbling".to_owned()),
                 window: "1d".to_owned(),
                 mode: Some(SpendWindowMode::Tumbling),
@@ -4037,6 +4120,7 @@ mod tests {
             request_cost: None,
             context_tokens: None,
             spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
                 id: Some("daily-tumbling".to_owned()),
                 window: "1d".to_owned(),
                 mode: Some(SpendWindowMode::Tumbling),
@@ -4451,15 +4535,13 @@ mod tests {
         BudgetRule {
             id: id.to_owned(),
             priority,
-            eligible: BudgetEligibility {
-                entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
-            },
             models: BudgetModelPolicy::default(),
             limits: BudgetLimitPolicy {
                 request_cost: None,
                 context_tokens: None,
                 spend: vec![SpendWindowLimit {
                     id: Some("budget-cap".to_owned()),
+                    by: spend_by_for_entity(entities[0]),
                     window: "60s".to_owned(),
                     mode: Some(SpendWindowMode::Tumbling),
                     anchor: Some(WindowAnchorPolicy {
@@ -4474,7 +4556,61 @@ mod tests {
                 retries: None,
             },
             allocation: None,
-            rule_match: RuleMatch::default(),
+            rule_match: rule_match_for_entity(entities[0]),
+        }
+    }
+
+    fn spend_by_for_entity(entity: &str) -> SpendWindowBy {
+        match entity.split_once(':').map(|(kind, _)| kind).unwrap_or(entity) {
+            "project" => SpendWindowBy::Project,
+            "user" => SpendWindowBy::User,
+            "team" => SpendWindowBy::Team,
+            "group" => SpendWindowBy::Group,
+            "org" => SpendWindowBy::Org,
+            "workflow" => SpendWindowBy::Workflow,
+            "surface" => SpendWindowBy::Surface,
+            "global" => SpendWindowBy::Global,
+            other => panic!("unsupported test entity kind {other}"),
+        }
+    }
+
+    fn rule_match_for_entity(entity: &str) -> RuleMatch {
+        let Some((kind, value)) = entity.split_once(':') else {
+            if entity.eq_ignore_ascii_case("global") {
+                return RuleMatch::default();
+            }
+            panic!("unsupported test entity {entity}");
+        };
+        match kind {
+            "project" => RuleMatch {
+                project: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "user" => RuleMatch {
+                user: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "team" => RuleMatch {
+                team: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "group" => RuleMatch {
+                group: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "org" => RuleMatch {
+                org: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "workflow" => RuleMatch {
+                workflow: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            "surface" => RuleMatch {
+                surface: Some(value.to_owned()),
+                ..RuleMatch::default()
+            },
+            _ => panic!("unsupported test entity kind {kind}"),
         }
     }
 }

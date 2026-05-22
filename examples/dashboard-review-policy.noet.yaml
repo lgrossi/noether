@@ -12,8 +12,8 @@ budgets:
           max_usd: 420
           warn_at_fraction: 0.65
           action: block
-    eligible:
-      entities: [team:platform]
+    match:
+      team: platform
     models:
       allow:
         - openai:*
@@ -31,8 +31,8 @@ budgets:
           max_usd: 320
           warn_at_fraction: 0.65
           action: block
-    eligible:
-      entities: [team:product]
+    match:
+      team: product
     models:
       allow:
         - openai:*
@@ -50,8 +50,8 @@ budgets:
           max_usd: 240
           warn_at_fraction: 0.6
           action: block
-    eligible:
-      entities: [team:security]
+    match:
+      team: security
     models:
       allow:
         - openai:*
@@ -69,8 +69,8 @@ budgets:
           max_usd: 210
           warn_at_fraction: 0.62
           action: block
-    eligible:
-      entities: [team:revenue]
+    match:
+      team: revenue
     models:
       allow:
         - openai:*
@@ -88,8 +88,8 @@ budgets:
           max_usd: 160
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:support]
+    match:
+      team: support
     models:
       allow:
         - openai:*
@@ -107,8 +107,8 @@ budgets:
           max_usd: 180
           warn_at_fraction: 0.55
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow:
         - openai:gpt-4.1
@@ -126,8 +126,8 @@ budgets:
           max_usd: 150
           warn_at_fraction: 0.5
           action: block
-    eligible:
-      entities: [project:search]
+    match:
+      project: search
     models:
       allow:
         - openai:*
@@ -150,8 +150,8 @@ budgets:
           mode: rolling
           max_usd: 18
           action: warn
-    eligible:
-      entities: [project:incident]
+    match:
+      project: incident
     models:
       allow:
         - openai:*
@@ -169,8 +169,8 @@ budgets:
           max_usd: 110
           warn_at_fraction: 0.58
           action: block
-    eligible:
-      entities: [project:pricing]
+    match:
+      project: pricing
     models:
       allow:
         - openai:*
@@ -188,8 +188,8 @@ budgets:
           max_usd: 90
           warn_at_fraction: 0.55
           action: block
-    eligible:
-      entities: [project:editor]
+    match:
+      project: editor
     models:
       allow:
         - anthropic:claude-sonnet-*
@@ -206,8 +206,8 @@ budgets:
           max_usd: 140
           warn_at_fraction: 0.6
           action: block
-    eligible:
-      entities: [project:editor]
+    match:
+      project: editor
     models:
       allow:
         - openai:*
@@ -224,8 +224,8 @@ budgets:
           max_usd: 240
           warn_at_fraction: 0.7
           action: block
-    eligible:
-      entities: [team:product]
+    match:
+      team: product
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -247,8 +247,8 @@ budgets:
           max_usd: 110
           warn_at_fraction: 0.7
           action: block
-    eligible:
-      entities: [team:support]
+    match:
+      team: support
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -276,5 +276,5 @@ budgets:
       tool_calls: 6
       agent_steps: 2
       retries: 1
-    eligible:
-      entities: [project:labs]
+    match:
+      project: labs

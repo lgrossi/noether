@@ -206,8 +206,8 @@ budgets:
     amount_usd: 1000
     window: monthly
     priority: 50
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow: [openai:gpt-4.1, anthropic:claude-sonnet-*]
     allocation:
@@ -217,8 +217,8 @@ budgets:
     amount_usd: 5000
     window: monthly
     priority: 10
-    eligible:
-      entities: [org:example]
+    match:
+      org: example
     allocation:
       standard: reserved_plus_shared
       by: team
@@ -229,8 +229,8 @@ budgets:
     amount_usd: 2000
     window: monthly
     priority: 20
-    eligible:
-      entities: [org:example]
+    match:
+      org: example
     models:
       allow: [openai:gpt-4.1-mini, anthropic:claude-haiku-*]
     allocation:
@@ -277,7 +277,8 @@ budgets:
 ## Compatibility and migration
 
 Current `limit_usd` budget rules can migrate to `amount_usd` + `allocation.standard=pooled_cap`.
-Current `match.project/provider/model/subject` becomes `eligible.entities` and/or `models.allow`.
+Current budget applicability should live under `match`, while spend partitioning should live under
+per-limit `limits.spend[].by`.
 The ledger should store selected budget id, selection reason, rejected requested budget reason, and
 charged slice so reports can explain behavior across both old and new policies.
 

@@ -44,8 +44,7 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    eligible:
-      entities: [global]
+    match: {}
     models:
       allow:
         - openai-codex:*
@@ -55,6 +54,7 @@ budgets:
     limits:
       spend:
         - id: budget-cap
+          by: global
           window: 30d
           mode: tumbling
           anchor:
@@ -63,6 +63,7 @@ budgets:
           warn_at_fraction: 0.8
           action: block
         - id: daily-cap
+          by: global
           window: 1d
           mode: tumbling
           anchor:

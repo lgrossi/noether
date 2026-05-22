@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, UsageObservation,
+    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, RuleMatch,
+    UsageObservation,
 };
 use crate::error::NoetError;
 use crate::ledger::BudgetLedger;
@@ -653,9 +654,7 @@ fn budget_total_cap_usd(budget: &BudgetRule) -> Option<f64> {
 fn summarize_budget_scope(policy: &PolicyFile) -> String {
     let mut scopes = BTreeSet::new();
     for budget in &policy.budgets {
-        for entity in &budget.eligible.entities {
-            scopes.insert(entity.clone());
-        }
+        collect_rule_match_scopes(&budget.rule_match, &mut scopes);
     }
     if scopes.is_empty() {
         return "all requests".to_owned();
@@ -667,6 +666,36 @@ fn summarize_budget_scope(policy: &PolicyFile) -> String {
         format!("{} +{} more", scope.join(", "), remaining)
     } else {
         scope.join(", ")
+    }
+}
+
+fn collect_rule_match_scopes(rule_match: &RuleMatch, scopes: &mut BTreeSet<String>) {
+    if let Some(project) = rule_match.project.as_deref() {
+        scopes.insert(format!("project:{project}"));
+    }
+    if let Some(user) = rule_match.user.as_deref() {
+        scopes.insert(format!("user:{user}"));
+    }
+    if let Some(subject) = rule_match.subject.as_deref() {
+        scopes.insert(if subject.contains(':') {
+            subject.to_owned()
+        } else {
+            format!("user:{subject}")
+        });
+    }
+    for (kind, value) in [
+        ("team", rule_match.team.as_deref()),
+        ("group", rule_match.group.as_deref()),
+        ("org", rule_match.org.as_deref()),
+        ("workflow", rule_match.workflow.as_deref()),
+        ("surface", rule_match.surface.as_deref()),
+    ] {
+        if let Some(value) = value {
+            scopes.insert(format!("{kind}:{value}"));
+        }
+    }
+    for nested in &rule_match.any {
+        collect_rule_match_scopes(nested, scopes);
     }
 }
 
@@ -975,8 +1004,8 @@ strategies:
                   kind: first_seen
                 max_usd: 250
                 action: block
-          eligible:
-            entities: [team:platform]
+          match:
+            team: platform
 "#,
         )
         .expect("simulation parses");
@@ -1017,7 +1046,16 @@ strategies:
       version: 0
       budgets:
         - id: ""
-          limit_usd: 0
+          limits:
+            spend:
+              - id: budget-cap
+                by: global
+                window: 30d
+                mode: tumbling
+                anchor:
+                  kind: first_seen
+                max_usd: 0
+                action: block
 "#,
         )
         .expect("simulation parses");
@@ -1221,8 +1259,8 @@ strategies:
                   kind: first_seen
                 max_usd: 10
                 action: block
-          eligible:
-            entities: [team:platform]
+          match:
+            team: platform
   - id: team a
     policy:
       version: 0
@@ -1237,8 +1275,8 @@ strategies:
                   kind: first_seen
                 max_usd: 10
                 action: block
-          eligible:
-            entities: [team:platform]
+          match:
+            team: platform
 "#,
         )
         .expect("simulation parses");

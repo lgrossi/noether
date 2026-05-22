@@ -7,14 +7,15 @@ policy:
       limits:
         spend:
           - id: budget-cap
+            by: project
             window: 30d
             mode: tumbling
             anchor:
               kind: first_seen
             max_usd: 25
             action: block
-      eligible:
-        entities: [project:noether]
+      match:
+        project: noether
 entities: [project:noether, user:alice]
 requests:
   - id: req-1

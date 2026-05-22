@@ -1488,13 +1488,13 @@ mod tests {
             budgets: vec![BudgetRule {
                 id: "tiny".to_owned(),
                 priority: 0,
-                eligible: Default::default(),
                 models: Default::default(),
                 limits: crate::contract::BudgetLimitPolicy {
                     request_cost: None,
                     context_tokens: None,
                     spend: vec![crate::contract::SpendWindowLimit {
                         id: Some("budget-cap".to_owned()),
+                        by: crate::contract::SpendWindowBy::Global,
                         window: "60s".to_owned(),
                         mode: Some(crate::contract::SpendWindowMode::Tumbling),
                         anchor: Some(crate::contract::WindowAnchorPolicy {
@@ -3066,8 +3066,8 @@ budgets:
             kind: first_seen
           max_usd: 10
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
 policies: []
 "#,
         )
@@ -3104,8 +3104,8 @@ routing:
   specificity: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     limits:
       spend:
         - id: budget-cap
@@ -3158,8 +3158,8 @@ budgets:
             kind: first_seen
           max_usd: 10
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
 policies: []
 "#,
         )

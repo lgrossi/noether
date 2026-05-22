@@ -30,8 +30,8 @@ routing:
 budgets:
   - id: dev-daily
     priority: 0
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow:
         - openai:gpt-4.1
@@ -39,6 +39,7 @@ budgets:
     limits:
       spend:
         - id: budget-cap
+          by: project
           window: 1d
           mode: tumbling
           anchor:
@@ -47,6 +48,7 @@ budgets:
           warn_at_fraction: 0.8
           action: block
         - id: burst-5h
+          by: project
           window: 5h
           mode: rolling
           max_usd: 40
@@ -65,8 +67,6 @@ budgets:
       carryover:
         percent: 10
         cap_usd: 50
-    match:
-      project: noether
 policies:
   - id: require-project
     action: block
@@ -84,8 +84,12 @@ The v0 evaluator is an in-memory fixed-window budget:
   before falling back;
 - inferred fallback budgets sort by entity specificity, higher `priority`, lower projected budget
   pressure, and stable budget id;
-- `eligible.entities` can match trusted request entities such as `project:noether`,
-  `user:alice`, `team:core`, `org:example`, or `global`;
+- `match` decides when a budget applies;
+- flat `match` fields compose with AND semantics by default;
+- `match.any` expresses OR across nested clauses;
+- `match.not` negates a nested clause;
+- `match.project`, `match.user`, `match.team`, `match.group`, `match.org`,
+  `match.workflow`, and `match.surface` all use typed request entities;
 - `models.allow` constrains a matching budget to provider/model patterns such as
   `openai:gpt-4.1` or wildcard suffixes such as `anthropic:claude-sonnet-*`;
 - `limits.request_cost` defines a per-budget request-cost limit that can warn or
@@ -93,6 +97,8 @@ The v0 evaluator is an in-memory fixed-window budget:
 - `limits.context_tokens` defines a per-budget context limit that can warn or deny when
   authorize-time context/input token estimates exceed its threshold;
 - `limits.spend[]` is the only money/window constraint model:
+  - `by` controls which scope key the window is counted against, such as
+    `global`, `project`, `user`, `team`, `group`, `org`, `workflow`, or `surface`;
   - every spend window defines its own `window`, `mode`, `anchor`, `max_usd`,
     `warn_at_fraction`, and `action`;
   - all spend windows compose with AND semantics;
@@ -109,9 +115,8 @@ The v0 evaluator is an in-memory fixed-window budget:
   `by` (`user` or `team`), `protected_amount_usd`, `window` (`monthly`), and
   `carryover.{percent,cap_usd}`;
 - omitted `models.allow` means all provider/model pairs are allowed;
-- when `eligible.entities` is omitted, legacy matching rules compare optional `subject`, `project`,
-  `provider`, and `model`;
-- `project` and `subject` fields are also treated as legacy entity sources for compatibility;
+- `project` and `subject` request fields are still treated as entity sources when explicit
+  `project:*` or `user:*` entities are absent;
 - estimated cost uses `estimated_cost_usd` when present;
 - otherwise estimated cost falls back to `estimated_tokens * 0.000001`;
 - `allow` creates a reservation;

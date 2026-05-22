@@ -202,8 +202,8 @@ Based on: `examples/scenarios/model-denial-fallback.noet.yaml`
 Route requests to a more appropriate project budget:
 
 ```yaml
-eligible:
-  entities: [project:noether]
+match:
+  project: noether
 ```
 
 Based on: `examples/scenarios/project-budget-fallback.noet.yaml`
@@ -225,21 +225,21 @@ Based on: `examples/scenarios/protected-adoption-pool.noet.yaml`
 
 Here is a more realistic policy that combines:
 
-- a monthly project budget
+- a monthly global budget
 - a warning threshold
-- project-scoped eligibility
-- a daily cap
-- a short rolling burst cap
+- a shared pool
+- a per-user daily cap
+- a short per-user rolling burst cap
 
 ```yaml
 version: 0
 budgets:
   - id: personal-primary
-    eligible:
-      entities: [project:noether]
+    match: {}
     limits:
       spend:
         - id: budget-cap
+          by: global
           window: 30d
           mode: tumbling
           anchor:
@@ -248,6 +248,7 @@ budgets:
           warn_at_fraction: 0.8
           action: block
         - id: daily-cap
+          by: user
           window: 1d
           mode: tumbling
           anchor:
@@ -255,14 +256,15 @@ budgets:
           max_usd: 100
           action: block
         - id: burst-5h
+          by: user
           window: 5h
           mode: rolling
           max_usd: 40
           action: block
 ```
 
-This is the kind of policy a real operator or team would actually run: a broad `30d` spend cap with
-extra protection against bursty agent behavior.
+This is the kind of policy a real operator or team would actually run: one broad shared `30d` pool,
+plus per-user pacing and burst protection against unhealthy agent behavior.
 
 You can run the checked-in scenario for it here:
 

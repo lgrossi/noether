@@ -15,8 +15,8 @@ budgets:
           max_usd: 2600
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [org:company-01]
+    match:
+      org: company-01
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -32,8 +32,8 @@ budgets:
           max_usd: 2200
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [org:company-02]
+    match:
+      org: company-02
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -49,8 +49,8 @@ budgets:
           max_usd: 1800
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [org:company-03]
+    match:
+      org: company-03
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -66,8 +66,8 @@ budgets:
           max_usd: 760
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-01]
+    match:
+      team: team-01
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -83,8 +83,8 @@ budgets:
           max_usd: 710
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-02]
+    match:
+      team: team-02
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -100,8 +100,8 @@ budgets:
           max_usd: 660
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-03]
+    match:
+      team: team-03
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -117,8 +117,8 @@ budgets:
           max_usd: 620
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-04]
+    match:
+      team: team-04
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -134,8 +134,8 @@ budgets:
           max_usd: 560
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-05]
+    match:
+      team: team-05
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -151,8 +151,8 @@ budgets:
           max_usd: 520
           warn_at_fraction: 0.68
           action: block
-    eligible:
-      entities: [team:team-06]
+    match:
+      team: team-06
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -168,8 +168,8 @@ budgets:
           max_usd: 280
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-01]
+    match:
+      team: team-01
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -191,8 +191,8 @@ budgets:
           max_usd: 260
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-02]
+    match:
+      team: team-02
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -214,8 +214,8 @@ budgets:
           max_usd: 250
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-03]
+    match:
+      team: team-03
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -237,8 +237,8 @@ budgets:
           max_usd: 240
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-04]
+    match:
+      team: team-04
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -260,8 +260,8 @@ budgets:
           max_usd: 220
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-05]
+    match:
+      team: team-05
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -283,8 +283,8 @@ budgets:
           max_usd: 210
           warn_at_fraction: 0.72
           action: block
-    eligible:
-      entities: [team:team-06]
+    match:
+      team: team-06
     allocation:
       standard: protected_adoption_pool
       by: user
@@ -306,8 +306,8 @@ budgets:
           max_usd: 720
           warn_at_fraction: 0.62
           action: block
-    eligible:
-      entities: [project:noether]
+    match:
+      project: noether
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -323,8 +323,8 @@ budgets:
           max_usd: 680
           warn_at_fraction: 0.62
           action: block
-    eligible:
-      entities: [project:search]
+    match:
+      project: search
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -340,8 +340,8 @@ budgets:
           max_usd: 600
           warn_at_fraction: 0.62
           action: block
-    eligible:
-      entities: [project:editor]
+    match:
+      project: editor
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -357,8 +357,8 @@ budgets:
           max_usd: 540
           warn_at_fraction: 0.62
           action: block
-    eligible:
-      entities: [project:pricing]
+    match:
+      project: pricing
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -379,8 +379,8 @@ budgets:
           mode: rolling
           max_usd: 32
           action: warn
-    eligible:
-      entities: [project:incident]
+    match:
+      project: incident
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -402,8 +402,8 @@ budgets:
       tool_calls: 10
       agent_steps: 6
       retries: 2
-    eligible:
-      entities: [project:labs]
+    match:
+      project: labs
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 
@@ -419,8 +419,7 @@ budgets:
           max_usd: 3600
           warn_at_fraction: 0.8
           action: block
-    eligible:
-      entities: [global]
+    match: {}
     models:
       allow: [openai:*, openai-codex:*, anthropic:*]
 policies:

@@ -165,12 +165,11 @@ pub struct EvalAnnotation {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetRule {
     pub id: String,
     #[serde(default)]
     pub priority: i64,
-    #[serde(default)]
-    pub eligible: BudgetEligibility,
     #[serde(default)]
     pub models: BudgetModelPolicy,
     #[serde(default)]
@@ -182,18 +181,14 @@ pub struct BudgetRule {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct BudgetEligibility {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entities: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetModelPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_cost: Option<RequestCostLimit>,
@@ -210,6 +205,7 @@ pub struct BudgetLimitPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestCostLimit {
     pub max_usd: f64,
     #[serde(default = "default_limit_action")]
@@ -217,6 +213,7 @@ pub struct RequestCostLimit {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextTokenLimit {
     pub max_tokens: u64,
     #[serde(default = "default_limit_action")]
@@ -224,9 +221,15 @@ pub struct ContextTokenLimit {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpendWindowLimit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(
+        default = "default_spend_window_by",
+        skip_serializing_if = "is_default_spend_window_by"
+    )]
+    pub by: SpendWindowBy,
     pub window: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SpendWindowMode>,
@@ -240,6 +243,27 @@ pub struct SpendWindowLimit {
     pub warn_at_fraction: f64,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpendWindowBy {
+    Global,
+    Project,
+    User,
+    Team,
+    Group,
+    Org,
+    Workflow,
+    Surface,
+}
+
+fn default_spend_window_by() -> SpendWindowBy {
+    SpendWindowBy::Global
+}
+
+fn is_default_spend_window_by(value: &SpendWindowBy) -> bool {
+    *value == SpendWindowBy::Global
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -261,6 +285,7 @@ pub enum WindowAnchorKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetAllocationPolicy {
     pub standard: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +299,7 @@ pub struct BudgetAllocationPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectedCarryoverPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub percent: Option<f64>,
@@ -282,15 +308,32 @@ pub struct ProtectedCarryoverPolicy {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleMatch {
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub org: Option<String>,
+    #[serde(default)]
+    pub workflow: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any: Vec<RuleMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not: Option<Box<RuleMatch>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
