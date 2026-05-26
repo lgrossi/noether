@@ -12,7 +12,10 @@ use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, Trac
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
 use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
-use crate::local::{DEFAULT_LOCAL_BIND, ensure_local_runtime_layout};
+use crate::local::{
+    DEFAULT_LOCAL_BIND, ensure_local_runtime_layout, read_local_sidecar_owner,
+    write_local_sidecar_owner,
+};
 use crate::policy::{load_policy, policy_validation_warnings};
 use crate::proxy::load_proxy_routes;
 use crate::redaction::redaction_findings;
@@ -95,6 +98,8 @@ struct LocalCommand {
 enum LocalSubcommand {
     /// Start the local sidecar with repo-local `.noether/` defaults.
     Up(LocalUpArgs),
+    /// Print repo-local sidecar owner state.
+    Status(LocalStatusArgs),
 }
 
 #[derive(Parser)]
@@ -118,6 +123,13 @@ struct LocalUpArgs {
     /// Decision mode for the local sidecar.
     #[arg(long, value_enum, default_value_t = DecisionMode::Enforce)]
     decision_mode: DecisionMode,
+}
+
+#[derive(Parser)]
+struct LocalStatusArgs {
+    /// Repo root that should contain the `.noether/` runtime home.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
 }
 
 #[derive(Parser)]
@@ -258,6 +270,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
     match command.command {
         LocalSubcommand::Up(args) => {
             let layout = ensure_local_runtime_layout(&args.root).await?;
+            write_local_sidecar_owner(&layout, &args.bind.to_string()).await?;
             let policy = load_policy(&layout.policy_path).await?;
             let routes = match args.routes {
                 Some(path) => load_proxy_routes(&path).await?.routes,
@@ -275,6 +288,20 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 decision_mode: args.decision_mode,
             })
             .await
+        }
+        LocalSubcommand::Status(args) => {
+            match read_local_sidecar_owner(&args.root).await? {
+                Some(owner) => {
+                    println!("state\t{}", owner.state);
+                    println!("pid\t{}", owner.pid);
+                    println!("cwd\t{}", owner.cwd.display());
+                    println!("bind\t{}", owner.bind);
+                    println!("url\t{}", owner.url);
+                    println!("started_at\t{}", owner.started_at);
+                }
+                None => println!("state\tstopped"),
+            }
+            Ok(())
         }
     }
 }
@@ -3838,6 +3865,22 @@ mod tests {
                     assert!(args.routes.is_none());
                     assert_eq!(args.decision_mode, DecisionMode::Enforce);
                 }
+                LocalSubcommand::Status(_) => panic!("expected local up command"),
+            },
+            _ => panic!("expected local command"),
+        }
+    }
+
+    #[test]
+    fn local_status_defaults_to_standard_runtime() {
+        let cli = Cli::try_parse_from(["noet", "local", "status"]).expect("local status parses");
+
+        match cli.command {
+            Command::Local(command) => match command.command {
+                LocalSubcommand::Status(args) => {
+                    assert_eq!(args.root, PathBuf::from("."));
+                }
+                LocalSubcommand::Up(_) => panic!("expected local status command"),
             },
             _ => panic!("expected local command"),
         }

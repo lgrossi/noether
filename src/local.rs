@@ -46,6 +46,8 @@ pub struct LocalRuntimeLayout {
     pub db_path: PathBuf,
     pub fixture_dir: PathBuf,
     pub simulation_dir: PathBuf,
+    pub sidecar_dir: PathBuf,
+    pub owner_path: PathBuf,
 }
 
 impl LocalRuntimeLayout {
@@ -56,9 +58,21 @@ impl LocalRuntimeLayout {
             db_path: runtime_root.join("noether.sqlite"),
             fixture_dir: runtime_root.join("fixtures"),
             simulation_dir: runtime_root.join("simulations"),
+            sidecar_dir: runtime_root.join("pi-sidecar"),
+            owner_path: runtime_root.join("pi-sidecar").join("owner.json"),
             root: runtime_root,
         }
     }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct LocalSidecarOwner {
+    pub state: String,
+    pub pid: u32,
+    pub cwd: PathBuf,
+    pub bind: String,
+    pub url: String,
+    pub started_at: String,
 }
 
 pub async fn ensure_local_runtime_layout(root: &Path) -> Result<LocalRuntimeLayout, NoetError> {
@@ -66,10 +80,38 @@ pub async fn ensure_local_runtime_layout(root: &Path) -> Result<LocalRuntimeLayo
     fs::create_dir_all(&layout.root).await?;
     fs::create_dir_all(&layout.fixture_dir).await?;
     fs::create_dir_all(&layout.simulation_dir).await?;
+    fs::create_dir_all(&layout.sidecar_dir).await?;
     if !fs::try_exists(&layout.policy_path).await? {
         fs::write(&layout.policy_path, DEFAULT_LOCAL_POLICY).await?;
     }
     Ok(layout)
+}
+
+pub async fn write_local_sidecar_owner(
+    layout: &LocalRuntimeLayout,
+    bind: &str,
+) -> Result<LocalSidecarOwner, NoetError> {
+    let owner = LocalSidecarOwner {
+        state: "running".to_owned(),
+        pid: std::process::id(),
+        cwd: std::env::current_dir()?,
+        bind: bind.to_owned(),
+        url: format!("http://{bind}"),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    fs::write(&layout.owner_path, serde_json::to_vec(&owner)?).await?;
+    Ok(owner)
+}
+
+pub async fn read_local_sidecar_owner(
+    root: &Path,
+) -> Result<Option<LocalSidecarOwner>, NoetError> {
+    let layout = LocalRuntimeLayout::for_root(root);
+    match fs::read(&layout.owner_path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(NoetError::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +131,7 @@ mod tests {
         assert_eq!(layout.root, tempdir.path().join(".noether"));
         assert!(layout.fixture_dir.exists());
         assert!(layout.simulation_dir.exists());
+        assert!(layout.sidecar_dir.exists());
         assert!(layout.policy_path.exists());
         let policy = crate::policy::load_policy(&layout.policy_path)
             .await
