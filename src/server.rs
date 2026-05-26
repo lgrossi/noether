@@ -2268,7 +2268,9 @@ mod tests {
     use tokio_stream::StreamExt;
     use tower::ServiceExt;
 
-    use crate::contract::{BudgetRule, PolicyAction, PolicyCondition, PolicyRule, RuleMatch};
+    use crate::contract::{
+        BudgetRule, DecisionSeverity, PolicyAction, PolicyCondition, PolicyRule, RuleMatch,
+    };
     use crate::fixture::{CapturedBody, ResponseSource, list_fixture_paths, read_fixture};
     use crate::policy::PolicyFile;
     use crate::proxy::{ProxyRoute, ProxyRoutes};
@@ -2511,6 +2513,53 @@ mod tests {
                 id: "require-project".to_owned(),
                 action: PolicyAction::Block,
                 reason: "project is required".to_owned(),
+                when: PolicyCondition {
+                    missing: Some("project".to_owned()),
+                    rule_match: RuleMatch::default(),
+                },
+            }],
+        }
+    }
+
+    fn warn_project_policy() -> PolicyFile {
+        PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "personal-local".to_owned(),
+                priority: 0,
+                models: crate::contract::BudgetModelPolicy {
+                    allow: vec!["openai:gpt-4.1".to_owned()],
+                },
+                limits: crate::contract::BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: Some(crate::contract::ContextTokenLimit {
+                        max_tokens: 1_000,
+                        action: crate::contract::PolicyAction::Warn,
+                    }),
+                    spend: vec![crate::contract::SpendWindowLimit {
+                        id: Some("daily-cap".to_owned()),
+                        by: crate::contract::SpendWindowBy::Global,
+                        window: "1d".to_owned(),
+                        mode: Some(crate::contract::SpendWindowMode::Tumbling),
+                        anchor: Some(crate::contract::WindowAnchorPolicy {
+                            kind: crate::contract::WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 1000.0,
+                        warn_at_fraction: 1.0,
+                        action: crate::contract::PolicyAction::Warn,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
+                allocation: None,
+                rule_match: RuleMatch::default(),
+            }],
+            policies: vec![PolicyRule {
+                id: "require-project".to_owned(),
+                action: PolicyAction::Warn,
+                reason: "project should be present for attribution".to_owned(),
                 when: PolicyCondition {
                     missing: Some("project".to_owned()),
                     rule_match: RuleMatch::default(),
@@ -4040,6 +4089,46 @@ budgets:
         assert_eq!(totals.allow, 2);
         assert_eq!(totals.deny, 0);
         assert!(changed_runs.is_empty());
+        assert_eq!(spend_delta, 0.0);
+    }
+
+    #[test]
+    fn noether_app_replay_matches_live_warning_policy_semantics() {
+        let policy = warn_project_policy();
+        let mut live_ledger = BudgetLedger::default();
+        let mut request = report_request("trace-warn", "request-warn", "gpt-4.1", 0.25);
+        request.project = None;
+        request.entities = Vec::new();
+        request.estimated_tokens = Some(1_200);
+        request.provider = Some("openai".to_owned());
+        let live = live_ledger
+            .try_authorize_replay_at(Some(&policy), &request, chrono::Utc::now())
+            .expect("live-style replay authorize");
+        let historical_requests = vec![crate::ledger::HistoricalAuthorizeRequest {
+            occurred_at: live.created_at,
+            decision_id: "decision-warn".to_owned(),
+            baseline_outcome: DecisionOutcome::Allow,
+            request,
+        }];
+
+        let (totals, changed_runs, spend_delta) = replay_historical_requests(
+            &policy,
+            &historical_requests,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("replay");
+
+        assert_eq!(live.outcome, DecisionOutcome::Warn);
+        assert!(live.explanations.iter().any(|explanation| {
+            explanation.rule_id == "require-project" && explanation.severity == DecisionSeverity::Warn
+        }));
+        assert!(live.explanations.iter().any(|explanation| {
+            explanation.rule_id == "personal-local.context_tokens"
+                && explanation.severity == DecisionSeverity::Warn
+        }));
+        assert_eq!(totals.warn, 1);
+        assert_eq!(changed_runs[0].to_decision, "warn");
+        assert_eq!(changed_runs[0].rule.as_deref(), Some("require-project"));
         assert_eq!(spend_delta, 0.0);
     }
 
