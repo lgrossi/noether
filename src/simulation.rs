@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, RuleMatch,
-    UsageObservation,
+    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, RuleMatch, UsageObservation,
 };
 use crate::error::NoetError;
 use crate::ledger::BudgetLedger;

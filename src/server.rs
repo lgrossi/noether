@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -9,7 +10,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -22,12 +23,12 @@ use tracing::{error, info};
 
 use crate::capture::capture;
 use crate::contract::{
-    AuthorizeDecision, AuthorizeRequest, DecisionMode, FinalizeReservation, Reservation, TraceEvent,
+    AuthorizeDecision, AuthorizeRequest, DecisionMode, DecisionOutcome, FinalizeReservation,
+    Reservation, TraceEvent,
 };
-use crate::dashboard::{self, DashboardViewQuery};
 use crate::error::NoetError;
-use crate::ledger::BudgetLedger;
-use crate::live_dashboard;
+use crate::ledger::{BudgetLedger, TraceReportItem};
+use crate::noether_app;
 use crate::policy::PolicyFile;
 use crate::proxy::ProxyRoute;
 use crate::reporting;
@@ -37,6 +38,7 @@ use crate::simulation::SimulationComparisonReport;
 pub struct AppState {
     pub fixture_dir: PathBuf,
     pub simulation_dir: PathBuf,
+    pub policy_proposal_path: PathBuf,
     pub upstream: Option<url::Url>,
     pub routes: Vec<ProxyRoute>,
     pub client: reqwest::Client,
@@ -44,6 +46,226 @@ pub struct AppState {
     pub decision_mode: DecisionMode,
     pub ledger: Arc<Mutex<BudgetLedger>>,
     pub report_updates: broadcast::Sender<ReportUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppPolicyResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    source: String,
+    policy: PolicyFile,
+    decision_mode: DecisionMode,
+    rule_stats: Vec<AppRuleStat>,
+    suggestions: Vec<AppSuggestion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposal: Option<AppPolicyProposal>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppPolicyProposal {
+    path: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppRuleStat {
+    rule: String,
+    allow: u64,
+    warn: u64,
+    deny: u64,
+    ask: u64,
+    limit_hits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppSuggestion {
+    id: String,
+    title: String,
+    body: String,
+    rule: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply_label: Option<String>,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppPolicyUpdate {
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppPolicyApplyResponse {
+    policy: AppPolicyResponse,
+    applied: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppRunsResponse {
+    runs: Vec<AppRunRow>,
+    totals: AppRunTotals,
+    filtered_total: u64,
+    next_offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppRunsQuery {
+    #[serde(default = "default_app_runs_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    decision: Option<String>,
+    rule: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct AppRunTotals {
+    runs: u64,
+    allow: u64,
+    warn: u64,
+    deny: u64,
+    ask: u64,
+    limit_hits: u64,
+    spend_usd: f64,
+    tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AppRunRow {
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_run_id: Option<String>,
+    decision: String,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_check: Option<String>,
+    limit_hits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_entity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    timeline: Vec<AppRunTimelineItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AppRunTimelineItem {
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    kind: String,
+    summary: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fields: BTreeMap<String, String>,
+}
+
+fn default_app_runs_limit() -> usize {
+    80
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AppRunUsage {
+    cost_usd: f64,
+    tokens: u64,
+    request_count: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayRunAggregate {
+    run_id: String,
+    trace_id: Option<String>,
+    baseline_decision: String,
+    proposed_decision: String,
+    cost_usd: f64,
+    tokens: u64,
+    rule: Option<String>,
+    summary: String,
+}
+
+#[derive(Default)]
+struct AppRuleEvidence {
+    reasons: std::collections::BTreeMap<String, u64>,
+    models: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppReplayResponse {
+    baseline: AppRunTotals,
+    has_proposed_policy: bool,
+    message: String,
+    history_window_days: i64,
+    history_window_start: chrono::DateTime<chrono::Utc>,
+    history_window_end: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposal: Option<AppReplayProposal>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppReplayProposal {
+    path: String,
+    mode: String,
+    can_enforce: bool,
+    explanation: String,
+    changed_lines: u64,
+    added_lines: u64,
+    removed_lines: u64,
+    proposed: AppRunTotals,
+    changed_runs: Vec<AppReplayChangedRun>,
+    recommendations: Vec<AppReplayRecommendation>,
+    spend_delta_usd: f64,
+    preview: Vec<AppReplayDiffLine>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppReplayRecommendation {
+    title: String,
+    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppReplayChangedRun {
+    run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
+    #[serde(rename = "from")]
+    from_decision: String,
+    #[serde(rename = "to")]
+    to_decision: String,
+    cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppReplayDiffLine {
+    kind: String,
+    line: String,
 }
 
 #[derive(Clone)]
@@ -94,6 +316,52 @@ impl PolicyRuntime {
             PolicyRuntimeState::Reloadable(reloadable) => {
                 reloadable.refresh().await;
                 reloadable.active.clone()
+            }
+        }
+    }
+
+    async fn source(&self) -> Option<(Option<PathBuf>, String, Arc<PolicyFile>)> {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            PolicyRuntimeState::Static(policy) => {
+                let policy = policy.clone()?;
+                let source = serde_yaml::to_string(policy.as_ref()).ok()?;
+                Some((None, source, policy))
+            }
+            PolicyRuntimeState::Reloadable(reloadable) => {
+                reloadable.refresh().await;
+                let policy = reloadable.active.clone()?;
+                let source = match &reloadable.last_observed_source {
+                    PolicySourceSnapshot::Bytes(bytes) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    PolicySourceSnapshot::ReadError(_) => {
+                        serde_yaml::to_string(policy.as_ref()).ok()?
+                    }
+                };
+                Some((Some(reloadable.source_path.clone()), source, policy))
+            }
+        }
+    }
+}
+
+impl PolicyRuntime {
+    async fn update_source(
+        &self,
+        source: String,
+    ) -> Result<(Option<PathBuf>, PolicyFile), NoetError> {
+        let policy = crate::policy::parse_policy_bytes(source.as_bytes())?;
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            PolicyRuntimeState::Static(active) => {
+                *active = Some(Arc::new(policy.clone()));
+                Ok((None, policy))
+            }
+            PolicyRuntimeState::Reloadable(reloadable) => {
+                fs::write(&reloadable.source_path, source.as_bytes()).await?;
+                reloadable.last_observed_source = PolicySourceSnapshot::Bytes(source.into_bytes());
+                reloadable.active = Some(Arc::new(policy.clone()));
+                Ok((Some(reloadable.source_path.clone()), policy))
             }
         }
     }
@@ -163,6 +431,7 @@ impl AppState {
         Self {
             fixture_dir,
             simulation_dir: PathBuf::from(".noet/simulations"),
+            policy_proposal_path: PathBuf::from(".noet/policy.proposed.yaml"),
             upstream,
             routes: Vec::new(),
             client: reqwest::Client::new(),
@@ -192,6 +461,17 @@ impl AppState {
     pub async fn active_policy(&self) -> Option<Arc<PolicyFile>> {
         self.policy.current().await
     }
+
+    async fn active_policy_source(&self) -> Option<(Option<PathBuf>, String, Arc<PolicyFile>)> {
+        self.policy.source().await
+    }
+
+    async fn update_policy_source(
+        &self,
+        source: String,
+    ) -> Result<(Option<PathBuf>, PolicyFile), NoetError> {
+        self.policy.update_source(source).await
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -220,6 +500,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     }
     let bind = config.bind;
     let ledger = BudgetLedger::open_sqlite(&config.db_path)?;
+    let policy_proposal_path = config
+        .simulation_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(".noet"))
+        .join("policy.proposed.yaml");
     let policy_runtime = match (config.policy_path, config.policy) {
         (Some(policy_path), Some(policy)) => {
             let source_bytes = fs::read(&policy_path).await?;
@@ -234,6 +519,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         config.decision_mode,
     );
     state.simulation_dir = config.simulation_dir;
+    state.policy_proposal_path = policy_proposal_path;
     state.routes = config.routes;
     state.ledger = Arc::new(Mutex::new(ledger));
     let app = build_router(state);
@@ -253,15 +539,26 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/reports/decisions", get(report_decisions))
         .route("/v1/reports/traces/{trace_id}", get(report_trace))
         .route("/v1/reports/observations", get(report_observations))
-        .route("/v1/reports/dashboard-data", get(report_dashboard_data))
-        .route("/v1/reports/dashboard", get(report_dashboard_html))
         .route("/v1/reports/updates", get(report_updates_stream))
-        .route("/v1/dashboard/filters", get(dashboard_filters))
-        .route("/v1/dashboard/overview", get(dashboard_overview))
-        .route("/v1/dashboard/budgets", get(dashboard_budgets))
-        .route("/v1/dashboard/adoption", get(dashboard_adoption))
-        .route("/v1/dashboard/traces", get(dashboard_traces))
-        .route("/v1/dashboard/strategy-lab", get(dashboard_strategy_lab))
+        .route(
+            "/v1/reports/dashboard-data",
+            any(deprecated_dashboard_surface),
+        )
+        .route("/v1/reports/dashboard", any(deprecated_dashboard_surface))
+        .route("/v1/dashboard/{*path}", any(deprecated_dashboard_surface))
+        .route("/v1/app/policy", get(app_policy))
+        .route(
+            "/v1/app/policy/proposal",
+            put(update_app_policy_proposal).delete(discard_app_policy_proposal),
+        )
+        .route(
+            "/v1/app/policy/suggestions/{suggestion_id}/apply",
+            post(apply_app_policy_suggestion),
+        )
+        .route("/v1/app/policy/enforce", post(enforce_app_policy_proposal))
+        .route("/v1/app/runs", get(app_runs))
+        .route("/v1/app/runs/{run_id}", get(app_run_detail))
+        .route("/v1/app/replay", get(app_replay))
         .route("/v1/simulations", get(list_simulations))
         .route("/v1/simulations/{simulation_id}", get(simulation_report))
         .route(
@@ -281,10 +578,16 @@ pub fn build_router(state: AppState) -> Router {
             get(simulation_strategy_dashboard_html),
         )
         .route("/simulations", get(simulations_index_html))
-        .route("/dashboard", get(live_dashboard_html))
-        .route("/dashboard/app.js", get(live_dashboard_js))
-        .route("/dashboard/app.css", get(live_dashboard_css))
-        .route("/dashboard/brand/icon.svg", get(live_dashboard_brand_icon))
+        .route("/", get(noether_app_html))
+        .route("/policy", get(noether_app_html))
+        .route("/runs", get(noether_app_html))
+        .route("/replay", get(noether_app_html))
+        .route("/app/app.js", get(noether_app_js))
+        .route("/app/app.css", get(noether_app_css))
+        .route("/app/logo.svg", get(noether_app_logo))
+        .route("/app/favicon.svg", get(noether_app_favicon))
+        .route("/dashboard", any(deprecated_dashboard_surface))
+        .route("/dashboard/{*path}", any(deprecated_dashboard_surface))
         .route("/v1/chat/completions", any(capture))
         .route("/v1/messages", any(capture))
         .route("/v1/responses", any(capture))
@@ -342,22 +645,6 @@ struct ReportQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct DashboardShellQuery {
-    page: Option<String>,
-    trace: Option<String>,
-    simulation: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashboardQuery {
-    window: Option<String>,
-    lens: Option<String>,
-    entity: Option<String>,
-    trace: Option<String>,
-    simulation: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct SimulationStrategyPath {
     simulation_id: String,
     strategy_id: String,
@@ -399,55 +686,6 @@ struct SimulationStrategySurfaceSummary {
     dashboard_url: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct DashboardStrategyBaseline {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    horizon_days: u32,
-    total_requests: u64,
-    strategy_count: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct DashboardStrategyCard {
-    id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    policy_moves: Vec<String>,
-    total_requests: u64,
-    allowed_requests: u64,
-    warned_requests: u64,
-    denied_requests: u64,
-    fallback_count: u64,
-    useful_work_blocked_score: u64,
-    total_cost_usd: f64,
-    adoption_coverage: f64,
-    fairness_score: f64,
-    runaway_spend_prevented_usd: f64,
-    unused_budget_usd: f64,
-    limit_hit_count: u64,
-    unused_protected_opportunity_usd: f64,
-    low_adopter_count: u64,
-    high_adopter_count: u64,
-    carryover_liability_usd: f64,
-    model_mix: Vec<crate::simulation::SimulationModelMixEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exhaustion_day: Option<u32>,
-    badges: Vec<String>,
-    recommendation: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct DashboardStrategyLabData {
-    simulations: Vec<SimulationSurfaceSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selected_simulation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    baseline: Option<DashboardStrategyBaseline>,
-    strategy_cards: Vec<DashboardStrategyCard>,
-    recommendations: Vec<String>,
-}
-
 async fn report_usage(State(state): State<AppState>) -> Result<Json<serde_json::Value>, NoetError> {
     let ledger = state.ledger.lock().await;
     Ok(Json(serde_json::to_value(reporting::usage_report(
@@ -486,90 +724,1001 @@ async fn report_observations(
     )?)?))
 }
 
-async fn report_dashboard_data(
-    State(state): State<AppState>,
-    Query(query): Query<ReportQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
-    let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(reporting::dashboard_report(
-        &ledger,
-        query.trace.as_deref(),
-    )?)?))
+async fn app_policy(State(state): State<AppState>) -> Result<Json<AppPolicyResponse>, NoetError> {
+    let Some((path, _, policy)) = state.active_policy_source().await else {
+        return Err(NoetError::NotFound("no active policy".to_owned()));
+    };
+    let decisions = {
+        let ledger = state.ledger.lock().await;
+        reporting::decisions_report(&ledger)?
+    };
+    let rule_stats = app_rule_stats(&policy, &decisions);
+    let suggestions = app_policy_suggestions(&rule_stats);
+    let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
+    let source = app_display_policy_source(policy.as_ref())?;
+    Ok(Json(AppPolicyResponse {
+        path: path.map(|path| path.display().to_string()),
+        source,
+        policy: policy.as_ref().clone(),
+        decision_mode: state.decision_mode,
+        rule_stats,
+        suggestions,
+        proposal,
+    }))
 }
 
-async fn report_dashboard_html(
+async fn update_app_policy_proposal(
     State(state): State<AppState>,
-    Query(query): Query<ReportQuery>,
-) -> Result<Html<String>, NoetError> {
-    let ledger = state.ledger.lock().await;
-    let report = reporting::dashboard_report(&ledger, query.trace.as_deref())?;
-    Ok(Html(render_dashboard_artifact(&report)))
+    Json(update): Json<AppPolicyUpdate>,
+) -> Result<Json<AppPolicyResponse>, NoetError> {
+    crate::policy::parse_policy_bytes(update.source.as_bytes())?;
+    if let Some(parent) = state.policy_proposal_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(&state.policy_proposal_path, update.source.as_bytes()).await?;
+    let response = app_policy(State(state.clone())).await?;
+    let _ = state.report_updates.send(ReportUpdate {
+        kind: "policy_proposal",
+        trace_id: None,
+    });
+    Ok(response)
 }
 
-async fn dashboard_filters(
+async fn discard_app_policy_proposal(
     State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
-    let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(dashboard::filters(
-        &ledger,
-        dashboard_query(&query),
-    )?)?))
+) -> Result<Json<AppPolicyResponse>, NoetError> {
+    match fs::remove_file(&state.policy_proposal_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let response = app_policy(State(state.clone())).await?;
+    let _ = state.report_updates.send(ReportUpdate {
+        kind: "policy_proposal",
+        trace_id: None,
+    });
+    Ok(response)
 }
 
-async fn dashboard_overview(
+async fn apply_app_policy_suggestion(
     State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
-    let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(dashboard::overview(
-        &ledger,
-        dashboard_query(&query),
-    )?)?))
+    AxumPath(suggestion_id): AxumPath<String>,
+) -> Result<Json<AppPolicyApplyResponse>, NoetError> {
+    let Some((_, active_source, policy)) = state.active_policy_source().await else {
+        return Err(NoetError::NotFound("no active policy".to_owned()));
+    };
+    let decisions = {
+        let ledger = state.ledger.lock().await;
+        reporting::decisions_report(&ledger)?
+    };
+    let stats = app_rule_stats(&policy, &decisions);
+    let suggestions = app_policy_suggestions(&stats);
+    let suggestion = suggestions
+        .iter()
+        .find(|suggestion| suggestion.id == suggestion_id)
+        .ok_or_else(|| NoetError::NotFound(format!("suggestion {suggestion_id}")))?;
+    let source = app_policy_proposal(&state.policy_proposal_path)
+        .await?
+        .map(|proposal| proposal.source)
+        .unwrap_or(active_source);
+    let updated_source = apply_suggestion_to_policy_source(&source, suggestion)?;
+    if let Some(parent) = state.policy_proposal_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(&state.policy_proposal_path, updated_source.as_bytes()).await?;
+    let policy = app_policy(State(state.clone())).await?.0;
+    Ok(Json(AppPolicyApplyResponse {
+        policy,
+        applied: suggestion.title.clone(),
+    }))
 }
 
-async fn dashboard_budgets(
+async fn enforce_app_policy_proposal(
     State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
-    let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(dashboard::budgets(
-        &ledger,
-        dashboard_query(&query),
-    )?)?))
+) -> Result<Json<AppPolicyResponse>, NoetError> {
+    let source = match fs::read_to_string(&state.policy_proposal_path).await {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NoetError::NotFound("no policy proposal saved".to_owned()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    state.update_policy_source(source).await?;
+    match fs::remove_file(&state.policy_proposal_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let response = app_policy(State(state.clone())).await?;
+    let _ = state.report_updates.send(ReportUpdate {
+        kind: "policy",
+        trace_id: None,
+    });
+    Ok(response)
 }
 
-async fn dashboard_adoption(
+async fn app_runs(
     State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
+    Query(query): Query<AppRunsQuery>,
+) -> Result<Json<AppRunsResponse>, NoetError> {
     let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(dashboard::adoption(
-        &ledger,
-        dashboard_query(&query),
-    )?)?))
+    let decisions = reporting::decisions_report(&ledger)?;
+    let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
+    let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
+    let totals = app_run_totals_from_rows(&all_runs);
+    let limit = query.limit.clamp(1, 250);
+    let offset = query.offset;
+    let filtered = all_runs
+        .into_iter()
+        .filter(|run| app_run_matches_query(run, &query))
+        .collect::<Vec<_>>();
+    let filtered_total = filtered.len() as u64;
+    let runs = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset =
+        (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
+    Ok(Json(AppRunsResponse {
+        runs,
+        totals,
+        filtered_total,
+        next_offset,
+    }))
 }
 
-async fn dashboard_traces(
+async fn app_run_detail(
     State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
+    AxumPath(run_id): AxumPath<String>,
+) -> Result<Json<AppRunRow>, NoetError> {
     let ledger = state.ledger.lock().await;
-    Ok(Json(serde_json::to_value(dashboard::traces(
-        &ledger,
-        dashboard_query(&query),
-    )?)?))
+    let decisions = reporting::decisions_report(&ledger)?;
+    let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
+    let mut run = app_agent_runs(&decisions, &usage_by_agent_run)
+        .into_iter()
+        .find(|run| {
+            run.id == run_id
+                || run.agent_run_id.as_deref() == Some(run_id.as_str())
+                || run.trace_id.as_deref() == Some(run_id.as_str())
+        })
+        .ok_or_else(|| NoetError::NotFound(format!("run {run_id}")))?;
+    run.timeline = app_run_timeline(&ledger, &run)?;
+    Ok(Json(run))
 }
 
-async fn dashboard_strategy_lab(
-    State(state): State<AppState>,
-    Query(query): Query<DashboardQuery>,
-) -> Result<Json<serde_json::Value>, NoetError> {
-    let simulations = list_simulation_artifacts(&state.simulation_dir)?;
-    Ok(Json(serde_json::to_value(strategy_lab_data(
-        simulations,
-        query.simulation.as_deref(),
-    ))?))
+async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayResponse>, NoetError> {
+    const HISTORY_WINDOW_DAYS: i64 = 1;
+    let history_window_end = chrono::Utc::now();
+    let history_window_start = history_window_end - chrono::Duration::days(HISTORY_WINDOW_DAYS);
+    let ledger = state.ledger.lock().await;
+    let decisions = ledger.decisions_report_since(Some(history_window_start))?;
+    let historical_requests =
+        ledger.historical_authorize_requests_since(Some(history_window_start))?;
+    let usage_by_agent_run =
+        app_usage_by_agent_run(&ledger.usage_activity_report_since(Some(history_window_start))?);
+    let baseline_runs = app_agent_runs(&decisions, &usage_by_agent_run);
+    let active_source = state
+        .active_policy_source()
+        .await
+        .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
+        .transpose()?
+        .unwrap_or_default();
+    let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
+    let has_proposed_policy = proposal.is_some();
+    let replay_proposal = proposal
+        .as_ref()
+        .map(|proposal| {
+            app_replay_proposal(
+                &active_source,
+                proposal,
+                &historical_requests,
+                &usage_by_agent_run,
+            )
+        })
+        .transpose()?;
+    Ok(Json(AppReplayResponse {
+        baseline: app_replay_baseline_totals(&baseline_runs),
+        has_proposed_policy,
+        message: if has_proposed_policy {
+            "A valid proposed policy is saved locally. Recent authorization requests were re-evaluated against the draft."
+        } else {
+            "No proposed policy has been saved for replay yet. Edit Policy first to create a local draft without enforcing it."
+        }
+        .to_owned(),
+        history_window_days: HISTORY_WINDOW_DAYS,
+        history_window_start,
+        history_window_end,
+        proposal: replay_proposal,
+    }))
+}
+
+async fn app_policy_proposal(path: &Path) -> Result<Option<AppPolicyProposal>, NoetError> {
+    match fs::read_to_string(path).await {
+        Ok(source) => {
+            let policy = crate::policy::parse_policy_bytes(source.as_bytes())?;
+            Ok(Some(AppPolicyProposal {
+                path: path.display().to_string(),
+                source: app_display_policy_source(&policy)?,
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn app_display_policy_source(policy: &PolicyFile) -> Result<String, NoetError> {
+    serde_yaml::to_string(policy).map_err(NoetError::from)
+}
+
+fn app_rule_stats(policy: &PolicyFile, decisions: &[TraceReportItem]) -> Vec<AppRuleStat> {
+    let mut stats = policy
+        .budgets
+        .iter()
+        .map(|budget| {
+            (
+                budget.id.clone(),
+                AppRuleStat {
+                    rule: budget.id.clone(),
+                    allow: 0,
+                    warn: 0,
+                    deny: 0,
+                    ask: 0,
+                    limit_hits: 0,
+                    top_reason: None,
+                    top_model: None,
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut evidence = std::collections::BTreeMap::<String, AppRuleEvidence>::new();
+
+    for item in decisions {
+        let rule = item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.selected_budget_id.clone())
+            .unwrap_or_else(|| "unattributed".to_owned());
+        let stat = stats.entry(rule.clone()).or_insert_with(|| AppRuleStat {
+            rule,
+            allow: 0,
+            warn: 0,
+            deny: 0,
+            ask: 0,
+            limit_hits: 0,
+            top_reason: None,
+            top_model: None,
+        });
+        let decision = app_decision_label(&item.kind);
+        match decision.as_str() {
+            "allow" => stat.allow += 1,
+            "warn" => stat.warn += 1,
+            "deny" => stat.deny += 1,
+            "ask" => stat.ask += 1,
+            _ => {}
+        }
+        stat.limit_hits += item
+            .limit_hits
+            .as_ref()
+            .map(|hits| hits.len() as u64)
+            .unwrap_or(0);
+        if decision == "deny"
+            || item
+                .limit_hits
+                .as_ref()
+                .is_some_and(|hits| !hits.is_empty())
+        {
+            let evidence = evidence.entry(stat.rule.clone()).or_default();
+            if let Some(reason) = app_decision_reason(item) {
+                *evidence.reasons.entry(reason).or_default() += 1;
+            }
+            if let Some(model) = reporting::summary_value(&item.summary, "model") {
+                *evidence.models.entry(model).or_default() += 1;
+            }
+        }
+    }
+
+    let mut stats = stats.into_values().collect::<Vec<_>>();
+    for stat in &mut stats {
+        if let Some(evidence) = evidence.get(&stat.rule) {
+            stat.top_reason = most_common(&evidence.reasons);
+            stat.top_model = most_common(&evidence.models);
+        }
+    }
+    stats
+}
+
+fn app_policy_suggestions(stats: &[AppRuleStat]) -> Vec<AppSuggestion> {
+    let mut suggestions = Vec::new();
+    for stat in stats {
+        if stat.deny > 0 {
+            let mut evidence = Vec::new();
+            if let Some(reason) = &stat.top_reason {
+                evidence.push(format!("Reason: {reason}"));
+            }
+            if let Some(model) = &stat.top_model {
+                evidence.push(format!("Top model: {model}"));
+            }
+            evidence.push(format!("Denied runs: {}", stat.deny));
+            let body = match (&stat.top_reason, &stat.top_model) {
+                (Some(reason), Some(model)) if reason.contains("provider/model is not allowed") => {
+                    let pattern = model_ref_to_policy_pattern(model);
+                    format!(
+                        "If this is intended, keep the denial. If not, add {pattern} to {}.models.allow or route it to another budget, then replay.",
+                        stat.rule
+                    )
+                }
+                (Some(reason), _) => format!(
+                    "Most denials are because: {reason}. Inspect affected runs, edit the specific rule if needed, then replay."
+                ),
+                _ => "Inspect affected runs, edit the specific rule if needed, then replay."
+                    .to_owned(),
+            };
+            suggestions.push(AppSuggestion {
+                id: format!("{}-denies", stat.rule),
+                title: format!("{} blocked {} run(s)", stat.rule, stat.deny),
+                body,
+                rule: stat.rule.clone(),
+                action: "open_runs_filtered_to_rule".to_owned(),
+                apply_label: stat
+                    .top_reason
+                    .as_deref()
+                    .filter(|reason| reason.contains("provider/model is not allowed"))
+                    .and(stat.top_model.as_deref())
+                    .map(|model| format!("Allow {}", model_ref_to_policy_pattern(model))),
+                evidence,
+            });
+        } else if stat.limit_hits > 0 {
+            let evidence = stat
+                .top_reason
+                .iter()
+                .map(|reason| format!("Limit evidence: {reason}"))
+                .collect::<Vec<_>>();
+            suggestions.push(AppSuggestion {
+                id: format!("{}-limit-hits", stat.rule),
+                title: format!("{} hit limits {} time(s)", stat.rule, stat.limit_hits),
+                body: "This rule is close to its boundary. Replay a stricter or roomier policy against real history.".to_owned(),
+                rule: stat.rule.clone(),
+                action: "replay_rule_change".to_owned(),
+                apply_label: None,
+                evidence,
+            });
+        }
+    }
+    suggestions.truncate(3);
+    suggestions
+}
+
+fn app_decision_reason(item: &TraceReportItem) -> Option<String> {
+    if let Some(hit) = item
+        .binding_limit
+        .as_ref()
+        .or_else(|| item.limit_hits.as_ref().and_then(|hits| hits.first()))
+    {
+        return Some(hit.reason.clone());
+    }
+    let routing = item.routing.as_ref()?;
+    if routing.model_check.as_deref() == Some("denied") {
+        return Some("provider/model is not allowed by budget".to_owned());
+    }
+    routing.rejected_budget_reason.clone()
+}
+
+fn model_ref_to_policy_pattern(model_ref: &str) -> String {
+    model_ref
+        .split_once('/')
+        .map(|(provider, model)| format!("{provider}:{model}"))
+        .unwrap_or_else(|| model_ref.to_owned())
+}
+
+fn apply_suggestion_to_policy_source(
+    source: &str,
+    suggestion: &AppSuggestion,
+) -> Result<String, NoetError> {
+    let model = suggestion
+        .apply_label
+        .as_deref()
+        .and_then(|label| label.strip_prefix("Allow "))
+        .ok_or_else(|| {
+            NoetError::InvalidPolicy("suggestion cannot be applied automatically".to_owned())
+        })?;
+    let mut policy = crate::policy::parse_policy_bytes(source.as_bytes())?;
+    let budget = policy
+        .budgets
+        .iter_mut()
+        .find(|budget| budget.id == suggestion.rule)
+        .ok_or_else(|| NoetError::NotFound(format!("budget {}", suggestion.rule)))?;
+    if !budget.models.allow.iter().any(|value| value == model) {
+        budget.models.allow.push(model.to_owned());
+        budget.models.allow.sort();
+    }
+    serde_yaml::to_string(&policy).map_err(NoetError::from)
+}
+
+fn most_common(values: &std::collections::BTreeMap<String, u64>) -> Option<String> {
+    values
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|(value, _)| value.clone())
+}
+
+fn app_agent_runs(
+    decisions: &[TraceReportItem],
+    usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+) -> Vec<AppRunRow> {
+    let mut runs = std::collections::BTreeMap::<String, AppRunRow>::new();
+    for item in decisions {
+        let run = app_run_row(item, usage_by_agent_run);
+        let key = app_run_group_key(&run);
+        runs.entry(key)
+            .and_modify(|existing| merge_app_run(existing, &run))
+            .or_insert(run);
+    }
+    let mut runs = runs.into_values().collect::<Vec<_>>();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.occurred_at));
+    runs
+}
+
+fn app_run_group_key(run: &AppRunRow) -> String {
+    if let Some(agent_run_id) = run.agent_run_id.as_deref() {
+        return format!("agent-run:{agent_run_id}");
+    }
+    if let Some(trace_id) = run.trace_id.as_deref() {
+        return format!("trace-fallback:{trace_id}");
+    }
+    let minute_bucket = run.occurred_at.timestamp() / 60;
+    format!(
+        "untraced:{}:{}:{}:{minute_bucket}",
+        run.decision,
+        run.rule.as_deref().unwrap_or("unattributed"),
+        run.model.as_deref().unwrap_or("unknown")
+    )
+}
+
+fn app_run_row(
+    item: &TraceReportItem,
+    usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+) -> AppRunRow {
+    let trace_id = item
+        .trace_id
+        .clone()
+        .or_else(|| reporting::summary_value(&item.summary, "trace"));
+    let request_id = reporting::summary_value(&item.summary, "request")
+        .or_else(|| reporting::summary_value(&item.summary, "request_id"));
+    let id = request_id
+        .or_else(|| trace_id.clone())
+        .unwrap_or_else(|| format!("{}-{}", item.kind, item.occurred_at.timestamp_millis()));
+    let agent_run_id = item.agent_run_id.clone();
+    let model_ref = reporting::summary_value(&item.summary, "model");
+    let (provider, model) = model_ref
+        .as_deref()
+        .and_then(|value| value.split_once('/'))
+        .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
+        .unwrap_or_else(|| (None, model_ref.clone()));
+    let run_usage = agent_run_id
+        .as_deref()
+        .and_then(|agent_run_id| usage_by_agent_run.get(agent_run_id).copied());
+    let estimated_cost = reporting::summary_value(&item.summary, "estimated_cost")
+        .and_then(|value| value.parse::<f64>().ok());
+    AppRunRow {
+        occurred_at: item.occurred_at,
+        id: agent_run_id.clone().unwrap_or(id),
+        agent_run_id,
+        decision: app_decision_label(&item.kind),
+        summary: item.summary.clone(),
+        trace_id,
+        rule: item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.selected_budget_id.clone()),
+        decision_reason: app_decision_reason(item),
+        model_check: item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.model_check.clone())
+            .or_else(|| reporting::summary_value(&item.summary, "model_check")),
+        limit_hits: item
+            .limit_hits
+            .as_ref()
+            .map(|hits| hits.len() as u64)
+            .unwrap_or(0),
+        provider,
+        model,
+        cost_usd: estimated_cost.or_else(|| {
+            run_usage
+                .map(|usage| usage.cost_usd)
+                .filter(|cost| *cost > 0.0)
+        }),
+        estimated_tokens: reporting::summary_value(&item.summary, "estimated_tokens")
+            .and_then(|value| value.parse::<u64>().ok()),
+        actual_tokens: run_usage
+            .map(|usage| usage.tokens)
+            .filter(|tokens| *tokens > 0),
+        tool_calls: reporting::summary_value(&item.summary, "tools_count")
+            .and_then(|value| value.parse::<u64>().ok()),
+        matched_entity: item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.matched_entity.clone()),
+        entities: item.entities.clone(),
+        timeline: Vec::new(),
+    }
+}
+
+fn merge_app_run(existing: &mut AppRunRow, next: &AppRunRow) {
+    if next.occurred_at > existing.occurred_at {
+        existing.occurred_at = next.occurred_at;
+        existing.id = next.id.clone();
+        existing.summary = next.summary.clone();
+        existing.provider = next.provider.clone().or_else(|| existing.provider.clone());
+        existing.model = next.model.clone().or_else(|| existing.model.clone());
+        existing.estimated_tokens = next.estimated_tokens.or(existing.estimated_tokens);
+        existing.tool_calls = next.tool_calls.or(existing.tool_calls);
+    }
+    existing.limit_hits += next.limit_hits;
+    existing.cost_usd = existing.cost_usd.or(next.cost_usd);
+    existing.actual_tokens = existing.actual_tokens.or(next.actual_tokens);
+    if app_decision_rank(&next.decision) > app_decision_rank(&existing.decision) {
+        existing.decision = next.decision.clone();
+        existing.rule = next.rule.clone().or_else(|| existing.rule.clone());
+        existing.decision_reason = next
+            .decision_reason
+            .clone()
+            .or_else(|| existing.decision_reason.clone());
+        existing.model_check = next
+            .model_check
+            .clone()
+            .or_else(|| existing.model_check.clone());
+    }
+    if existing.rule.is_none() {
+        existing.rule = next.rule.clone();
+    }
+    if existing.decision_reason.is_none() {
+        existing.decision_reason = next.decision_reason.clone();
+    }
+    if existing.model_check.is_none() {
+        existing.model_check = next.model_check.clone();
+    }
+    if existing.matched_entity.is_none() {
+        existing.matched_entity = next.matched_entity.clone();
+    }
+    for entity in &next.entities {
+        if !existing.entities.contains(entity) {
+            existing.entities.push(entity.clone());
+        }
+    }
+}
+
+fn app_decision_rank(decision: &str) -> u8 {
+    match decision {
+        "deny" => 4,
+        "ask" => 3,
+        "warn" => 2,
+        "allow" => 1,
+        _ => 0,
+    }
+}
+
+fn app_usage_by_agent_run(
+    usage: &[crate::ledger::UsageActivityRecord],
+) -> std::collections::BTreeMap<String, AppRunUsage> {
+    let mut by_agent_run = std::collections::BTreeMap::new();
+    for record in usage {
+        let Some(agent_run_id) = record.agent_run_id.as_deref() else {
+            continue;
+        };
+        let entry = by_agent_run
+            .entry(agent_run_id.to_owned())
+            .or_insert_with(AppRunUsage::default);
+        entry.cost_usd += record.cost_usd;
+        entry.tokens += record.total_tokens;
+        entry.request_count += 1;
+    }
+    by_agent_run
+}
+
+fn app_run_timeline(
+    ledger: &BudgetLedger,
+    run: &AppRunRow,
+) -> Result<Vec<AppRunTimelineItem>, NoetError> {
+    let Some(trace_id) = run.trace_id.as_deref() else {
+        return Ok(vec![AppRunTimelineItem {
+            occurred_at: run.occurred_at,
+            kind: format!("decision.{}", run.decision),
+            summary: run.summary.clone(),
+            fields: app_summary_fields(&run.summary),
+        }]);
+    };
+    let trace = ledger.trace_report(trace_id)?;
+    let mut items = trace
+        .items
+        .into_iter()
+        .filter(|item| {
+            run.agent_run_id.is_none()
+                || item.agent_run_id.as_deref() == run.agent_run_id.as_deref()
+        })
+        .map(|item| AppRunTimelineItem {
+            occurred_at: item.occurred_at,
+            kind: item.kind,
+            fields: app_summary_fields(&item.summary),
+            summary: item.summary,
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        items.push(AppRunTimelineItem {
+            occurred_at: run.occurred_at,
+            kind: format!("decision.{}", run.decision),
+            summary: run.summary.clone(),
+            fields: app_summary_fields(&run.summary),
+        });
+    }
+    items.sort_by_key(|item| item.occurred_at);
+    items.truncate(80);
+    Ok(items)
+}
+
+fn app_summary_fields(summary: &str) -> BTreeMap<String, String> {
+    summary
+        .split_whitespace()
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn app_run_matches_query(run: &AppRunRow, query: &AppRunsQuery) -> bool {
+    if let Some(decision) = query.decision.as_deref()
+        && !decision.is_empty()
+        && decision != "any"
+        && run.decision != decision
+    {
+        return false;
+    }
+    if let Some(rule) = query.rule.as_deref()
+        && !rule.is_empty()
+        && rule != "any"
+        && run.rule.as_deref() != Some(rule)
+    {
+        return false;
+    }
+    if let Some(q) = query.q.as_deref() {
+        let q = q.trim().to_ascii_lowercase();
+        if !q.is_empty()
+            && ![
+                run.id.as_str(),
+                run.agent_run_id.as_deref().unwrap_or(""),
+                run.summary.as_str(),
+                run.trace_id.as_deref().unwrap_or(""),
+                run.rule.as_deref().unwrap_or(""),
+                run.provider.as_deref().unwrap_or(""),
+                run.model.as_deref().unwrap_or(""),
+                run.matched_entity.as_deref().unwrap_or(""),
+            ]
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(&q))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn app_replay_proposal(
+    active_source: &str,
+    proposal: &AppPolicyProposal,
+    historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
+    usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+) -> Result<AppReplayProposal, NoetError> {
+    let active_lines = active_source
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>();
+    let proposal_lines = proposal
+        .source
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut preview = Vec::new();
+
+    for line in active_lines.difference(&proposal_lines).take(8) {
+        preview.push(AppReplayDiffLine {
+            kind: "removed".to_owned(),
+            line: (*line).to_owned(),
+        });
+    }
+    for line in proposal_lines.difference(&active_lines).take(8) {
+        preview.push(AppReplayDiffLine {
+            kind: "added".to_owned(),
+            line: (*line).to_owned(),
+        });
+    }
+
+    let added_lines = proposal_lines.difference(&active_lines).count() as u64;
+    let removed_lines = active_lines.difference(&proposal_lines).count() as u64;
+    let changed_lines = added_lines + removed_lines;
+    let proposed_policy = crate::policy::parse_policy_bytes(proposal.source.as_bytes())?;
+    let (proposed, changed_runs, spend_delta_usd) =
+        replay_historical_requests(&proposed_policy, historical_requests, usage_by_agent_run)?;
+    let recommendations = app_replay_recommendations(&changed_runs, spend_delta_usd);
+    let (mode, explanation) = if changed_lines == 0 {
+        (
+            "current_policy_backtest",
+            "No pending source edit. This backtests the currently saved policy against recorded historical decisions.",
+        )
+    } else {
+        (
+            "draft_impact",
+            "This compares the active policy to the saved draft by replaying recorded historical authorizations.",
+        )
+    };
+    Ok(AppReplayProposal {
+        path: proposal.path.clone(),
+        mode: mode.to_owned(),
+        can_enforce: changed_lines > 0,
+        explanation: explanation.to_owned(),
+        changed_lines,
+        added_lines,
+        removed_lines,
+        proposed,
+        changed_runs,
+        recommendations,
+        spend_delta_usd,
+        preview,
+    })
+}
+
+fn app_replay_recommendations(
+    changed_runs: &[AppReplayChangedRun],
+    spend_delta_usd: f64,
+) -> Vec<AppReplayRecommendation> {
+    if changed_runs.is_empty() {
+        return vec![AppReplayRecommendation {
+            title: "Draft matches recorded history".to_owned(),
+            body: "No recorded run decisions would change. This is safe from a historical-decision perspective, but it may still affect future traffic.".to_owned(),
+            rule: None,
+            action: "review_policy_diff".to_owned(),
+        }];
+    }
+
+    let newly_blocked = changed_runs
+        .iter()
+        .filter(|run| run.to_decision == "deny" && run.from_decision != "deny")
+        .count();
+    let newly_warned = changed_runs
+        .iter()
+        .filter(|run| run.to_decision == "warn" && run.from_decision != "warn")
+        .count();
+    let newly_allowed = changed_runs
+        .iter()
+        .filter(|run| run.from_decision == "deny" && run.to_decision != "deny")
+        .count();
+    let mut by_rule = std::collections::BTreeMap::<String, (u64, f64)>::new();
+    for run in changed_runs {
+        let rule = run
+            .rule
+            .clone()
+            .unwrap_or_else(|| "unattributed".to_owned());
+        let entry = by_rule.entry(rule).or_default();
+        entry.0 += 1;
+        entry.1 += run.cost_usd;
+    }
+    let (rule, (count, cost)) = by_rule
+        .into_iter()
+        .max_by(|(_, left), (_, right)| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        })
+        .expect("changed runs are non-empty");
+    let title = if newly_blocked > 0 {
+        format!("{newly_blocked} run(s) would be newly blocked")
+    } else if newly_warned > 0 && newly_allowed == 0 {
+        format!("{newly_warned} run(s) would become warnings")
+    } else if newly_warned > 0 && newly_allowed > 0 {
+        format!("{newly_warned} warning(s), {newly_allowed} previously denied run(s) loosened")
+    } else if newly_allowed > 0 {
+        format!("{newly_allowed} previously denied run(s) would be allowed or warned")
+    } else {
+        format!("{count} recorded outcome(s) would change")
+    };
+    let body = if newly_blocked > 0 {
+        format!(
+            "This draft blocks traffic that previously ran. The largest affected rule is {rule}, covering ${cost:.2}. Projected spend delta is {spend_delta_usd:+.2}; inspect examples before adopting."
+        )
+    } else if newly_warned > 0 {
+        format!(
+            "This draft mostly changes enforcement posture, not spend: affected runs would warn under {rule}. Projected spend delta is {spend_delta_usd:+.2}."
+        )
+    } else {
+        format!(
+            "The largest affected rule is {rule}, covering ${cost:.2}. Projected spend delta is {spend_delta_usd:+.2}; inspect examples before adopting."
+        )
+    };
+    vec![AppReplayRecommendation {
+        title,
+        body,
+        rule: Some(rule),
+        action: "review_changed_runs".to_owned(),
+    }]
+}
+
+fn replay_historical_requests(
+    proposed_policy: &PolicyFile,
+    historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
+    usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+) -> Result<(AppRunTotals, Vec<AppReplayChangedRun>, f64), NoetError> {
+    let mut replay_ledger = BudgetLedger::default();
+    let mut runs = std::collections::BTreeMap::<String, ReplayRunAggregate>::new();
+
+    for historical in historical_requests {
+        let decision = replay_ledger.try_authorize_replay_at(
+            Some(proposed_policy),
+            &historical.request,
+            historical.occurred_at,
+        )?;
+        let proposed_label = decision_outcome_label(decision.outcome);
+        let baseline_label = decision_outcome_label(historical.baseline_outcome);
+        let agent_run_id = string_metadata_value(&historical.request, "agent_run_id");
+        let trace_id = string_metadata_value(&historical.request, "trace_id");
+        let key = agent_run_id
+            .clone()
+            .map(|id| format!("agent-run:{id}"))
+            .or_else(|| trace_id.clone().map(|id| format!("trace:{id}")))
+            .unwrap_or_else(|| {
+                let minute_bucket = historical.occurred_at.timestamp() / 60;
+                format!(
+                    "untraced:{}:{}:{}:{minute_bucket}",
+                    baseline_label,
+                    "unattributed",
+                    historical.request.model.as_deref().unwrap_or("unknown")
+                )
+            });
+        let run_id = agent_run_id
+            .clone()
+            .or_else(|| trace_id.clone())
+            .unwrap_or_else(|| historical.decision_id.clone());
+        let usage = agent_run_id
+            .as_deref()
+            .and_then(|id| usage_by_agent_run.get(id).copied());
+        let entry = runs.entry(key).or_insert_with(|| ReplayRunAggregate {
+            run_id,
+            trace_id,
+            baseline_decision: baseline_label.to_owned(),
+            proposed_decision: proposed_label.to_owned(),
+            cost_usd: usage.map(|usage| usage.cost_usd).unwrap_or(0.0),
+            tokens: usage.map(|usage| usage.tokens).unwrap_or(0),
+            rule: None,
+            summary: replay_change_summary(&historical.request),
+        });
+        if usage.is_none() {
+            entry.cost_usd += historical.request.estimated_cost_usd.unwrap_or(0.0);
+            entry.tokens += historical.request.estimated_tokens.unwrap_or(0);
+        }
+        if app_decision_rank(baseline_label) > app_decision_rank(&entry.baseline_decision) {
+            entry.baseline_decision = baseline_label.to_owned();
+        }
+        if app_decision_rank(proposed_label) > app_decision_rank(&entry.proposed_decision) {
+            entry.proposed_decision = proposed_label.to_owned();
+        }
+        if entry.rule.is_none() {
+            entry.rule = decision
+                .explanations
+                .iter()
+                .find(|explanation| explanation.severity == decision.action.decision_severity())
+                .map(|explanation| explanation.rule_id.clone());
+        }
+    }
+
+    let mut totals = AppRunTotals {
+        runs: runs.len() as u64,
+        ..AppRunTotals::default()
+    };
+    let mut changed_runs = Vec::new();
+    let mut baseline_spend = 0.0;
+    let mut proposed_spend = 0.0;
+    for run in runs.into_values() {
+        totals.tokens += run.tokens;
+        match run.proposed_decision.as_str() {
+            "allow" => totals.allow += 1,
+            "warn" => totals.warn += 1,
+            "deny" => totals.deny += 1,
+            "ask" => totals.ask += 1,
+            _ => {}
+        }
+        if run.baseline_decision != "deny" {
+            baseline_spend += run.cost_usd;
+        }
+        if run.proposed_decision != "deny" {
+            proposed_spend += run.cost_usd;
+            totals.spend_usd += run.cost_usd;
+        }
+        if run.baseline_decision != run.proposed_decision {
+            changed_runs.push(AppReplayChangedRun {
+                run_id: run.run_id,
+                trace_id: run.trace_id,
+                from_decision: run.baseline_decision,
+                to_decision: run.proposed_decision,
+                cost_usd: run.cost_usd,
+                rule: run.rule,
+                summary: run.summary,
+            });
+        }
+    }
+    changed_runs.sort_by(|left, right| right.cost_usd.total_cmp(&left.cost_usd));
+    Ok((totals, changed_runs, proposed_spend - baseline_spend))
+}
+
+fn decision_outcome_label(outcome: DecisionOutcome) -> &'static str {
+    match outcome {
+        DecisionOutcome::Allow => "allow",
+        DecisionOutcome::Warn => "warn",
+        DecisionOutcome::Deny => "deny",
+    }
+}
+
+fn string_metadata_value(request: &AuthorizeRequest, key: &str) -> Option<String> {
+    request
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn replay_change_summary(request: &AuthorizeRequest) -> String {
+    [
+        request.project.as_deref(),
+        request.subject.as_deref(),
+        request.provider.as_deref(),
+        request.model.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+fn app_run_totals_from_rows(runs: &[AppRunRow]) -> AppRunTotals {
+    let mut totals = AppRunTotals {
+        runs: runs.len() as u64,
+        ..AppRunTotals::default()
+    };
+    for run in runs {
+        match run.decision.as_str() {
+            "allow" => totals.allow += 1,
+            "warn" => totals.warn += 1,
+            "deny" => totals.deny += 1,
+            "ask" => totals.ask += 1,
+            _ => {}
+        }
+        totals.limit_hits += run.limit_hits;
+        totals.spend_usd += run.cost_usd.unwrap_or(0.0);
+        totals.tokens += run.actual_tokens.or(run.estimated_tokens).unwrap_or(0);
+    }
+    totals
+}
+
+fn app_replay_baseline_totals(runs: &[AppRunRow]) -> AppRunTotals {
+    let mut totals = app_run_totals_from_rows(runs);
+    totals.spend_usd = runs
+        .iter()
+        .filter(|run| run.decision != "deny")
+        .map(|run| run.cost_usd.unwrap_or(0.0))
+        .sum();
+    totals
+}
+
+fn app_decision_label(kind: &str) -> String {
+    if kind.ends_with(".allow") {
+        "allow"
+    } else if kind.ends_with(".warn") {
+        "warn"
+    } else if kind.ends_with(".deny") {
+        "deny"
+    } else if kind.ends_with(".ask") {
+        "ask"
+    } else {
+        kind
+    }
+    .to_owned()
 }
 
 async fn list_simulations(
@@ -669,23 +1818,8 @@ async fn report_updates_stream(
     )
 }
 
-async fn live_dashboard_html(
-    Query(query): Query<DashboardShellQuery>,
-) -> Result<Html<String>, NoetError> {
-    Ok(Html(live_dashboard::dashboard_shell(
-        query.trace.as_deref(),
-        query.page.as_deref(),
-        query.simulation.as_deref(),
-    )))
-}
-
-fn dashboard_query(query: &DashboardQuery) -> DashboardViewQuery<'_> {
-    DashboardViewQuery {
-        window: query.window.as_deref(),
-        lens: query.lens.as_deref(),
-        entity: query.entity.as_deref(),
-        trace: query.trace.as_deref(),
-    }
+async fn noether_app_html() -> Html<&'static str> {
+    Html(noether_app::app_shell())
 }
 
 fn list_simulation_artifacts(simulation_dir: &Path) -> Result<Vec<SimulationArtifact>, NoetError> {
@@ -832,146 +1966,6 @@ fn simulation_surface_summary(artifact: SimulationArtifact) -> SimulationSurface
     }
 }
 
-fn strategy_lab_data(
-    artifacts: Vec<SimulationArtifact>,
-    selected_simulation: Option<&str>,
-) -> DashboardStrategyLabData {
-    let simulations: Vec<_> = artifacts
-        .iter()
-        .cloned()
-        .map(simulation_surface_summary)
-        .collect();
-    let selected = selected_simulation
-        .and_then(|id| artifacts.iter().find(|artifact| artifact.id == id))
-        .or_else(|| artifacts.first());
-
-    let baseline = selected.map(|artifact| DashboardStrategyBaseline {
-        name: artifact.report.name.clone(),
-        horizon_days: artifact.report.horizon_days,
-        total_requests: artifact.report.total_requests,
-        strategy_count: artifact.report.strategies.len(),
-    });
-    let strategy_cards = selected
-        .map(|artifact| {
-            let mut cards: Vec<_> = artifact
-                .report
-                .strategies
-                .iter()
-                .map(|strategy| {
-                    let mut badges = Vec::new();
-                    if strategy.limit_hit_count > 0 {
-                        badges.push(format!("{} limit hits", strategy.limit_hit_count));
-                    }
-                    if let Some(day) = strategy.exhaustion_day {
-                        badges.push(format!("exhausted on day {day}"));
-                    } else {
-                        badges.push("budget held through horizon".to_owned());
-                    }
-                    DashboardStrategyCard {
-                        id: strategy.id.clone(),
-                        description: strategy.description.clone(),
-                        policy_moves: strategy.policy_moves.clone(),
-                        total_requests: strategy.total_requests,
-                        allowed_requests: strategy.allowed_requests,
-                        warned_requests: strategy.warned_requests,
-                        denied_requests: strategy.denied_requests,
-                        fallback_count: strategy.fallback_count,
-                        useful_work_blocked_score: strategy.useful_work_blocked_score,
-                        total_cost_usd: strategy.total_cost_usd,
-                        adoption_coverage: strategy.adoption_coverage,
-                        fairness_score: strategy.fairness_score,
-                        runaway_spend_prevented_usd: strategy.runaway_spend_prevented_usd,
-                        unused_budget_usd: strategy.unused_budget_usd,
-                        limit_hit_count: strategy.limit_hit_count,
-                        unused_protected_opportunity_usd: strategy.unused_protected_opportunity_usd,
-                        low_adopter_count: strategy.low_adopter_count,
-                        high_adopter_count: strategy.high_adopter_count,
-                        carryover_liability_usd: strategy.carryover_liability_usd,
-                        model_mix: strategy.model_mix.clone(),
-                        exhaustion_day: strategy.exhaustion_day,
-                        badges,
-                        recommendation: strategy_recommendation(strategy),
-                    }
-                })
-                .collect();
-            cards.sort_by(|left, right| {
-                right
-                    .adoption_coverage
-                    .total_cmp(&left.adoption_coverage)
-                    .then_with(|| left.total_cost_usd.total_cmp(&right.total_cost_usd))
-            });
-            cards
-        })
-        .unwrap_or_default();
-    let recommendations = selected
-        .map(|artifact| strategy_lab_recommendations(&artifact.report))
-        .unwrap_or_default();
-
-    DashboardStrategyLabData {
-        simulations,
-        selected_simulation_id: selected.map(|artifact| artifact.id.clone()),
-        baseline,
-        strategy_cards,
-        recommendations,
-    }
-}
-
-fn strategy_lab_recommendations(report: &SimulationComparisonReport) -> Vec<String> {
-    let mut notes = Vec::new();
-    if let Some(best_adoption) = report
-        .strategies
-        .iter()
-        .max_by(|left, right| left.adoption_coverage.total_cmp(&right.adoption_coverage))
-    {
-        notes.push(format!(
-            "{} maximizes adoption coverage at {:.0}%.",
-            best_adoption.id,
-            best_adoption.adoption_coverage * 100.0
-        ));
-    }
-    if let Some(lowest_cost) = report
-        .strategies
-        .iter()
-        .min_by(|left, right| left.total_cost_usd.total_cmp(&right.total_cost_usd))
-    {
-        notes.push(format!(
-            "{} has the lowest total cost at ${:.2}.",
-            lowest_cost.id, lowest_cost.total_cost_usd
-        ));
-    }
-    if let Some(best_fairness) = report
-        .strategies
-        .iter()
-        .max_by(|left, right| left.fairness_score.total_cmp(&right.fairness_score))
-    {
-        notes.push(format!(
-            "{} scores highest on fairness at {:.2}.",
-            best_fairness.id, best_fairness.fairness_score
-        ));
-    }
-    notes
-}
-
-fn strategy_recommendation(strategy: &crate::simulation::SimulationStrategyReport) -> String {
-    if strategy.limit_hit_count > 0 && strategy.runaway_spend_prevented_usd > 0.0 {
-        return format!(
-            "Best when runaway protection matters: prevented ${:.2} while keeping fairness at {:.2}.",
-            strategy.runaway_spend_prevented_usd, strategy.fairness_score
-        );
-    }
-    if strategy.unused_protected_opportunity_usd > 0.0 {
-        return format!(
-            "Best when adoption enablement matters: surfaced ${:.2} of protected opportunity.",
-            strategy.unused_protected_opportunity_usd
-        );
-    }
-    format!(
-        "Balanced trade-off: ${:.2} total cost with {:.0}% adoption coverage.",
-        strategy.total_cost_usd,
-        strategy.adoption_coverage * 100.0
-    )
-}
-
 fn render_simulations_index(simulations: &[SimulationArtifact]) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
@@ -1071,170 +2065,40 @@ fn percent_encode_path_component(input: &str) -> String {
     encoded
 }
 
-async fn live_dashboard_js() -> impl IntoResponse {
+async fn noether_app_js() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        live_dashboard::dashboard_js(),
+        noether_app::app_js(),
     )
 }
 
-async fn live_dashboard_css() -> impl IntoResponse {
+async fn noether_app_css() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
-        live_dashboard::dashboard_css(),
+        noether_app::app_css(),
     )
 }
 
-async fn live_dashboard_brand_icon() -> impl IntoResponse {
+async fn noether_app_logo() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
-        live_dashboard::brand_icon_svg(),
+        noether_app::logo_svg(),
     )
 }
 
-fn render_dashboard_artifact(report: &reporting::DashboardReportData) -> String {
-    let featured_trace = report.featured_trace_id.as_deref().unwrap_or("latest");
-    let decision_total = report.summary.decisions.total();
-    let tool_count = report.summary.activity.tools;
-    let agent_count = report.summary.activity.agent;
-    let context_count = report.summary.activity.skill_context;
-    let mut html = String::new();
-    html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
-    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-    html.push_str("<title>Noether reporting dashboard</title>");
-    html.push_str(
-        "<style>
-        :root { color-scheme: dark; --bg:#0f172a; --panel:#111c33; --muted:#94a3b8; --text:#e5edf7; --line:#263449; --blue:#38bdf8; }
-        * { box-sizing: border-box; }
-        body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:radial-gradient(circle at top left,#172554,#0f172a 42%); color:var(--text); }
-        main { max-width:1100px; margin:0 auto; padding:32px 20px 48px; }
-        h1,h2 { margin:0; letter-spacing:-0.03em; }
-        h1 { font-size:34px; margin-bottom:6px; }
-        h2 { font-size:22px; margin-bottom:12px; }
-        .sub,.muted { color:var(--muted); }
-        .hero,.panel { background:rgba(17,28,51,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 55px rgba(0,0,0,.22); padding:20px; margin-top:16px; }
-        .hero { margin-top:0; }
-        .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:16px; }
-        .card { background:rgba(15,23,42,.55); border:1px solid rgba(148,163,184,.14); border-radius:16px; padding:16px; }
-        .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-        .value { font-size:28px; font-weight:800; margin-top:6px; }
-        ul { margin:12px 0 0 18px; padding:0; }
-        li { margin:6px 0; }
-        .entry { border-top:1px solid var(--line); padding:12px 0; }
-        .entry:first-child { border-top:0; padding-top:0; }
-        .pill { display:inline-block; padding:4px 9px; border-radius:999px; background:#1e293b; border:1px solid var(--line); font-size:12px; margin-right:8px; }
-        code { color:var(--blue); }
-        </style>",
-    );
-    html.push_str("</head><body><main>");
-    html.push_str("<h1>Noether reporting dashboard</h1>");
-    html.push_str("<div class=\"sub\">HTTP-served reporting artifact backed by the same ledger read model as CLI export.</div>");
-    html.push_str("<section class=\"hero\">");
-    html.push_str("<div class=\"label\">Featured trace</div>");
-    html.push_str(&format!(
-        "<div class=\"value\"><code>{}</code></div>",
-        escape_html(featured_trace)
-    ));
-    html.push_str("<p class=\"muted\">This artifact summarizes the latest reporting state without depending on the live dashboard UI.</p>");
-    html.push_str("</section>");
-
-    html.push_str("<section class=\"grid\">");
-    metric_card_html(
-        &mut html,
-        "Finalized spend",
-        &format_money(report.usage.total_cost_usd),
-        "finalized cost in the ledger",
-    );
-    metric_card_html(
-        &mut html,
-        "Decisions",
-        &decision_total.to_string(),
-        "authorize outcomes captured in the report set",
-    );
-    metric_card_html(
-        &mut html,
-        "Tokens",
-        &report.summary.usage.total_tokens.to_string(),
-        "finalized tokens across the selected report set",
-    );
-    metric_card_html(
-        &mut html,
-        "Evidence",
-        &format!("{tool_count} tools · {agent_count} agent · {context_count} context"),
-        "observed activity attached to the selected trace",
-    );
-    html.push_str("</section>");
-
-    html.push_str("<section class=\"panel\"><h2>Policy decisions</h2>");
-    if report.decisions.is_empty() {
-        html.push_str("<p class=\"muted\">No authorization decisions have been recorded yet.</p>");
-    } else {
-        for item in report.decisions.iter().take(8) {
-            html.push_str("<div class=\"entry\">");
-            html.push_str(&format!(
-                "<div><span class=\"pill\">{}</span><strong>{}</strong></div>",
-                escape_html(&item.kind),
-                escape_html(&item.summary)
-            ));
-            html.push_str("</div>");
-        }
-    }
-    html.push_str("</section>");
-
-    html.push_str("<section class=\"panel\"><h2>Available traces</h2>");
-    if report.available_traces.is_empty() {
-        html.push_str("<p class=\"muted\">No trace-backed decisions are available yet.</p>");
-    } else {
-        html.push_str("<ul>");
-        for trace in &report.available_traces {
-            html.push_str(&format!(
-                "<li><code>{}</code> · {} · {}</li>",
-                escape_html(&trace.trace_id),
-                escape_html(trace.latest_decision_kind.as_deref().unwrap_or("decision")),
-                escape_html(&trace.latest_decision_summary)
-            ));
-        }
-        html.push_str("</ul>");
-    }
-    html.push_str("</section>");
-
-    html.push_str("<section class=\"panel\"><h2>Recent observations</h2>");
-    if report.observations.is_empty() {
-        html.push_str("<p class=\"muted\">No observations matched the selected trace yet.</p>");
-    } else {
-        for item in report.observations.iter().take(8) {
-            html.push_str(&format!(
-                "<div class=\"entry\"><span class=\"pill\">{}</span>{}</div>",
-                escape_html(&item.kind),
-                escape_html(&item.summary)
-            ));
-        }
-    }
-    html.push_str("</section>");
-
-    html.push_str("</main></body></html>");
-    html
+async fn noether_app_favicon() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        noether_app::favicon_svg(),
+    )
 }
 
-fn metric_card_html(html: &mut String, label: &str, value: &str, hint: &str) {
-    html.push_str("<article class=\"card\">");
-    html.push_str(&format!(
-        "<div class=\"label\">{}</div><div class=\"value\">{}</div><div class=\"muted\">{}</div>",
-        escape_html(label),
-        escape_html(value),
-        escape_html(hint)
-    ));
-    html.push_str("</article>");
-}
-
-fn format_money(value: f64) -> String {
-    if value == 0.0 {
-        "$0".to_owned()
-    } else if value < 0.01 {
-        format!("${value:.4}")
-    } else {
-        format!("${value:.2}")
-    }
+async fn deprecated_dashboard_surface() -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "The old Noether dashboard has been removed. Use /policy, /runs, or /replay.",
+    )
 }
 
 fn escape_html(value: &str) -> String {
@@ -1529,6 +2393,42 @@ mod tests {
                     rule_match: RuleMatch::default(),
                 },
             }],
+        }
+    }
+
+    fn model_locked_policy() -> PolicyFile {
+        PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![BudgetRule {
+                id: "personal-local".to_owned(),
+                priority: 0,
+                models: crate::contract::BudgetModelPolicy {
+                    allow: vec!["openai-codex:gpt-4.1".to_owned()],
+                },
+                limits: crate::contract::BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![crate::contract::SpendWindowLimit {
+                        id: Some("daily-cap".to_owned()),
+                        by: crate::contract::SpendWindowBy::Global,
+                        window: "1d".to_owned(),
+                        mode: Some(crate::contract::SpendWindowMode::Tumbling),
+                        anchor: Some(crate::contract::WindowAnchorPolicy {
+                            kind: crate::contract::WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 1000.0,
+                        warn_at_fraction: 0.8,
+                        action: crate::contract::PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
+                allocation: None,
+                rule_match: RuleMatch::default(),
+            }],
+            policies: Vec::new(),
         }
     }
 
@@ -2074,14 +2974,6 @@ mod tests {
             )
             .expect("observations json")
         };
-        let expected_dashboard = {
-            let ledger = state.ledger.lock().await;
-            serde_json::to_value(
-                reporting::dashboard_report(&ledger, Some("trace-beta")).expect("dashboard data"),
-            )
-            .expect("dashboard json")
-        };
-
         let app = build_router(state);
 
         let usage_response = app
@@ -2153,56 +3045,6 @@ mod tests {
         let observations_json: Value =
             serde_json::from_slice(&observations_body).expect("observations value");
         assert_eq!(observations_json, expected_observations);
-
-        let dashboard_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/reports/dashboard-data?trace=trace-beta")
-                    .body(Body::empty())
-                    .expect("dashboard data request"),
-            )
-            .await
-            .expect("dashboard data response");
-        assert_eq!(dashboard_response.status(), StatusCode::OK);
-        let dashboard_body = to_bytes(dashboard_response.into_body(), usize::MAX)
-            .await
-            .expect("dashboard data body");
-        let dashboard_json: Value =
-            serde_json::from_slice(&dashboard_body).expect("dashboard value");
-        assert_eq!(dashboard_json, expected_dashboard);
-    }
-
-    #[tokio::test]
-    async fn dashboard_html_endpoint_renders_report_artifact_markers() {
-        let state = test_state(None);
-        seed_reporting_data(&state).await;
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/reports/dashboard?trace=trace-beta")
-                    .body(Body::empty())
-                    .expect("dashboard request"),
-            )
-            .await
-            .expect("dashboard response");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("dashboard body");
-        let html = String::from_utf8(body.to_vec()).expect("dashboard html");
-        for marker in [
-            "Noether reporting dashboard",
-            "Featured trace",
-            "trace-beta",
-            "Policy decisions",
-            "Available traces",
-            "Recent observations",
-        ] {
-            assert!(html.contains(marker), "missing dashboard marker: {marker}");
-        }
     }
 
     #[tokio::test]
@@ -2568,50 +3410,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_dashboard_shell_serves_bootstrapped_trace_picker() {
+    async fn noether_app_serves_policy_runs_replay_shell() {
         let app = build_router(test_state(None));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/dashboard?trace=trace-beta")
-                    .body(Body::empty())
-                    .expect("dashboard shell request"),
-            )
-            .await
-            .expect("dashboard shell response");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("dashboard shell body");
-        let html = String::from_utf8(body.to_vec()).expect("dashboard shell html");
-        for marker in [
-            "Noether",
-            "Open exceptions",
-            "dashboard-open-exceptions",
-            "dashboard-lens-pill",
-            "dashboard-window-pill",
-            "dashboard-trace-select",
-            "dashboard-window-select",
-            "Simulation",
-            "/dashboard/app.js",
-            "/dashboard/app.css",
-            "/dashboard/brand/icon.svg",
-            "trace-beta",
-        ] {
-            assert!(html.contains(marker), "missing live shell marker: {marker}");
+        for route in ["/", "/policy", "/runs", "/replay"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .body(Body::empty())
+                        .expect("app shell request"),
+                )
+                .await
+                .expect("app shell response");
+            assert_eq!(response.status(), StatusCode::OK, "route {route}");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("app shell body");
+            let html = String::from_utf8(body.to_vec()).expect("app shell html");
+            for marker in [
+                "noether",
+                "What&apos;s allowed here.",
+                "What actually happened.",
+                "What would change.",
+                "/app/app.js",
+                "/app/app.css",
+                "ask Noether...",
+            ] {
+                assert!(
+                    html.contains(marker),
+                    "route {route} missing app marker: {marker}"
+                );
+            }
         }
     }
 
     #[tokio::test]
-    async fn live_dashboard_assets_reference_reporting_api() {
+    async fn noether_app_assets_are_new_product_shell_assets() {
         let app = build_router(test_state(None));
-
         let js_response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/app.js")
+                    .uri("/app/app.js")
                     .body(Body::empty())
                     .expect("js request"),
             )
@@ -2621,25 +3463,19 @@ mod tests {
         let js_body = to_bytes(js_response.into_body(), usize::MAX)
             .await
             .expect("js body");
-        let js = String::from_utf8(js_body.to_vec()).expect("dashboard js");
-        assert!(js.contains("/v1/dashboard/filters"));
-        assert!(js.contains("/v1/dashboard/overview"));
-        assert!(js.contains("/v1/dashboard/strategy-lab"));
-        assert!(js.contains("closeTraceDrawerIfUnfocused"));
-        assert!(js.contains("closeTraceSpansDrawerIfUnfocused"));
-        assert!(js.contains("data-trace-drawer"));
-        assert!(js.contains("data-trace-spans-drawer"));
-        assert!(js.contains("trace-request-main-pane"));
-        assert!(js.contains("traceSpanCardTimeline"));
-        assert!(js.contains("rememberTraceSpansScroll"));
-        assert!(js.contains("data-trace-spans-body"));
+        let js = String::from_utf8(js_body.to_vec()).expect("app js");
+        assert!(js.contains("modeFromPath"));
+        assert!(js.contains("policy"));
+        assert!(js.contains("runs"));
+        assert!(js.contains("replay"));
+        assert!(!js.contains("/v1/dashboard"));
         assert!(!js.contains("<html"));
 
         let css_response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/app.css")
+                    .uri("/app/app.css")
                     .body(Body::empty())
                     .expect("css request"),
             )
@@ -2649,66 +3485,495 @@ mod tests {
         let css_body = to_bytes(css_response.into_body(), usize::MAX)
             .await
             .expect("css body");
-        let css = String::from_utf8(css_body.to_vec()).expect("dashboard css");
-        assert!(css.contains(".metric-grid"));
-        assert!(css.contains(".trace-layout"));
-        assert!(css.contains(".trace-lane-rail"));
-        assert!(css.contains(".trace-drawer-shell"));
-        assert!(css.contains(".trace-drawer-backdrop"));
-        assert!(css.contains(".trace-spans-drawer-shell"));
-        assert!(css.contains(".trace-spans-drawer-backdrop"));
-        assert!(css.contains(".trace-span-card"));
-        assert!(css.contains(".tradeoff-grid"));
+        let css = String::from_utf8(css_body.to_vec()).expect("app css");
+        assert!(css.contains(".policy-grid"));
+        assert!(css.contains(".runs-table"));
+        assert!(css.contains(".scenarios"));
+        assert!(css.contains(".editor-source"));
+        assert!(!css.contains(".dashboard-shell"));
 
-        let icon_response = app
+        let logo_response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/brand/icon.svg")
+                    .uri("/app/logo.svg")
                     .body(Body::empty())
-                    .expect("icon request"),
+                    .expect("logo request"),
             )
             .await
-            .expect("icon response");
-        assert_eq!(icon_response.status(), StatusCode::OK);
-        let icon_body = to_bytes(icon_response.into_body(), usize::MAX)
+            .expect("logo response");
+        assert_eq!(logo_response.status(), StatusCode::OK);
+        let logo_body = to_bytes(logo_response.into_body(), usize::MAX)
             .await
-            .expect("icon body");
-        let icon_svg = String::from_utf8(icon_body.to_vec()).expect("icon svg");
-        assert!(icon_svg.contains("<svg"));
-        assert!(icon_svg.contains("Noether icon"));
+            .expect("logo body");
+        let logo_svg = String::from_utf8(logo_body.to_vec()).expect("logo svg");
+        assert!(logo_svg.contains("<svg"));
     }
 
     #[tokio::test]
-    async fn split_dashboard_endpoints_serve_analytics_models() {
-        let state = test_state(None);
-        seed_reporting_data(&state).await;
-        let app = build_router(state);
+    async fn noether_app_policy_source_is_clean_user_yaml() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let policy_path = tempdir.path().join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            r#"
+version: 0
+routing:
+  mode: explicit_then_fallback
+  specificity: [project, user, team, group, org, global]
+budgets:
+  - id: personal-local
+    priority: 0
+    match:
+      subject: null
+      user: null
+      project: null
+      team: null
+      group: null
+      org: null
+      workflow: null
+      surface: null
+      provider: null
+      model: null
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 100
+          action: block
+"#,
+        )
+        .expect("write policy");
+        let policy = crate::policy::load_policy(&policy_path)
+            .await
+            .expect("load policy");
+        let state = AppState::with_reloadable_policy(
+            tempdir.path().join("fixtures"),
+            None,
+            policy_path,
+            policy,
+            DecisionMode::DryRun,
+        );
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/policy")
+                    .body(Body::empty())
+                    .expect("policy request"),
+            )
+            .await
+            .expect("policy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("policy body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("policy json");
+        let source = payload["source"].as_str().expect("source");
 
-        for (route, expected_keys) in [
-            (
-                "/v1/dashboard/overview?window=all&lens=project",
-                vec![
-                    "hero",
-                    "kpis",
-                    "spend_trend",
-                    "spend_distribution",
-                    "model_mix",
-                    "insights",
-                ],
-            ),
-            (
-                "/v1/dashboard/budgets?window=all&lens=budget",
-                vec!["budgets", "budget_trends", "concentration", "insights"],
-            ),
-            (
-                "/v1/dashboard/adoption?window=all&lens=user",
-                vec!["hero", "summary_cards", "leaderboard", "insights"],
-            ),
-            (
-                "/v1/dashboard/traces?window=all&lens=project&trace=trace-beta",
-                vec!["hero", "traces", "timeline", "interop", "policy"],
-            ),
+        assert!(source.contains("fallback_order:"));
+        assert!(!source.contains("specificity:"));
+        assert!(!source.contains("match:"));
+        assert!(!source.contains("null"));
+        assert!(!source.contains("priority: 0"));
+    }
+
+    #[tokio::test]
+    async fn noether_app_discard_policy_proposal_removes_saved_draft() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(
+            tempdir.path().join("fixtures"),
+            Some(model_locked_policy()),
+            DecisionMode::DryRun,
+        );
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&strict_policy()).expect("strict policy yaml"),
+        )
+        .expect("write proposal");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/app/policy/proposal")
+                    .body(Body::empty())
+                    .expect("discard request"),
+            )
+            .await
+            .expect("discard response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("discard body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("discard json");
+        assert!(payload["proposal"].is_null());
+        assert!(!tempdir.path().join("policy.proposed.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn noether_app_replay_reevaluates_historical_requests_against_draft_policy() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&strict_policy()).expect("strict policy yaml"),
+        )
+        .expect("write proposal");
+
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request = report_request("trace-replay", "req-replay", "gpt-4.1", 1.25);
+            request
+                .metadata
+                .insert("agent_run_id".to_owned(), json!("run-replay"));
+            let decision = ledger.try_authorize(None, &request).expect("authorize");
+            let reservation = decision.reservation.expect("reservation");
+            ledger
+                .finalize(
+                    &reservation.id,
+                    &finalize_payload("trace-replay", "gpt-4.1", 1.25, 1_000, 250),
+                )
+                .expect("finalize");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value =
+            serde_json::from_slice(&body).expect("replay response json");
+
+        assert_eq!(replay["baseline"]["allow"], 1);
+        assert_eq!(replay["proposal"]["proposed"]["deny"], 1);
+        assert_eq!(
+            replay["proposal"]["changed_runs"][0]["run_id"],
+            "run-replay"
+        );
+        assert_eq!(replay["proposal"]["changed_runs"][0]["from"], "allow");
+        assert_eq!(replay["proposal"]["changed_runs"][0]["to"], "deny");
+        assert_eq!(
+            replay["proposal"]["recommendations"][0]["action"],
+            "review_changed_runs"
+        );
+        assert_eq!(replay["proposal"]["mode"], "draft_impact");
+        assert_eq!(replay["proposal"]["can_enforce"], true);
+        assert_eq!(replay["proposal"]["spend_delta_usd"], -1.25);
+    }
+
+    #[tokio::test]
+    async fn noether_app_replay_keeps_unchanged_history_empty() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&PolicyFile {
+                version: 0,
+                routing: Default::default(),
+                budgets: Vec::new(),
+                policies: Vec::new(),
+            })
+            .expect("policy yaml"),
+        )
+        .expect("write proposal");
+
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request = report_request("trace-same", "req-same", "gpt-4.1", 0.5);
+            request
+                .metadata
+                .insert("agent_run_id".to_owned(), json!("run-same"));
+            ledger.try_authorize(None, &request).expect("authorize");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value =
+            serde_json::from_slice(&body).expect("replay response json");
+
+        assert_eq!(replay["proposal"]["proposed"]["allow"], 1);
+        assert_eq!(
+            replay["proposal"]["changed_runs"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(replay["proposal"]["mode"], "draft_impact");
+        assert_eq!(replay["proposal"]["can_enforce"], true);
+        assert_eq!(
+            replay["proposal"]["recommendations"][0]["action"],
+            "review_policy_diff"
+        );
+        assert_eq!(replay["proposal"]["spend_delta_usd"], 0.0);
+    }
+
+    #[test]
+    fn noether_app_replay_marks_identical_draft_as_backtest() {
+        let source = serde_yaml::to_string(&PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: Vec::new(),
+            policies: Vec::new(),
+        })
+        .expect("policy yaml");
+        let proposal = AppPolicyProposal {
+            path: "policy.proposed.yaml".to_owned(),
+            source: source.clone(),
+        };
+
+        let replay =
+            app_replay_proposal(&source, &proposal, &[], &std::collections::BTreeMap::new())
+                .expect("replay proposal");
+
+        assert_eq!(replay.mode, "current_policy_backtest");
+        assert!(!replay.can_enforce);
+        assert_eq!(replay.changed_lines, 0);
+    }
+
+    #[tokio::test]
+    async fn noether_app_replay_reports_static_history_window() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value =
+            serde_json::from_slice(&body).expect("replay response json");
+
+        assert_eq!(replay["history_window_days"], 1);
+        assert!(replay["history_window_start"].as_str().is_some());
+        assert!(replay["history_window_end"].as_str().is_some());
+    }
+
+    #[test]
+    fn noether_app_replay_evaluates_spend_windows_at_historical_time() {
+        let policy = strict_policy();
+        let first_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let second_at = first_at + chrono::Duration::minutes(2);
+        let historical_requests = vec![
+            crate::ledger::HistoricalAuthorizeRequest {
+                occurred_at: first_at,
+                decision_id: "decision-1".to_owned(),
+                baseline_outcome: DecisionOutcome::Allow,
+                request: report_request("trace-1", "request-1", "gpt-4.1", 0.007),
+            },
+            crate::ledger::HistoricalAuthorizeRequest {
+                occurred_at: second_at,
+                decision_id: "decision-2".to_owned(),
+                baseline_outcome: DecisionOutcome::Allow,
+                request: report_request("trace-2", "request-2", "gpt-4.1", 0.007),
+            },
+        ];
+
+        let (totals, changed_runs, spend_delta) = replay_historical_requests(
+            &policy,
+            &historical_requests,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("replay");
+
+        assert_eq!(totals.allow, 2);
+        assert_eq!(totals.deny, 0);
+        assert!(changed_runs.is_empty());
+        assert_eq!(spend_delta, 0.0);
+    }
+
+    #[tokio::test]
+    async fn noether_app_run_detail_returns_agent_run_for_changed_run_links() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request = report_request("trace-detail", "req-detail", "gpt-4.1", 0.75);
+            request
+                .metadata
+                .insert("agent_run_id".to_owned(), json!("run-detail"));
+            ledger.try_authorize(None, &request).expect("authorize");
+            ledger
+                .record_event(TraceEvent {
+                    id: Some("evt-detail-tool".to_owned()),
+                    trace_id: Some("trace-detail".to_owned()),
+                    occurred_at: None,
+                    kind: "tool.observed".to_owned(),
+                    payload: json!({
+                        "agent_run_id": "run-detail",
+                        "name": "bash",
+                        "success": true
+                    }),
+                })
+                .expect("record event");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/runs/run-detail")
+                    .body(Body::empty())
+                    .expect("run detail request"),
+            )
+            .await
+            .expect("run detail response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("run detail body");
+        let run: serde_json::Value = serde_json::from_slice(&body).expect("run detail json");
+        assert_eq!(run["id"], "run-detail");
+        assert_eq!(run["agent_run_id"], "run-detail");
+        assert_eq!(run["trace_id"], "trace-detail");
+        assert!(
+            run["timeline"]
+                .as_array()
+                .expect("timeline array")
+                .iter()
+                .any(|item| item["kind"] == "tool.observed")
+        );
+    }
+
+    #[test]
+    fn noether_app_policy_suggestions_include_reason_and_model_evidence() {
+        let suggestions = app_policy_suggestions(&[AppRuleStat {
+            rule: "personal-local".to_owned(),
+            allow: 0,
+            warn: 0,
+            deny: 15,
+            ask: 0,
+            limit_hits: 0,
+            top_reason: Some("provider/model is not allowed by budget".to_owned()),
+            top_model: Some("openai-codex/gpt-5.5".to_owned()),
+        }]);
+
+        assert_eq!(suggestions[0].action, "open_runs_filtered_to_rule");
+        assert!(suggestions[0].title.contains("personal-local blocked 15"));
+        assert!(suggestions[0].body.contains("models.allow"));
+        assert!(
+            suggestions[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("Reason: provider/model"))
+        );
+        assert!(
+            suggestions[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("Top model: openai-codex/gpt-5.5"))
+        );
+    }
+
+    #[tokio::test]
+    async fn noether_app_apply_blocked_model_suggestion_saves_concrete_draft() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(
+            tempdir.path().join("fixtures"),
+            Some(model_locked_policy()),
+            DecisionMode::DryRun,
+        );
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request = report_request("trace-model", "req-model", "gpt-5.5", 0.5);
+            request.provider = Some("openai-codex".to_owned());
+            ledger
+                .try_authorize(state.active_policy().await.as_deref(), &request)
+                .expect("authorize denied model");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/policy/suggestions/personal-local-denies/apply")
+                    .method("POST")
+                    .body(Body::empty())
+                    .expect("apply request"),
+            )
+            .await
+            .expect("apply response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("apply body");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("apply json");
+
+        assert!(
+            payload["policy"]["proposal"]["source"]
+                .as_str()
+                .expect("proposal source")
+                .contains("openai-codex:gpt-5.5")
+        );
+    }
+
+    #[tokio::test]
+    async fn old_dashboard_surface_is_gone() {
+        let app = build_router(test_state(None));
+
+        for route in [
+            "/dashboard",
+            "/dashboard/app.js",
+            "/v1/dashboard/overview?window=all&lens=project",
+            "/v1/dashboard/strategy-lab?simulation=runaway-pressure",
+            "/v1/reports/dashboard-data?trace=trace-beta",
+            "/v1/reports/dashboard?trace=trace-beta",
         ] {
             let response = app
                 .clone()
@@ -2716,59 +3981,12 @@ mod tests {
                     Request::builder()
                         .uri(route)
                         .body(Body::empty())
-                        .expect("dashboard request"),
+                        .expect("removed dashboard request"),
                 )
                 .await
-                .expect("dashboard response");
-            assert_eq!(response.status(), StatusCode::OK, "route {route}");
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("dashboard body");
-            let json: Value = serde_json::from_slice(&body).expect("dashboard json");
-            for key in expected_keys {
-                assert!(json.get(key).is_some(), "route {route} missing key {key}");
-            }
+                .expect("removed dashboard response");
+            assert_eq!(response.status(), StatusCode::GONE, "route {route}");
         }
-    }
-
-    #[tokio::test]
-    async fn strategy_lab_endpoint_serves_simulation_comparison_cards() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let mut state = test_state(None);
-        state.simulation_dir = tempdir.path().join("simulations");
-        seed_simulation_artifacts(&state.simulation_dir);
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/dashboard/strategy-lab?simulation=runaway-pressure")
-                    .body(Body::empty())
-                    .expect("strategy lab request"),
-            )
-            .await
-            .expect("strategy lab response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("strategy lab body");
-        let json: Value = serde_json::from_slice(&body).expect("strategy lab json");
-        assert_eq!(json["selected_simulation_id"], "runaway-pressure");
-        assert!(
-            json["strategy_cards"]
-                .as_array()
-                .is_some_and(|cards| !cards.is_empty())
-        );
-        assert!(
-            json["strategy_cards"][0]["policy_moves"]
-                .as_array()
-                .is_some_and(|moves| !moves.is_empty())
-        );
-        assert!(
-            json["recommendations"]
-                .as_array()
-                .is_some_and(|notes| !notes.is_empty())
-        );
     }
 
     #[tokio::test]
@@ -3067,7 +4285,7 @@ mod tests {
 version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
     limits:
@@ -3114,7 +4332,7 @@ policies: []
 version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
     match:
@@ -3159,7 +4377,7 @@ policies: []
 version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
     limits:

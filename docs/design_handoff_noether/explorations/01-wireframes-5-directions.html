@@ -1,0 +1,1353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Noether — 5 wireframe directions</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Kalam:wght@300;400;700&family=Caveat:wght@400;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #f7f4ec;
+    --paper-2: #efeadc;
+    --ink: #1a1a1a;
+    --ink-soft: #4a4a4a;
+    --ink-faint: #8a8578;
+    --rule: #2a2a2a;
+    --rule-faint: #c9c1ad;
+    --accent: #d94a26;     /* marker red */
+    --accent-2: #f4c430;   /* highlighter yellow */
+    --ok: #2f7d3a;
+    --warn: #c46a14;
+    --deny: #b32a1a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Kalam", "Comic Neue", system-ui, sans-serif;
+    font-size: 17px;
+    line-height: 1.45;
+    background-image:
+      radial-gradient(rgba(0,0,0,0.025) 1px, transparent 1px),
+      radial-gradient(rgba(0,0,0,0.02) 1px, transparent 1px);
+    background-size: 28px 28px, 28px 28px;
+    background-position: 0 0, 14px 14px;
+  }
+  .mono { font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; }
+  .sans { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+
+  /* ---- top header ---- */
+  header.top {
+    padding: 28px 40px 0;
+    max-width: 1480px;
+    margin: 0 auto;
+  }
+  .eyebrow {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  h1.brief {
+    font-family: "Caveat", cursive;
+    font-size: 56px;
+    line-height: 1;
+    margin: 6px 0 10px;
+    font-weight: 700;
+  }
+  .brief-sub {
+    max-width: 720px;
+    color: var(--ink-soft);
+    font-size: 18px;
+  }
+  .brief-sub b { color: var(--ink); }
+
+  /* ---- tabs ---- */
+  nav.tabs {
+    display: flex;
+    gap: 0;
+    margin-top: 28px;
+    border-bottom: 2px solid var(--rule);
+    position: sticky;
+    top: 0;
+    background: var(--paper);
+    z-index: 10;
+    padding-top: 6px;
+  }
+  nav.tabs button {
+    appearance: none;
+    background: transparent;
+    border: 2px solid var(--rule);
+    border-bottom: none;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    margin-right: -2px;
+    padding: 10px 18px 12px;
+    font-family: "Kalam", sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--ink-soft);
+    cursor: pointer;
+    transform: translateY(2px);
+    transition: background .12s, color .12s, transform .12s;
+  }
+  nav.tabs button .num {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    margin-right: 8px;
+  }
+  nav.tabs button:hover { color: var(--ink); }
+  nav.tabs button[aria-selected="true"] {
+    background: var(--paper);
+    color: var(--ink);
+    border-bottom: 2px solid var(--paper);
+    transform: translateY(2px) translateY(-1px);
+  }
+  nav.tabs button[aria-selected="true"] .num { color: var(--accent); }
+
+  /* ---- per-direction page ---- */
+  main {
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 36px 40px 96px;
+  }
+  .page { display: none; }
+  .page.active { display: block; }
+
+  .id-card {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 28px;
+    margin-bottom: 36px;
+    padding-bottom: 24px;
+    border-bottom: 1px dashed var(--rule-faint);
+  }
+  .id-card .left h2 {
+    font-family: "Caveat", cursive;
+    font-size: 64px;
+    line-height: 1;
+    margin: 0 0 8px;
+  }
+  .id-card .left .tag {
+    font-size: 22px;
+    color: var(--ink-soft);
+  }
+  .id-card .left .pulled {
+    display: inline-block;
+    background: var(--accent-2);
+    padding: 2px 8px;
+    transform: rotate(-1.5deg);
+    color: var(--ink);
+    margin-top: 12px;
+    font-weight: 700;
+  }
+  .id-card .right {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    align-content: start;
+  }
+  .id-card .right .cell {
+    border: 1.5px solid var(--rule);
+    border-radius: 10px;
+    padding: 10px 14px;
+    background: var(--paper);
+  }
+  .id-card .right .cell .k {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .id-card .right .cell .v {
+    font-size: 17px;
+    font-weight: 700;
+    margin-top: 2px;
+  }
+
+  /* sketch frames */
+  .frame {
+    border: 2.5px solid var(--rule);
+    border-radius: 14px;
+    background: var(--paper);
+    position: relative;
+    box-shadow: 4px 5px 0 rgba(26,26,26,0.08);
+  }
+  .frame .chrome {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1.5px solid var(--rule);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    letter-spacing: 0.05em;
+  }
+  .frame .chrome .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    border: 1.5px solid var(--rule);
+  }
+  .frame .chrome .url {
+    margin-left: 8px;
+    padding: 2px 10px;
+    border: 1.5px solid var(--rule-faint);
+    border-radius: 6px;
+    background: var(--paper-2);
+  }
+  .frame .body { padding: 22px; }
+
+  /* screens row */
+  .screens {
+    display: grid;
+    grid-template-columns: 1.45fr 1fr;
+    gap: 28px;
+    align-items: start;
+  }
+  .screens.three { grid-template-columns: 1.4fr 1fr 1fr; }
+  .screen-label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 8px;
+  }
+  .screen-label b { color: var(--ink); }
+
+  /* generic placeholder shapes */
+  .skel-line {
+    height: 8px;
+    background: var(--rule-faint);
+    border-radius: 4px;
+    margin: 8px 0;
+  }
+  .skel-line.short { width: 38%; }
+  .skel-line.med { width: 64%; }
+  .skel-block {
+    background: repeating-linear-gradient(135deg, var(--paper-2), var(--paper-2) 6px, transparent 6px, transparent 12px);
+    border: 1.5px dashed var(--rule-faint);
+    border-radius: 8px;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1.5px solid var(--rule);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .pill.allow { border-color: var(--ok); color: var(--ok); }
+  .pill.warn { border-color: var(--warn); color: var(--warn); }
+  .pill.deny { border-color: var(--deny); color: var(--deny); background: rgba(179,42,26,0.06); }
+  .pill.ask { border-color: var(--accent); color: var(--accent); }
+  .pill .ball { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+  /* sticky note */
+  .sticky {
+    background: var(--accent-2);
+    padding: 14px 16px;
+    font-family: "Kalam", sans-serif;
+    color: #2a2410;
+    box-shadow: 3px 4px 0 rgba(26,26,26,0.15);
+    transform: rotate(-1.4deg);
+    border-radius: 2px;
+    line-height: 1.35;
+  }
+  .sticky.alt { background: #ffd1a8; transform: rotate(1.2deg); }
+  .sticky.red { background: #f7c0b4; transform: rotate(-0.6deg); }
+  .sticky b { display: block; font-weight: 700; margin-bottom: 4px; font-size: 14px; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(26,26,26,0.7); }
+
+  .annotations {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 22px;
+    margin-top: 36px;
+  }
+
+  /* arrow + scribble */
+  .scribble {
+    font-family: "Caveat", cursive;
+    font-size: 22px;
+    color: var(--accent);
+    transform: rotate(-3deg);
+    display: inline-block;
+  }
+  .arrow {
+    font-family: "Caveat", cursive;
+    color: var(--accent);
+    font-size: 26px;
+  }
+
+  /* --------- direction-specific elements --------- */
+
+  /* Policy linter */
+  .policy-editor {
+    display: grid;
+    grid-template-columns: 38px 1fr;
+    background: #fdfbf5;
+    border: 1.5px solid var(--rule);
+    border-radius: 8px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    overflow: hidden;
+  }
+  .policy-editor .gutter {
+    background: var(--paper-2);
+    color: var(--ink-faint);
+    padding: 10px 6px;
+    text-align: right;
+    border-right: 1px solid var(--rule-faint);
+    font-size: 11px;
+  }
+  .policy-editor .code {
+    padding: 10px 14px;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .policy-editor .code .k { color: #6a2a8a; }
+  .policy-editor .code .s { color: #2f5d2f; }
+  .policy-editor .code .n { color: var(--accent); }
+  .policy-editor .code .c { color: var(--ink-faint); font-style: italic; }
+  .policy-editor .code .hl {
+    background: rgba(244,196,48,0.4);
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+  .gutter-mark { color: var(--accent); }
+
+  .linter-output {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    border: 1.5px solid var(--rule);
+    border-radius: 8px;
+    background: #fdfbf5;
+    padding: 10px 14px;
+    margin-top: 14px;
+  }
+  .linter-output .row {
+    display: grid;
+    grid-template-columns: 14px 110px 1fr;
+    gap: 10px;
+    padding: 4px 0;
+    border-bottom: 1px dotted var(--rule-faint);
+    align-items: baseline;
+  }
+  .linter-output .row:last-child { border-bottom: none; }
+  .linter-output .marker.allow { color: var(--ok); }
+  .linter-output .marker.warn { color: var(--warn); }
+  .linter-output .marker.deny { color: var(--deny); }
+  .linter-output .marker.ask { color: var(--accent); }
+  .linter-output .meta { color: var(--ink-faint); }
+
+  /* Receipt / ledger */
+  .receipt {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12.5px;
+  }
+  .receipt .receipt-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 90px 80px;
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1.5px dashed var(--rule-faint);
+    align-items: baseline;
+  }
+  .receipt .receipt-row.head {
+    border-bottom: 2px solid var(--rule);
+    color: var(--ink-faint);
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+  .receipt .who { font-weight: 700; }
+  .receipt .who .small { color: var(--ink-faint); font-weight: 400; font-size: 11px; display: block; }
+  .receipt .amt { text-align: right; }
+  .receipt .amt.deny { color: var(--deny); }
+  .receipt .amt.warn { color: var(--warn); }
+  .receipt-totals {
+    display: flex; justify-content: space-between;
+    margin-top: 12px; padding-top: 12px;
+    border-top: 2px solid var(--rule);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+  }
+
+  /* Approval inbox */
+  .inbox-card {
+    border: 1.5px solid var(--rule);
+    border-radius: 12px;
+    background: var(--paper);
+    padding: 16px 18px;
+    margin-bottom: 14px;
+    position: relative;
+  }
+  .inbox-card.selected {
+    border-width: 2.5px;
+    box-shadow: 0 0 0 4px rgba(217,74,38,0.12);
+  }
+  .inbox-card .who-line {
+    display: flex; align-items: baseline; gap: 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+  }
+  .inbox-card .who-line .who { font-weight: 700; }
+  .inbox-card .who-line .when { color: var(--ink-faint); margin-left: auto; font-size: 11px; }
+  .inbox-card .ask {
+    margin-top: 6px;
+    font-size: 18px;
+    font-family: "Kalam", sans-serif;
+    color: var(--ink);
+  }
+  .inbox-card .why {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+  .inbox-card .actions {
+    display: flex; gap: 8px; margin-top: 12px;
+    font-family: "JetBrains Mono", monospace;
+  }
+  .btn {
+    border: 1.5px solid var(--rule);
+    background: var(--paper);
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+  }
+  .btn.primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .btn.deny { color: var(--deny); border-color: var(--deny); }
+  .btn.allow { color: var(--ok); border-color: var(--ok); }
+
+  /* Sim lab */
+  .sim-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .sim-card {
+    border: 1.5px solid var(--rule);
+    border-radius: 10px;
+    padding: 12px 14px;
+    background: var(--paper);
+  }
+  .sim-card.winner { border-width: 2.5px; background: rgba(244,196,48,0.18); }
+  .sim-card h4 {
+    margin: 0 0 4px;
+    font-family: "Caveat", cursive;
+    font-size: 26px;
+    font-weight: 700;
+  }
+  .sim-card .stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px 12px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    margin-top: 8px;
+  }
+  .sim-card .stats .k { color: var(--ink-faint); }
+  .sim-card .stats .v { font-weight: 700; }
+  .sim-card .stats .v.deny { color: var(--deny); }
+  .sim-card .stats .v.ok { color: var(--ok); }
+
+  /* CLI surface */
+  .cli {
+    background: #15110a;
+    color: #f7f4ec;
+    border-radius: 12px;
+    padding: 22px 26px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13.5px;
+    line-height: 1.55;
+    border: 2.5px solid var(--rule);
+    box-shadow: 4px 5px 0 rgba(26,26,26,0.15);
+  }
+  .cli .prompt { color: var(--accent-2); }
+  .cli .you { color: #fff; }
+  .cli .dim { color: #978f7a; }
+  .cli .ok { color: #8ad07a; }
+  .cli .deny { color: #ff8a78; }
+  .cli .warn { color: #f4c430; }
+  .cli .hr { border-top: 1px dashed #4a4435; margin: 8px 0; }
+  .cli .input-row {
+    margin-top: 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    border-top: 1px dashed #4a4435;
+    padding-top: 12px;
+  }
+  .cli .caret {
+    display: inline-block;
+    width: 8px; height: 16px;
+    background: var(--accent-2);
+    margin-left: 4px;
+    animation: blink 1.1s steps(2) infinite;
+    vertical-align: middle;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .cli .hint {
+    color: #978f7a;
+    margin-top: 16px;
+    font-size: 11px;
+  }
+  .cli .hint b { color: var(--accent-2); font-weight: 500; }
+
+  /* trace visual */
+  .trace-bar {
+    display: grid;
+    grid-template-columns: 110px 1fr 60px;
+    gap: 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    align-items: center;
+    padding: 4px 0;
+  }
+  .trace-bar .bar {
+    height: 12px;
+    background: var(--rule-faint);
+    border-radius: 3px;
+    position: relative;
+  }
+  .trace-bar .bar .seg { position: absolute; top: 0; height: 100%; border-radius: 3px; }
+
+  .footer-note {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px dashed var(--rule-faint);
+    font-size: 14px;
+    color: var(--ink-faint);
+    text-align: center;
+  }
+  .footer-note .scribble { font-size: 20px; }
+
+  @media (max-width: 1100px) {
+    .screens { grid-template-columns: 1fr; }
+    .screens.three { grid-template-columns: 1fr; }
+    .id-card { grid-template-columns: 1fr; }
+    .annotations { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="eyebrow">Noether · wireframe exploration · v1</div>
+  <h1 class="brief">What does Noether want to be?</h1>
+  <p class="brief-sub">
+    The product story is strong (<b>local governance for agent work — observe, attribute, control, simulate</b>)
+    but the current UI tries to be a dashboard of everything. Below are <b>five distinct identities</b>
+    Noether could commit to. Each picks a different center of gravity, a different first verb,
+    a different thing that gets killed. Pick one — or mix.
+  </p>
+</header>
+
+<nav class="tabs" role="tablist" aria-label="Wireframe directions">
+  <button role="tab" aria-selected="true" data-tab="policy"><span class="num">01</span>The Policy</button>
+  <button role="tab" aria-selected="false" data-tab="ledger"><span class="num">02</span>The Receipt</button>
+  <button role="tab" aria-selected="false" data-tab="inbox"><span class="num">03</span>The Gate</button>
+  <button role="tab" aria-selected="false" data-tab="lab"><span class="num">04</span>The Lab</button>
+  <button role="tab" aria-selected="false" data-tab="cli"><span class="num">05</span>The Console</button>
+</nav>
+
+<main>
+
+<!-- =========================================================================
+     01 · THE POLICY  — Noether is a linter for agent work
+========================================================================= -->
+<section class="page active" id="page-policy">
+
+  <div class="id-card">
+    <div class="left">
+      <h2>01 · The Policy</h2>
+      <p class="tag">Noether is a <b>linter</b> for agent work. One file decides what's allowed. Everything else is feedback on that file.</p>
+      <div class="pulled">center of product = the policy file</div>
+    </div>
+    <div class="right">
+      <div class="cell"><div class="k">Metaphor</div><div class="v">ESLint / CI for AI</div></div>
+      <div class="cell"><div class="k">First verb</div><div class="v">Edit &amp; watch</div></div>
+      <div class="cell"><div class="k">Kills</div><div class="v">5-tab nav, KPI cards</div></div>
+      <div class="cell"><div class="k">Wins when</div><div class="v">policy is the artefact you ship</div></div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- HOME: policy editor + live decisions -->
+    <div>
+      <div class="screen-label">HOME &mdash; <b>policy.noet.yaml on the left, live decisions on the right</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · ~/work/api/.noether/policy.noet.yaml</span>
+          <span style="margin-left:auto" class="pill warn"><span class="ball"></span>dry-run</span>
+        </div>
+        <div class="body" style="display:grid; grid-template-columns: 1.1fr 1fr; gap: 18px;">
+          <div>
+            <div class="screen-label" style="margin-bottom:6px">POLICY</div>
+            <div class="policy-editor">
+              <div class="gutter">
+1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10<br>11<br>12<br>13<br>14<br>15<br>16<br>17<br>18<br>19
+              </div>
+              <div class="code"><span class="c"># local-first, observe→warn→enforce</span>
+<span class="k">defaults</span>:
+  <span class="k">decision_mode</span>: <span class="s">warn</span>
+  <span class="k">attribute_to</span>: <span class="s">project</span>
+
+<span class="k">models</span>:
+  <span class="k">allow</span>: [<span class="s">"openai/gpt-4*"</span>, <span class="s">"anthropic/*"</span>]
+  <span class="k">deny</span>:  [<span class="s">"*/gpt-3.5*"</span>]
+
+<span class="k">budgets</span>:
+  - <span class="k">id</span>: <span class="s">personal-local</span>
+    <span class="k">window</span>: <span class="s">"30d"</span>
+    <span class="k">cap_usd</span>: <span class="n">"<span class="hl">$50</span>"</span>   <span class="c"># &lt;-- 2 hits this window</span>
+    <span class="k">on_exhaust</span>: <span class="s">block</span>
+
+<span class="k">limits</span>:
+  <span class="k">request_cost_usd</span>: <span class="n">2.50</span>
+  <span class="k">tools_per_turn</span>:  <span class="n">12</span>
+  <span class="k">retries</span>:         <span class="n">3</span></div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:10px; align-items:center;">
+              <button class="btn">save</button>
+              <button class="btn primary">enforce</button>
+              <span class="scribble">↑ flip this when policy is honest</span>
+            </div>
+          </div>
+          <div>
+            <div class="screen-label" style="margin-bottom:6px">DECISIONS &mdash; live tail (last 30d)</div>
+            <div class="linter-output">
+              <div class="row"><span class="marker allow">●</span><span>allow</span><span>req-1a3f &middot; <span class="meta">claude-sonnet-4 · $0.18 · project=api</span></span></div>
+              <div class="row"><span class="marker allow">●</span><span>allow</span><span>req-1a40 &middot; <span class="meta">claude-sonnet-4 · $0.07</span></span></div>
+              <div class="row"><span class="marker warn">▲</span><span>warn</span><span>req-1a44 &middot; <span class="meta">cost $2.81 over <b>request_cost_usd</b></span></span></div>
+              <div class="row"><span class="marker allow">●</span><span>allow</span><span>req-1a45 &middot; <span class="meta">gpt-4.1 · $1.20</span></span></div>
+              <div class="row"><span class="marker deny">✕</span><span>deny</span><span>req-1a49 &middot; <span class="meta"><b>budget personal-local exhausted ($50.04 / $50)</b></span></span></div>
+              <div class="row"><span class="marker ask">?</span><span>ask</span><span>req-1a4b &middot; <span class="meta">tool=shell.exec · awaiting approval</span></span></div>
+              <div class="row"><span class="marker allow">●</span><span>allow</span><span>req-1a4c &middot; <span class="meta">cached · $0.00</span></span></div>
+              <div class="row"><span class="marker warn">▲</span><span>warn</span><span>req-1a4d &middot; <span class="meta">tools_per_turn = 14 (limit 12)</span></span></div>
+            </div>
+            <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+              <span class="pill"><span class="ball" style="background:var(--ok)"></span>47 allow</span>
+              <span class="pill warn"><span class="ball"></span>21 warn</span>
+              <span class="pill deny"><span class="ball"></span>2 deny</span>
+              <span class="pill ask"><span class="ball"></span>1 ask</span>
+            </div>
+            <p style="margin-top:14px; font-size:14px; color:var(--ink-soft);">
+              Tail follows the cursor in the policy &mdash; click <span class="mono" style="font-size:12px">cap_usd</span>
+              and you only see decisions that touched <i>this</i> rule.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL: rule drill-down -->
+    <div>
+      <div class="screen-label">DETAIL &mdash; <b>one rule, every decision it caused</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">policy.noet.yaml<span style="color:var(--accent)">:13</span> · cap_usd</span>
+        </div>
+        <div class="body" style="padding:18px;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--ink-faint);">RULE</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:14px; margin:4px 0 14px;">
+            budgets[personal-local].<b>cap_usd</b> = <span style="background:rgba(244,196,48,.4)">$50</span>
+          </div>
+          <div style="display:flex; gap:12px; margin-bottom:14px;">
+            <div class="pill deny"><span class="ball"></span>2 hits</div>
+            <div class="pill warn"><span class="ball"></span>3 near-misses</div>
+            <div class="pill"><span class="ball" style="background:var(--ink-faint)"></span>$50.04 of $50 used</div>
+          </div>
+          <div class="screen-label" style="margin:14px 0 6px">SPEND vs CAP &mdash; 30d</div>
+          <svg viewBox="0 0 320 90" width="100%" height="90" style="border:1.5px dashed var(--rule-faint); border-radius:8px; background:#fdfbf5;">
+            <line x1="0" y1="20" x2="320" y2="20" stroke="#d94a26" stroke-dasharray="4 4" stroke-width="1.5"/>
+            <text x="6" y="16" fill="#d94a26" font-family="JetBrains Mono" font-size="9">cap $50</text>
+            <polyline fill="none" stroke="#1a1a1a" stroke-width="2"
+              points="0,80 20,76 40,72 60,68 80,60 100,55 120,52 140,48 160,42 180,36 200,30 220,28 240,22 260,18 280,21 300,18 320,16"/>
+            <circle cx="240" cy="22" r="3" fill="#d94a26"/>
+            <circle cx="260" cy="18" r="3" fill="#d94a26"/>
+          </svg>
+          <div class="screen-label" style="margin:14px 0 6px">SUGGESTED CHANGE</div>
+          <div class="policy-editor">
+            <div class="gutter">13</div>
+            <div class="code"><span class="k">cap_usd</span>: <span style="text-decoration:line-through; color:#b32a1a">"$50"</span> <span style="color:var(--ok)">→ "$65"</span>   <span class="c"># covers 95% of observed weeks</span></div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:14px;">
+            <button class="btn allow">apply</button>
+            <button class="btn">simulate first</button>
+            <button class="btn">dismiss</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="annotations">
+    <div class="sticky"><b>why this works</b>Noether's whole thesis is "small auditable control plane." The policy file IS the product. Treating it as the home screen makes that legible in 3 seconds.</div>
+    <div class="sticky alt"><b>what you give up</b>Casual browsing. A user who wants to "just look around" without thinking about policy is wrong-footed. Best for ops/platform folks, less so for solo curious users.</div>
+    <div class="sticky red"><b>watch out for</b>This direction makes Noether feel like infrastructure. If your users are mostly individual operators who never write YAML, the policy file should still exist but the home screen should not lead with it.</div>
+  </div>
+</section>
+
+<!-- =========================================================================
+     02 · THE RECEIPT  — Noether is a bank statement for agent work
+========================================================================= -->
+<section class="page" id="page-ledger">
+
+  <div class="id-card">
+    <div class="left">
+      <h2>02 · The Receipt</h2>
+      <p class="tag">Noether is a <b>ledger</b>. Every agent run is a line. Plain history, legible, no dashboards.</p>
+      <div class="pulled">center of product = a chronological list</div>
+    </div>
+    <div class="right">
+      <div class="cell"><div class="k">Metaphor</div><div class="v">Bank statement / Stripe</div></div>
+      <div class="cell"><div class="k">First verb</div><div class="v">Read history</div></div>
+      <div class="cell"><div class="k">Kills</div><div class="v">Charts, queues, KPIs</div></div>
+      <div class="cell"><div class="k">Wins when</div><div class="v">people just want to know what happened</div></div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- HOME: ledger -->
+    <div>
+      <div class="screen-label">HOME &mdash; <b>chronological ledger of agent runs</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · ledger · last 7 days</span>
+          <span style="margin-left:auto" class="mono" style="font-size:11px; color:var(--ink-faint)">↑↓ to navigate · / to filter</span>
+        </div>
+        <div class="body" style="padding:18px 22px;">
+          <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom:14px;">
+            <div>
+              <div style="font-family:'Caveat',cursive; font-size:32px; line-height:1;">Last 7 days</div>
+              <div class="mono" style="font-size:11px; color:var(--ink-faint); margin-top:4px;">May 17 – May 23 · 7 days · all projects</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="mono" style="font-size:11px; color:var(--ink-faint);">SPEND</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:24px; font-weight:700;">$148.32</div>
+            </div>
+          </div>
+
+          <div class="receipt">
+            <div class="receipt-row head">
+              <span>when</span><span>what</span><span>decision</span><span style="text-align:right">cost</span>
+            </div>
+            <!-- today -->
+            <div style="font-family:'Caveat',cursive; font-size:24px; margin:12px 0 0; color:var(--ink-soft);">today &mdash; Fri May 23</div>
+            <div class="receipt-row">
+              <span>12:00 AM</span>
+              <span class="who">claude-code &middot; refactor auth<span class="small">project=api · 1.3k tools · 44.6M tok</span></span>
+              <span><span class="pill allow"><span class="ball"></span>allow</span></span>
+              <span class="amt">$31.46</span>
+            </div>
+
+            <div style="font-family:'Caveat',cursive; font-size:24px; margin:18px 0 0; color:var(--ink-soft);">yesterday &mdash; Thu May 22</div>
+            <div class="receipt-row">
+              <span>10:56 PM</span>
+              <span class="who">pi &middot; security triage spike<span class="small">project=api · 438 tools</span></span>
+              <span><span class="pill allow"><span class="ball"></span>allow</span></span>
+              <span class="amt">$10.42</span>
+            </div>
+            <div class="receipt-row">
+              <span>06:43 PM</span>
+              <span class="who">pi &middot; search runup<span class="small">project=search · 2.7k tools · <b style="color:var(--deny)">1 limit hit</b></span></span>
+              <span><span class="pill deny"><span class="ball"></span>limit</span></span>
+              <span class="amt deny">$58.35</span>
+            </div>
+            <div class="receipt-row">
+              <span>06:01 PM</span>
+              <span class="who">claude-code &middot; release notes<span class="small">project=editor · 24 tools</span></span>
+              <span><span class="pill warn"><span class="ball"></span>warn</span></span>
+              <span class="amt warn">$1.44</span>
+            </div>
+            <div class="receipt-row">
+              <span>05:39 PM</span>
+              <span class="who">pi &middot; index migration<span class="small">project=search · 12 tools</span></span>
+              <span><span class="pill allow"><span class="ball"></span>allow</span></span>
+              <span class="amt">$0.39</span>
+            </div>
+            <div class="receipt-row">
+              <span>03:14 PM</span>
+              <span class="who">pi &middot; dashboard polish<span class="small">project=editor · 411 tools</span></span>
+              <span><span class="pill allow"><span class="ball"></span>allow</span></span>
+              <span class="amt">$9.95</span>
+            </div>
+            <div class="receipt-row">
+              <span>02:31 PM</span>
+              <span class="who">codex &middot; long context experiment<span class="small">project=labs · 792 tools</span></span>
+              <span><span class="pill warn"><span class="ball"></span>warn</span></span>
+              <span class="amt warn">$19.15</span>
+            </div>
+            <div class="receipt-row">
+              <span>12:28 PM</span>
+              <span class="who">pi &middot; agent runaway<span class="small">project=incident · 348 tools</span></span>
+              <span><span class="pill deny"><span class="ball"></span>deny</span></span>
+              <span class="amt deny">$15.09</span>
+            </div>
+          </div>
+
+          <div class="receipt-totals">
+            <span>114 runs · 53.8M tokens · 4 limits hit</span>
+            <span><b>$148.32</b></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL: one run, opened -->
+    <div>
+      <div class="screen-label">DETAIL &mdash; <b>one run, opened</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">run / pi · search runup · May 22 06:43 PM</span>
+        </div>
+        <div class="body" style="padding:18px;">
+          <div style="display:flex; align-items:flex-start; gap:14px;">
+            <div style="flex:1;">
+              <div class="mono" style="font-size:11px; color:var(--ink-faint);">REQUEST</div>
+              <div style="font-family:'Caveat',cursive; font-size:28px; line-height:1;">8f38ab89-5f67…</div>
+              <div class="mono" style="font-size:11px; margin-top:4px; color:var(--ink-soft);">pi · project=search · 2 714 tool calls · 93.2M tokens</div>
+            </div>
+            <div><span class="pill deny" style="font-size:13px"><span class="ball"></span>$58.35 · limit hit</span></div>
+          </div>
+
+          <div class="screen-label" style="margin:18px 0 6px">WHY IT COSTS</div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:8px 10px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">RETRIES</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:18px; font-weight:700;">11×</div>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:8px 10px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">TOOL LOOPS</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:18px; font-weight:700;">3 loops &gt; 50</div>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:8px 10px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">CACHE HIT</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:18px; font-weight:700; color:var(--deny);">4%</div>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:8px 10px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">PROMPT GROWTH</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:18px; font-weight:700;">2.4× over run</div>
+            </div>
+          </div>
+
+          <div class="screen-label" style="margin:18px 0 6px">TIMELINE</div>
+          <div style="background:#fdfbf5; border:1.5px dashed var(--rule-faint); border-radius:8px; padding:10px 14px;">
+            <div class="trace-bar"><span>06:43:01</span><span class="bar"><span class="seg" style="left:0%; width:18%; background:var(--ok)"></span></span><span style="text-align:right">$3.10</span></div>
+            <div class="trace-bar"><span>06:43:18</span><span class="bar"><span class="seg" style="left:18%; width:32%; background:var(--warn)"></span></span><span style="text-align:right">$11.40</span></div>
+            <div class="trace-bar"><span>06:43:42</span><span class="bar"><span class="seg" style="left:50%; width:30%; background:var(--warn)"></span></span><span style="text-align:right">$22.90</span></div>
+            <div class="trace-bar"><span>06:44:09</span><span class="bar"><span class="seg" style="left:80%; width:20%; background:var(--deny)"></span></span><span style="text-align:right">$20.95</span></div>
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:14px;">
+            <button class="btn deny">add to policy as deny</button>
+            <button class="btn">attribute differently</button>
+          </div>
+          <p class="scribble" style="margin-top:6px">↑ turn a finding into a policy edit in one click</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="annotations">
+    <div class="sticky"><b>why this works</b>Most people understand a bank statement. It's recognizable from second one. Keyboard nav (↑↓, / to filter) makes it dense without being a dashboard.</div>
+    <div class="sticky alt"><b>what you give up</b>The forward-looking story. "What's about to happen" / "what should I change" lives off-screen. Better for review than for in-flight decisions.</div>
+    <div class="sticky red"><b>watch out for</b>Risk of becoming the "generic request log explorer" the docs explicitly call out as a non-goal. The per-line decision/attribution pills are how it stays Noether and not Sentry.</div>
+  </div>
+</section>
+
+<!-- =========================================================================
+     03 · THE GATE  — Noether is an approval inbox
+========================================================================= -->
+<section class="page" id="page-inbox">
+
+  <div class="id-card">
+    <div class="left">
+      <h2>03 · The Gate</h2>
+      <p class="tag">Noether is an <b>approval inbox</b>. One decision in front of you at a time. The point isn't to look; it's to act.</p>
+      <div class="pulled">center of product = the next decision</div>
+    </div>
+    <div class="right">
+      <div class="cell"><div class="k">Metaphor</div><div class="v">Email triage / Linear inbox</div></div>
+      <div class="cell"><div class="k">First verb</div><div class="v">Approve · deny · defer</div></div>
+      <div class="cell"><div class="k">Kills</div><div class="v">Charts, history-first views</div></div>
+      <div class="cell"><div class="k">Wins when</div><div class="v">policy uses <span class="mono" style="font-size:13px">ask</span> a lot</div></div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- HOME: two-pane inbox -->
+    <div>
+      <div class="screen-label">HOME &mdash; <b>queue on the left, focused card on the right</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · inbox · 7 pending</span>
+          <span style="margin-left:auto;" class="pill ask"><span class="ball"></span>3 high-stakes</span>
+        </div>
+        <div class="body" style="padding:18px; display:grid; grid-template-columns: 1fr 1.3fr; gap:18px;">
+
+          <div>
+            <div class="screen-label" style="margin-bottom:8px">PENDING &mdash; <b>7</b></div>
+
+            <div class="inbox-card selected">
+              <div class="who-line">
+                <span class="who">pi</span>
+                <span class="mono" style="color:var(--ink-faint);">incident</span>
+                <span class="when">just now</span>
+              </div>
+              <div class="ask">run <span class="mono" style="font-size:15px">shell.exec("rm -rf node_modules && pnpm i")</span>?</div>
+              <div class="why">tool not on allowlist · 4th retry · agent step 18/20</div>
+            </div>
+
+            <div class="inbox-card">
+              <div class="who-line">
+                <span class="who">claude-code</span>
+                <span class="mono" style="color:var(--ink-faint);">api</span>
+                <span class="when">2 min</span>
+              </div>
+              <div class="ask">spend <span class="mono" style="font-size:15px">+$4.50</span> over budget <span class="mono" style="font-size:13px">personal-local</span>?</div>
+            </div>
+
+            <div class="inbox-card">
+              <div class="who-line">
+                <span class="who">codex</span>
+                <span class="mono" style="color:var(--ink-faint);">labs</span>
+                <span class="when">5 min</span>
+              </div>
+              <div class="ask">switch to <span class="mono" style="font-size:15px">gpt-4.1</span> (not on allowlist)?</div>
+            </div>
+
+            <div class="inbox-card" style="opacity:.65">
+              <div class="who-line">
+                <span class="who">pi</span>
+                <span class="mono" style="color:var(--ink-faint);">editor</span>
+                <span class="when">12 min</span>
+              </div>
+              <div class="ask">read 14 files outside repo root?</div>
+            </div>
+
+            <div class="inbox-card" style="opacity:.5">
+              <div class="who-line">
+                <span class="who">claude-code</span>
+                <span class="mono" style="color:var(--ink-faint);">api</span>
+                <span class="when">31 min</span>
+              </div>
+              <div class="ask">extend session past tool limit (12 → 18)?</div>
+            </div>
+
+            <div style="margin-top:14px; font-size:13px; color:var(--ink-soft);"><span class="arrow">↩</span> hit <span class="mono" style="font-size:12px">y</span> to allow · <span class="mono" style="font-size:12px">n</span> deny · <span class="mono" style="font-size:12px">e</span> edit policy</div>
+          </div>
+
+          <div>
+            <div class="screen-label" style="margin-bottom:8px">FOCUSED &mdash; <b>shell.exec on incident</b></div>
+            <div style="border:2.5px solid var(--rule); border-radius:12px; padding:16px 18px; background:#fdfbf5; box-shadow: inset 0 0 0 4px rgba(217,74,38,0.05);">
+              <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                <div style="font-family:'Caveat',cursive; font-size:30px; line-height:1;">should pi run this?</div>
+                <span class="pill ask" style="font-size:12px;"><span class="ball"></span>ASK</span>
+              </div>
+              <div class="mono" style="margin-top:14px; font-size:13px; background:#15110a; color:#f7f4ec; padding:10px 14px; border-radius:6px;">
+                <span style="color:#f4c430">$</span> shell.exec("rm -rf node_modules &amp;&amp; pnpm i")
+              </div>
+
+              <div class="screen-label" style="margin:18px 0 6px">CONTEXT</div>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-family:'JetBrains Mono',monospace; font-size:12px;">
+                <div><span style="color:var(--ink-faint);">trace</span> req-1a4b · 18 steps so far</div>
+                <div><span style="color:var(--ink-faint);">project</span> incident · attributed via repo</div>
+                <div><span style="color:var(--ink-faint);">rule fired</span> tools.allowlist (shell.* not listed)</div>
+                <div><span style="color:var(--ink-faint);">spend so far</span> $0.93</div>
+                <div><span style="color:var(--ink-faint);">retries</span> 4 (3 limit)</div>
+                <div><span style="color:var(--ink-faint);">prior asks</span> 2 this hour, both allowed</div>
+              </div>
+
+              <div class="screen-label" style="margin:18px 0 6px">PI ASKED ITSELF FIRST</div>
+              <div style="font-family:'Kalam',sans-serif; font-size:15px; background:rgba(244,196,48,0.25); padding:10px 14px; border-radius:6px; color:var(--ink);">
+                "I want to reinstall node_modules because the build failed with a missing dependency.
+                I judged this destructive enough to ask before running."
+              </div>
+
+              <div class="screen-label" style="margin:18px 0 6px">DO</div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button class="btn allow" style="font-size:13px; padding:8px 14px;">allow once</button>
+                <button class="btn" style="font-size:13px; padding:8px 14px;">allow shell.* in <b>incident</b></button>
+                <button class="btn deny" style="font-size:13px; padding:8px 14px;">deny &amp; let pi continue</button>
+                <button class="btn" style="font-size:13px; padding:8px 14px;">deny &amp; stop run</button>
+              </div>
+              <p style="margin-top:14px; font-size:13px; color:var(--ink-soft);">
+                <span class="scribble">↘</span> "allow shell.* in incident" writes one line into <span class="mono" style="font-size:12px">policy.noet.yaml</span>.
+              </p>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL: empty state / when there's nothing to do -->
+    <div>
+      <div class="screen-label">DETAIL &mdash; <b>empty state &amp; quiet stats</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · inbox · 0 pending</span>
+        </div>
+        <div class="body" style="padding:32px 24px; text-align:center;">
+          <div style="font-family:'Caveat',cursive; font-size:54px; line-height:1; color:var(--ok);">all clear ✓</div>
+          <p style="color:var(--ink-soft); margin:8px 0 24px;">No decisions waiting. Noether handled everything else.</p>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; text-align:left; margin-top:24px;">
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">AUTO-ALLOWED · 24H</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:24px; font-weight:700; color:var(--ok);">312</div>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">AUTO-DENIED · 24H</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:24px; font-weight:700; color:var(--deny);">4</div>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px;">
+              <div class="mono" style="font-size:10px; color:var(--ink-faint);">ASKED ME · 24H</div>
+              <div style="font-family:'JetBrains Mono',monospace; font-size:24px; font-weight:700;">7</div>
+            </div>
+          </div>
+
+          <div style="margin-top:24px; text-align:left;">
+            <div class="screen-label" style="margin-bottom:8px">PATTERNS NOETHER NOTICED</div>
+            <div style="border:1.5px dashed var(--rule-faint); border-radius:8px; padding:14px 16px; background:#fdfbf5;">
+              <p style="margin:0 0 8px;">
+                You allowed <span class="mono" style="font-size:13px">shell.exec</span> on
+                <span class="mono" style="font-size:13px">incident</span> 3 times this week.
+              </p>
+              <p style="margin:0 0 8px;">
+                <button class="btn">make it a permanent rule</button>
+                <button class="btn">keep asking</button>
+              </p>
+              <p style="margin-top:14px; margin-bottom:0; color:var(--ink-faint); font-size:13px;">
+                <i>(Noether learns from your decisions, but only when you tell it to.)</i>
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="annotations">
+    <div class="sticky"><b>why this works</b>It commits to the most distinctive thing Noether can do that LiteLLM can't: <i>ask the human in the loop</i>. "Approval is a first-class policy action" goes from a docs line to the home screen.</div>
+    <div class="sticky alt"><b>what you give up</b>Discoverability. There is no "look at everything" surface up front. You'd put history, budgets, and sim behind keyboard shortcuts or a small left rail.</div>
+    <div class="sticky red"><b>watch out for</b>If policy mostly uses <span class="mono" style="font-size:12px">allow/warn</span> and almost never <span class="mono" style="font-size:12px">ask</span>, the inbox is empty most of the time. Pair this with patterns / coaching so the empty state still feels alive.</div>
+  </div>
+</section>
+
+<!-- =========================================================================
+     04 · THE LAB  — simulation is the hero
+========================================================================= -->
+<section class="page" id="page-lab">
+
+  <div class="id-card">
+    <div class="left">
+      <h2>04 · The Lab</h2>
+      <p class="tag">Noether is a <b>strategy lab</b>. You play out a policy on synthetic load before you ship it. Live data is just one scenario.</p>
+      <div class="pulled">center of product = "try this policy"</div>
+    </div>
+    <div class="right">
+      <div class="cell"><div class="k">Metaphor</div><div class="v">Lab notebook · what-if</div></div>
+      <div class="cell"><div class="k">First verb</div><div class="v">Compare strategies</div></div>
+      <div class="cell"><div class="k">Kills</div><div class="v">Live overview as homepage</div></div>
+      <div class="cell"><div class="k">Wins when</div><div class="v">teams are nervous about enforcing</div></div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- HOME: scenario comparison -->
+    <div>
+      <div class="screen-label">HOME &mdash; <b>two strategies, same week, side by side</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · lab · scenario "runaway pressure"</span>
+        </div>
+        <div class="body" style="padding:22px;">
+
+          <div style="display:flex; align-items:baseline; justify-content:space-between; gap:18px; flex-wrap:wrap;">
+            <div>
+              <div style="font-family:'Caveat',cursive; font-size:34px; line-height:1;">what would happen if…</div>
+              <div class="mono" style="font-size:12px; color:var(--ink-soft); margin-top:6px;">scenario · runaway pressure · 14 simulated days · 115 requests</div>
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn">change scenario</button>
+              <button class="btn">+ add strategy</button>
+              <button class="btn primary">replay against real last week</button>
+            </div>
+          </div>
+
+          <div class="sim-grid" style="margin-top:22px;">
+            <div class="sim-card">
+              <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                <h4>A · pooled, no guard</h4>
+                <span class="pill deny" style="font-size:10px;"><span class="ball"></span>exhausted day 3</span>
+              </div>
+              <p style="margin:4px 0 0; color:var(--ink-soft); font-size:14px;">"share the budget, trust the agents"</p>
+              <div class="stats">
+                <span class="k">total spend</span><span class="v">$11.99</span>
+                <span class="k">runaway $$ saved</span><span class="v">$23.77</span>
+                <span class="k">denied</span><span class="v">87</span>
+                <span class="k">fallbacks</span><span class="v">28</span>
+                <span class="k">unused budget</span><span class="v">$0.01</span>
+                <span class="k">fairness</span><span class="v">0.25</span>
+              </div>
+            </div>
+
+            <div class="sim-card winner">
+              <div style="display:flex; justify-content:space-between; align-items:baseline;">
+                <h4>B · guarded team budget</h4>
+                <span class="pill allow" style="font-size:10px;"><span class="ball"></span>held all 14 days</span>
+              </div>
+              <p style="margin:4px 0 0; color:var(--ink-soft); font-size:14px;">"per-day spend window, deny runaway loops"</p>
+              <div class="stats">
+                <span class="k">total spend</span><span class="v ok">$1.20</span>
+                <span class="k">runaway $$ saved</span><span class="v ok">$51.99</span>
+                <span class="k">denied</span><span class="v">107</span>
+                <span class="k">fallbacks</span><span class="v">115</span>
+                <span class="k">unused budget</span><span class="v">$10.80</span>
+                <span class="k">fairness</span><span class="v">0.55</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top:22px; border-top:2px dashed var(--rule-faint); padding-top:18px;">
+            <div class="screen-label" style="margin-bottom:8px">WHERE THEY DIFFER</div>
+            <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; font-family:'JetBrains Mono', monospace; font-size:12px;">
+              <div style="border:1.5px solid var(--ok); border-radius:8px; padding:10px;"><span style="color:var(--ink-faint);">CHEAPER</span><br><b style="font-size:18px;">B · −$10.79</b></div>
+              <div style="border:1.5px solid var(--accent); border-radius:8px; padding:10px;"><span style="color:var(--ink-faint);">FAIRER</span><br><b style="font-size:18px;">B · +0.30</b></div>
+              <div style="border:1.5px solid var(--warn); border-radius:8px; padding:10px;"><span style="color:var(--ink-faint);">DENIES MORE</span><br><b style="font-size:18px;">B · +20 reqs</b></div>
+              <div style="border:1.5px solid var(--deny); border-radius:8px; padding:10px;"><span style="color:var(--ink-faint);">PROTECTS MORE</span><br><b style="font-size:18px;">B · +$28.22</b></div>
+            </div>
+          </div>
+
+          <p style="margin-top:20px; font-size:15px; color:var(--ink-soft);">
+            <span class="arrow">→</span> the recommendation is plain English. The numbers back it up. Both can be wrong; you can edit either strategy and rerun.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL: scenario picker -->
+    <div>
+      <div class="screen-label">DETAIL &mdash; <b>pick a scenario, or replay your real data</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · lab · scenarios</span>
+        </div>
+        <div class="body" style="padding:18px;">
+          <div class="screen-label" style="margin-bottom:8px">CURATED SCENARIOS</div>
+          <div style="display:grid; gap:8px;">
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between;">
+              <span><b>solo dev · local-first</b><br><span style="font-size:12px; color:var(--ink-faint);">one user, two coding agents, mixed model budget</span></span>
+              <button class="btn">run</button>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between;">
+              <span><b>team pooled budget</b><br><span style="font-size:12px; color:var(--ink-faint);">8 users, shared $500/mo, mixed adoption</span></span>
+              <button class="btn">run</button>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between; background:rgba(244,196,48,0.18);">
+              <span><b>runaway agent</b> <span class="pill deny" style="font-size:9px;"><span class="ball"></span>active</span><br><span style="font-size:12px; color:var(--ink-faint);">one tool loop blows the budget without guards</span></span>
+              <button class="btn primary">running</button>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between;">
+              <span><b>adoption pressure</b><br><span style="font-size:12px; color:var(--ink-faint);">protected pool, low + high adopters, fairness</span></span>
+              <button class="btn">run</button>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between;">
+              <span><b>model denial / fallback</b><br><span style="font-size:12px; color:var(--ink-faint);">flagship blocked at peak hours, falls back to fast</span></span>
+              <button class="btn">run</button>
+            </div>
+          </div>
+
+          <div class="screen-label" style="margin:18px 0 8px">…OR USE YOUR OWN HISTORY</div>
+          <div style="border:1.5px dashed var(--rule-faint); border-radius:8px; padding:14px; background:#fdfbf5;">
+            <p style="margin:0 0 8px;"><b>replay last 7 days</b> with a different policy.</p>
+            <p style="margin:0; font-size:13px; color:var(--ink-soft);">114 real runs · $148.32 spent · 4 limits hit</p>
+            <div style="display:flex; gap:8px; margin-top:10px;">
+              <button class="btn">try stricter caps</button>
+              <button class="btn">try approval-heavy</button>
+              <button class="btn">try protected adoption</button>
+            </div>
+          </div>
+
+          <p class="scribble" style="margin-top:18px">↑ this is the killer feature competitors don't have</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="annotations">
+    <div class="sticky"><b>why this works</b>It leads with what's <i>unique</i>. LiteLLM can't simulate. Datadog can't simulate. Stripe can't simulate. A user who lands here learns "this thing is for trying policies, not for staring at numbers."</div>
+    <div class="sticky alt"><b>what you give up</b>Day-to-day operational awareness. Someone who just wants to know "did anything weird happen today" has to click to find out. The lab as homepage assumes you're <i>thinking</i>, not <i>watching</i>.</div>
+    <div class="sticky red"><b>watch out for</b>If your scenarios feel like demos rather than real teams' shapes, the whole thing feels like marketing. Replay-against-real-data is the credibility move.</div>
+  </div>
+</section>
+
+<!-- =========================================================================
+     05 · THE CONSOLE  — command surface
+========================================================================= -->
+<section class="page" id="page-cli">
+
+  <div class="id-card">
+    <div class="left">
+      <h2>05 · The Console</h2>
+      <p class="tag">Noether is a single command surface. You ask, it answers. The "UI" is the answer.</p>
+      <div class="pulled">center of product = an input</div>
+    </div>
+    <div class="right">
+      <div class="cell"><div class="k">Metaphor</div><div class="v">k9s / Raycast / Stripe CLI</div></div>
+      <div class="cell"><div class="k">First verb</div><div class="v">Ask</div></div>
+      <div class="cell"><div class="k">Kills</div><div class="v">Sidebar nav entirely</div></div>
+      <div class="cell"><div class="k">Wins when</div><div class="v">your users live in a terminal</div></div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- HOME: terminal -->
+    <div>
+      <div class="screen-label">HOME &mdash; <b>one input box, no chrome, replies inline</b></div>
+      <div class="cli">
+        <div><span class="prompt">noether ›</span> <span class="you">why did req-1a49 deny?</span></div>
+        <div class="dim">└── decision: <span class="deny">DENY</span> · budget personal-local exhausted ($50.04 / $50)</div>
+        <div class="dim">    rule: budgets.personal-local.cap_usd · file policy.noet.yaml:13</div>
+        <div class="dim">    suggestion: <span class="ok">cap → $65</span> covers 95% of last 8 weeks</div>
+        <div class="hr"></div>
+
+        <div><span class="prompt">noether ›</span> <span class="you">spend by project last 7d</span></div>
+        <div class="dim">─────────────────────────────────────────────</div>
+        <div>  api      <span class="warn">▆▆▆▆▆▆▆▆▆</span> $58.41</div>
+        <div>  search   <span class="warn">▆▆▆▆▆▆▆</span>   $42.18</div>
+        <div>  editor   <span class="warn">▆▆▆▆</span>      $24.96</div>
+        <div>  incident <span class="warn">▆▆</span>        $15.09</div>
+        <div>  labs     <span class="warn">▆</span>         $7.68</div>
+        <div class="dim">─────────────────────────────────────────────</div>
+        <div>  total                            <b>$148.32</b></div>
+        <div class="hr"></div>
+
+        <div><span class="prompt">noether ›</span> <span class="you">what would tighter caps cost me?</span></div>
+        <div class="dim">└── running scenario `replay-last-7d`, two strategies…</div>
+        <div>  current      $148.32   <span class="dim">87 allow · 4 limit</span></div>
+        <div>  <span class="ok">stricter</span>     $108.12   <span class="dim">71 allow · 20 deny · 4 limit prevented</span></div>
+        <div>  approval-h.  $124.05   <span class="dim">79 allow · 12 ask · 0 limit</span></div>
+        <div class="dim">    `noether explain stricter` for details</div>
+
+        <div class="input-row">
+          <span class="prompt">noether ›</span>
+          <span class="you">attribute pi/sessions/* to project=api</span>
+          <span class="caret"></span>
+        </div>
+
+        <div class="hint">
+          <b>?</b> try: <span class="dim">`who spent the most yesterday`</span> · <span class="dim">`alert if next request &gt; $3`</span> · <span class="dim">`open policy`</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- DETAIL: same product, web ui shape -->
+    <div>
+      <div class="screen-label">DETAIL &mdash; <b>same thing in a browser, for the non-CLI crowd</b></div>
+      <div class="frame">
+        <div class="chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url">noether · ask</span>
+        </div>
+        <div class="body" style="padding:32px 24px;">
+          <div style="text-align:center; padding:24px 0;">
+            <div style="font-family:'Caveat',cursive; font-size:46px; line-height:1;">what do you want to know?</div>
+            <div style="margin-top:18px; border:2px solid var(--rule); border-radius:14px; padding:14px 18px; display:flex; align-items:center; gap:10px; background:var(--paper);">
+              <span class="mono" style="font-size:14px; color:var(--accent);">›</span>
+              <span class="mono" style="font-size:15px; color:var(--ink-faint);">why did pi cost $58 yesterday?</span>
+              <span class="caret" style="background:var(--ink); margin-left:auto;"></span>
+            </div>
+            <div style="margin-top:10px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+              <button class="btn">spend by project</button>
+              <button class="btn">explain a request</button>
+              <button class="btn">simulate stricter caps</button>
+              <button class="btn">edit policy</button>
+            </div>
+          </div>
+
+          <div class="screen-label" style="margin:24px 0 8px">WHAT NOETHER NOTICED FOR YOU</div>
+          <div style="display:grid; gap:8px;">
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between; align-items:baseline;">
+              <span><span class="pill deny" style="font-size:10px;"><span class="ball"></span>limit hit</span> &nbsp; <b>pi/search runup</b> · $58.35</span>
+              <span class="mono" style="font-size:11px; color:var(--ink-faint);">11 retries · 4% cache · prompt grew 2.4×</span>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between; align-items:baseline;">
+              <span><span class="pill ask" style="font-size:10px;"><span class="ball"></span>asked you</span> &nbsp; <b>shell.exec on incident</b></span>
+              <span class="mono" style="font-size:11px; color:var(--ink-faint);">waiting · 0:42</span>
+            </div>
+            <div style="border:1.5px solid var(--rule); border-radius:8px; padding:10px 14px; display:flex; justify-content:space-between; align-items:baseline;">
+              <span><span class="pill warn" style="font-size:10px;"><span class="ball"></span>pattern</span> &nbsp; <b>codex/labs prompts growing</b></span>
+              <span class="mono" style="font-size:11px; color:var(--ink-faint);">+18% week-over-week</span>
+            </div>
+          </div>
+
+          <p style="margin-top:18px; font-size:14px; color:var(--ink-soft);">
+            <span class="arrow">→</span> three things, hand-picked. No KPI grid. The cards <i>are</i> the suggestions.
+          </p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="annotations">
+    <div class="sticky"><b>why this works</b>It refuses to be a dashboard. You "talk" to your governance layer the way you talk to <span class="mono" style="font-size:12px">git</span> or <span class="mono" style="font-size:12px">jq</span>. Discoverability lives in suggested follow-ups.</div>
+    <div class="sticky alt"><b>what you give up</b>Visual overview. People who think in tables and charts get nothing on first load. Best when wrapped with a fallback (the right-side mock) for the non-CLI half of users.</div>
+    <div class="sticky red"><b>watch out for</b>Natural-language answers can lie if they wrap real data carelessly. Every reply must show the underlying query/numbers so it's auditable — same posture Noether already takes about decisions.</div>
+  </div>
+</section>
+
+<div class="footer-note">
+  <span class="scribble">a few options · pick one, mix two, kill the rest</span><br>
+  next: pick a direction and we lift one into a hi-fi mock with the real palette.
+</div>
+
+</main>
+
+<script>
+  const tabs = document.querySelectorAll("nav.tabs button");
+  const pages = document.querySelectorAll(".page");
+  tabs.forEach(t => t.addEventListener("click", () => {
+    tabs.forEach(x => x.setAttribute("aria-selected", x === t ? "true" : "false"));
+    const id = "page-" + t.dataset.tab;
+    pages.forEach(p => p.classList.toggle("active", p.id === id));
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }));
+</script>
+
+</body>
+</html>

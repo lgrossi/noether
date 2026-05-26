@@ -26,7 +26,7 @@ noet serve --policy policy.noet.yaml --decision-mode enforce
 version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: dev-daily
     priority: 0
@@ -82,9 +82,10 @@ The v0 evaluator is an in-memory fixed-window budget:
 - routing defaults to `explicit_then_fallback`;
 - when `budget_id` is present, Noether tries that budget first and records why it was rejected
   before falling back;
-- inferred fallback budgets sort by entity specificity, higher `priority`, lower projected budget
+- inferred fallback budgets sort by `routing.fallback_order`, higher `priority`, lower projected budget
   pressure, and stable budget id;
 - `match` decides when a budget applies;
+- omit `match` for a catch-all budget;
 - flat `match` fields compose with AND semantics by default;
 - `match.any` expresses OR across nested clauses;
 - `match.not` negates a nested clause;

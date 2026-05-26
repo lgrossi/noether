@@ -41,10 +41,9 @@ The current local setup was validated with real Pi requests routed through a loc
 version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    match: {}
     models:
       allow:
         - openai-codex:*

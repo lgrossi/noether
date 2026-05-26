@@ -9,10 +9,9 @@ const LOCAL_RUNTIME_DIR: &str = ".noether";
 const DEFAULT_LOCAL_POLICY: &str = r#"version: 0
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 budgets:
   - id: personal-local
-    match: {}
     models:
       allow:
         - openai-codex:*

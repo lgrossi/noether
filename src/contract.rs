@@ -168,16 +168,28 @@ pub struct EvalAnnotation {
 #[serde(deny_unknown_fields)]
 pub struct BudgetRule {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub priority: i64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_empty_budget_model_policy")]
     pub models: BudgetModelPolicy,
     #[serde(default)]
     pub limits: BudgetLimitPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation: Option<BudgetAllocationPolicy>,
-    #[serde(default, rename = "match")]
+    #[serde(
+        default,
+        rename = "match",
+        skip_serializing_if = "is_default_rule_match"
+    )]
     pub rule_match: RuleMatch,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_empty_budget_model_policy(policy: &BudgetModelPolicy) -> bool {
+    policy.allow.is_empty()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -310,30 +322,34 @@ pub struct ProtectedCarryoverPolicy {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleMatch {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any: Vec<RuleMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not: Option<Box<RuleMatch>>,
+}
+
+fn is_default_rule_match(rule_match: &RuleMatch) -> bool {
+    rule_match == &RuleMatch::default()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -378,9 +394,13 @@ impl PolicyAction {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PolicyCondition {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<String>,
-    #[serde(default, rename = "match")]
+    #[serde(
+        default,
+        rename = "match",
+        skip_serializing_if = "is_default_rule_match"
+    )]
     pub rule_match: RuleMatch,
 }
 
@@ -495,10 +515,7 @@ limits:
         )
         .expect("explicit rule parses");
 
-        assert_eq!(
-            rule.limits.spend[0].id.as_deref(),
-            Some("monthly-cap")
-        );
+        assert_eq!(rule.limits.spend[0].id.as_deref(), Some("monthly-cap"));
         assert_eq!(rule.limits.spend[0].mode, Some(SpendWindowMode::Tumbling));
         assert_eq!(
             rule.limits.spend[0].anchor,

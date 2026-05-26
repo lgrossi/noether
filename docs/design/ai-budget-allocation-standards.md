@@ -69,7 +69,7 @@ Rationale: explicit user/caller intent is useful, but hard-failing on a typo, ex
 model mismatch is needlessly brittle when another valid company budget can pay. The decision report
 must show both the rejected explicit budget and selected fallback.
 
-## Decision 3: inference favors specificity, then priority, then best-fit budget pressure
+## Decision 3: inference favors fallback order, then priority, then best-fit budget pressure
 
 When Noether infers a budget, it should evaluate all valid budgets and sort by:
 
@@ -78,14 +78,14 @@ When Noether infers a budget, it should evaluate all valid budgets and sort by:
 3. best-fit budget pressure;
 4. stable budget id.
 
-Default specificity order:
+Default fallback order:
 
 ```text
 project > user > team > group > org > global
 ```
 
 Rationale: project budgets should usually pay before personal/team/org pools because projects are
-the most useful unit for company work attribution. The specificity order remains configurable for
+the most useful unit for company work attribution. The fallback order remains configurable for
 companies that want user grants or team pools to win. If two budgets are equivalent for the request,
 Noether should choose the most obvious healthy pot rather than deny: a budget expiring soon with
 healthy remaining capacity can be a better fit than a huge long-lived pool, while an over-paced or
@@ -199,7 +199,7 @@ AI inactivity from creating a large personal balance.
 ```yaml
 routing:
   mode: explicit_then_fallback
-  specificity: [project, user, team, group, org, global]
+  fallback_order: [project, user, team, group, org, global]
 
 budgets:
   - id: project-noether

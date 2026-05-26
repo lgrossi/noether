@@ -39,7 +39,7 @@ Acceptance:
 - Budgets can define eligible entities.
 - Explicit valid budget wins.
 - Invalid explicit budget falls back to inferred valid budgets.
-- Inference chooses by specificity, priority, best-fit budget pressure, and stable id.
+- Inference chooses by fallback order, priority, best-fit budget pressure, and stable id.
 - Budgets can define provider/model allowlists.
 - Decisions explain selected budget, rejected requested budget, matched entity, model check, and
   remaining budget.

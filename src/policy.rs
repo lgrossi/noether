@@ -25,7 +25,11 @@ pub struct PolicyFile {
 pub struct RoutingPolicy {
     #[serde(default = "default_routing_mode")]
     pub mode: String,
-    #[serde(default = "default_specificity")]
+    #[serde(
+        default = "default_specificity",
+        rename = "fallback_order",
+        alias = "specificity"
+    )]
     pub specificity: Vec<String>,
 }
 
@@ -71,7 +75,11 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 budget.id
             ));
         }
-        validate_rule_match(&format!("budget {}", budget.id), &budget.rule_match, &mut errors);
+        validate_rule_match(
+            &format!("budget {}", budget.id),
+            &budget.rule_match,
+            &mut errors,
+        );
         for pattern in &budget.models.allow {
             if pattern.trim().is_empty() {
                 errors.push(format!(
@@ -559,6 +567,41 @@ policies:
     }
 
     #[test]
+    fn accepts_legacy_specificity_but_serializes_fallback_order_and_clean_match() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+routing:
+  mode: explicit_then_fallback
+  specificity: [project, user, team, group, org, global]
+budgets:
+  - id: personal-local
+    priority: 0
+    match: {}
+    limits:
+      spend:
+        - id: monthly-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 100
+          action: block
+"#,
+        )
+        .expect("legacy specificity policy parses");
+
+        validate_policy(&policy).expect("policy is valid");
+        let yaml = serde_yaml::to_string(&policy).expect("policy serializes");
+
+        assert!(yaml.contains("fallback_order:"));
+        assert!(!yaml.contains("specificity:"));
+        assert!(!yaml.contains("match:"));
+        assert!(!yaml.contains("null"));
+        assert!(!yaml.contains("priority: 0"));
+    }
+
+    #[test]
     fn rejects_invalid_limit_policy() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
@@ -643,7 +686,9 @@ budgets:
             "budget explicit-budget limits.spend[rolling-with-anchor].anchor requires mode tumbling"
         ));
         assert!(message.contains("budget explicit-budget limits.spend[tumbling-without-anchor].anchor is required when mode is tumbling"));
-        assert!(message.contains("budget explicit-budget limits.spend[missing-mode].mode is required"));
+        assert!(
+            message.contains("budget explicit-budget limits.spend[missing-mode].mode is required")
+        );
     }
 
     #[test]

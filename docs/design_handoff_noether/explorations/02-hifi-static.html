@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Noether — Policy · Runs · Replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Newsreader:ital,wght@0,400;0,500;1,400;1,500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="noether.css" />
+<link rel="stylesheet" href="noether-surfaces.css" />
+</head>
+<body>
+
+<!-- ============================== TOP BAR ============================== -->
+<header class="topbar" data-screen-label="00 chrome">
+  <div class="brand">
+    <span class="dot"></span>
+    <span>noether</span>
+    <span class="crumb mono">~/work/api · main</span>
+  </div>
+
+  <nav class="modes" role="tablist" aria-label="Surface">
+    <button data-mode="policy" aria-current="true">Policy</button>
+    <button data-mode="runs" aria-current="false">Runs</button>
+    <button data-mode="replay" aria-current="false">Replay</button>
+  </nav>
+
+  <div class="cmd" title="Ask Noether anything">
+    <span class="glyph">›</span>
+    <span class="placeholder">ask · "why did pi cost $58 yesterday?"</span>
+    <span class="kbd">⌘K</span>
+  </div>
+
+  <div class="status">
+    <span class="pulse"></span>
+    <span>dry-run · 312 decisions today</span>
+  </div>
+</header>
+
+<main>
+
+<!-- ============================== POLICY (HOME) ============================== -->
+<section class="surface active" id="surface-policy" data-screen-label="01 Policy">
+
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">policy</div>
+      <h1>What's allowed here.</h1>
+      <p class="lede">
+        One file decides what agents can do, what they can spend, and when to ask first. Edits are dry-run until you flip enforce.
+      </p>
+    </div>
+    <div class="right">
+      <div class="big">7 rules</div>
+      <div class="sub">last edited 4h ago · clean</div>
+    </div>
+  </div>
+
+  <div class="policy-grid">
+
+    <!-- ===== EDITOR ===== -->
+    <div class="editor" aria-label="Policy file">
+      <div class="editor-head">
+        <span class="path">policy.noet.yaml</span>
+        <span class="modified">● modified</span>
+        <span class="branch">main · 4h</span>
+      </div>
+
+      <pre><span class="ln"><span class="gutter">1</span><span class="code"><span class="yc"># local-first · observe → warn → enforce</span></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">2</span><span class="code"><span class="yk">defaults</span>:</span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">3</span><span class="code">  <span class="yk">decision_mode</span>: <span class="ys">warn</span></span><span class="tally"><b>312</b> applied today</span></span>
+<span class="ln"><span class="gutter">4</span><span class="code">  <span class="yk">attribute_to</span>: <span class="ys">project</span></span><span class="tally"><b>5</b> projects detected</span></span>
+<span class="ln"><span class="gutter">5</span><span class="code"></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">6</span><span class="code"><span class="yk">models</span>:</span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">7</span><span class="code">  <span class="yk">allow</span>: [<span class="ys">"anthropic/*"</span>, <span class="ys">"openai/gpt-4*"</span>]</span><span class="tally"><span class="ok">298 allow</span></span></span>
+<span class="ln"><span class="gutter">8</span><span class="code">  <span class="yk">deny</span>:  [<span class="ys">"*/gpt-3.5*"</span>]</span><span class="tally"><span class="deny">2 deny</span></span></span>
+<span class="ln"><span class="gutter">9</span><span class="code"></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">10</span><span class="code"><span class="yk">budgets</span>:</span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">11</span><span class="code">  - <span class="yk">id</span>: <span class="ys">personal-local</span></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">12</span><span class="code">    <span class="yk">window</span>: <span class="ys">"30d"</span></span><span class="tally"></span></span>
+<span class="ln has-issue"><span class="gutter">13</span><span class="code">    <span class="yk">cap_usd</span>: <span class="yn"><span class="hl-warn">"$50"</span></span>   <span class="yc"># 95% used</span></span><span class="tally"><span class="warn">2 deny</span> · $50.04</span></span>
+<span class="ln"><span class="gutter">14</span><span class="code">    <span class="yk">on_exhaust</span>: <span class="ys">block</span></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">15</span><span class="code"></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">16</span><span class="code"><span class="yk">limits</span>:</span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">17</span><span class="code">  <span class="yk">request_cost_usd</span>: <span class="yn">2.50</span></span><span class="tally"><span class="warn">11 warn</span></span></span>
+<span class="ln"><span class="gutter">18</span><span class="code">  <span class="yk">tools_per_turn</span>:  <span class="yn">12</span></span><span class="tally"><span class="warn">3 warn</span></span></span>
+<span class="ln"><span class="gutter">19</span><span class="code">  <span class="yk">retries</span>:         <span class="yn">3</span></span><span class="tally"><b>—</b></span></span>
+<span class="ln"><span class="gutter">20</span><span class="code"></span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">21</span><span class="code"><span class="yk">tools</span>:</span><span class="tally"></span></span>
+<span class="ln"><span class="gutter">22</span><span class="code">  <span class="yk">ask_for</span>: [<span class="ys">"shell.exec"</span>, <span class="ys">"fs.delete"</span>, <span class="ys">"net.*"</span>]</span><span class="tally"><span class="ask">7 ask</span></span></span></pre>
+
+      <div class="editor-foot">
+        <div class="mode-toggle" title="What happens when a rule fires">
+          <button>observe</button>
+          <button class="on">warn</button>
+          <button>enforce</button>
+        </div>
+        <div class="info"><span class="pill info"><span class="ball"></span>dry-run</span><span>changes apply on save, decisions logged but not blocked</span></div>
+        <div class="spacer"></div>
+        <button class="btn">Replay against last 7d <span class="arrow">→</span></button>
+        <button class="btn primary">Enforce</button>
+      </div>
+    </div>
+
+    <!-- ===== LIVE TAIL ===== -->
+    <aside class="tail">
+
+      <div class="card tail-card" aria-label="Decisions tail">
+        <div class="card-head">
+          <h3>Decisions · live</h3>
+          <span class="status" style="margin-left:6px"><span class="pulse"></span></span>
+          <span class="meta">last 24h · all projects</span>
+        </div>
+
+        <div class="tail-list">
+          <div class="tail-row is-new"><span class="t">12:04</span><span class="glyph ask">?</span><span class="what">pi · shell.exec on <b>incident</b> <span class="ref">req-1a4b</span></span><span class="cost">waiting</span></div>
+          <div class="tail-row"><span class="t">12:01</span><span class="glyph ok">●</span><span class="what">claude-code · refactor auth <span class="ref">req-1a4a</span></span><span class="cost">$0.18</span></div>
+          <div class="tail-row is-deny"><span class="t">11:58</span><span class="glyph deny">✕</span><span class="what">pi · search runup <span class="ref">req-1a49</span> <span class="ref" style="color:var(--deny)">budget exhausted</span></span><span class="cost">$0.00</span></div>
+          <div class="tail-row is-warn"><span class="t">11:42</span><span class="glyph warn">▲</span><span class="what">codex · long context <span class="ref">req-1a47</span></span><span class="cost">$2.81</span></div>
+          <div class="tail-row"><span class="t">11:30</span><span class="glyph ok">●</span><span class="what">pi · index migration <span class="ref">req-1a46</span></span><span class="cost">$0.39</span></div>
+          <div class="tail-row"><span class="t">11:24</span><span class="glyph ok">●</span><span class="what">claude-code · release notes <span class="ref">req-1a45</span></span><span class="cost">$1.20</span></div>
+          <div class="tail-row is-warn"><span class="t">11:11</span><span class="glyph warn">▲</span><span class="what">pi · 14 tools/turn <span class="ref">req-1a44</span></span><span class="cost">$0.55</span></div>
+          <div class="tail-row"><span class="t">10:52</span><span class="glyph ok">●</span><span class="what">claude-code · doc edit <span class="ref">req-1a43</span></span><span class="cost">$0.07</span></div>
+          <div class="tail-row"><span class="t">10:30</span><span class="glyph ok">●</span><span class="what">pi · review changes <span class="ref">req-1a40</span></span><span class="cost">$0.18</span></div>
+          <div class="tail-row"><span class="t">10:21</span><span class="glyph ok">●</span><span class="what">claude-code · cached <span class="ref">req-1a3f</span></span><span class="cost">$0.00</span></div>
+        </div>
+
+        <div class="tail-summary">
+          <span><b>312</b> today</span>
+          <span><b style="color:var(--ok)">298</b> allow</span>
+          <span><b style="color:var(--warn)">11</b> warn</span>
+          <span><b style="color:var(--deny)">2</b> deny</span>
+          <span><b style="color:var(--accent)">1</b> ask</span>
+          <span style="margin-left:auto">→ open in Runs</span>
+        </div>
+      </div>
+
+      <!-- suggestion -->
+      <div class="suggest" role="note">
+        <span class="glyph">⌁</span>
+        <div class="body">
+          <p><b>Cap is too tight.</b> <span class="mono" style="font-size:12px">budgets.personal-local.cap_usd</span> denied 2 reqs and almost-denied 3 more this window. $65 covers the last 8 weeks of activity.</p>
+          <div class="diff">
+            <span><span class="minus">- cap_usd: "$50"</span></span>
+            <span><span class="plus">+ cap_usd: "$65"</span></span>
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <button class="btn primary">Apply</button>
+          <button class="btn ghost">Simulate first</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ===== RULE-BY-RULE STRIP ===== -->
+  <div class="rule-strip" aria-label="Rule-by-rule activity">
+    <h3>How each rule played out · last 7 days</h3>
+    <p class="sub">Counts come from the live tail. Click a rule to see the runs it touched.</p>
+
+    <div class="rule-list">
+      <div class="rule-row">
+        <span class="dot"></span>
+        <span class="name">models.allow <span class="loc">L7</span></span>
+        <span class="bar"><span class="ok" style="width: 98%"></span><span class="warn" style="width: 2%"></span></span>
+        <span class="counts"><b>2 081</b> allow · 41 warn · <span style="color:var(--ink-faint)">0 deny</span></span>
+      </div>
+      <div class="rule-row deny">
+        <span class="dot"></span>
+        <span class="name">budgets.personal-local.cap_usd <span class="loc">L13</span></span>
+        <span class="bar"><span class="ok" style="width: 88%"></span><span class="warn" style="width: 8%"></span><span class="deny" style="width: 4%"></span></span>
+        <span class="counts"><b>$50.04</b> / $50 · 2 deny · 3 near-miss</span>
+      </div>
+      <div class="rule-row warn">
+        <span class="dot"></span>
+        <span class="name">limits.request_cost_usd <span class="loc">L17</span></span>
+        <span class="bar"><span class="ok" style="width: 92%"></span><span class="warn" style="width: 8%"></span></span>
+        <span class="counts">avg $0.34 · <b>11</b> over $2.50</span>
+      </div>
+      <div class="rule-row warn">
+        <span class="dot"></span>
+        <span class="name">limits.tools_per_turn <span class="loc">L18</span></span>
+        <span class="bar"><span class="ok" style="width: 96%"></span><span class="warn" style="width: 4%"></span></span>
+        <span class="counts">p95 = 9 · <b>3</b> over 12</span>
+      </div>
+      <div class="rule-row">
+        <span class="dot" style="background:var(--accent)"></span>
+        <span class="name">tools.ask_for <span class="loc">L22</span></span>
+        <span class="bar"><span class="ask" style="width: 100%"></span></span>
+        <span class="counts"><b>7</b> asked · 5 allowed · 2 denied</span>
+      </div>
+      <div class="rule-row" style="opacity:.7">
+        <span class="dot" style="background:var(--ink-faint)"></span>
+        <span class="name">models.deny <span class="loc">L8</span></span>
+        <span class="bar"><span class="deny" style="width: 2%"></span></span>
+        <span class="counts">2 denied · <span style="color:var(--ink-faint)">last 4d ago</span></span>
+      </div>
+      <div class="rule-row" style="opacity:.55">
+        <span class="dot" style="background:var(--ink-faint)"></span>
+        <span class="name">limits.retries <span class="loc">L19</span></span>
+        <span class="bar"></span>
+        <span class="counts" style="color:var(--ink-faint)">never fired · check it's needed</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- cross-link strip -->
+  <div class="cross">
+    <span class="label">next</span>
+    <span class="grow">You have <b>1 pending change</b> &mdash; cap_usd $50 → $65.</span>
+    <button class="btn">Replay before enforcing <span class="arrow">→</span></button>
+    <button class="btn primary">Enforce</button>
+  </div>
+
+</section>
+
+<!-- ============================== RUNS ============================== -->
+<section class="surface" id="surface-runs" data-screen-label="02 Runs">
+
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">runs</div>
+      <h1>What actually happened.</h1>
+      <p class="lede">Every agent run, attributed and decided. Click a row to see the trace, or turn a finding into a policy edit.</p>
+    </div>
+    <div class="right">
+      <div class="big">$148.32</div>
+      <div class="sub">114 runs · last 7 days · 4 limits hit</div>
+    </div>
+  </div>
+
+  <!-- filter bar -->
+  <div class="filterbar">
+    <span class="mono" style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-faint);">filter</span>
+    <span class="chip">project <b>any</b><span class="x">×</span></span>
+    <span class="chip">agent <b>any</b><span class="x">×</span></span>
+    <span class="chip">decision <b>any</b><span class="x">×</span></span>
+    <span class="chip" style="background:var(--accent-2); border-color:rgba(194,65,12,0.2); color:var(--ink-2);">rule <b>cap_usd</b><span class="x">×</span></span>
+    <span class="sep">·</span>
+    <span style="color:var(--ink-faint);">filtering to runs that touched <span class="mono" style="font-size:12px">budgets.personal-local.cap_usd</span></span>
+    <span style="margin-left:auto;" class="mono" style="font-size:11px; color:var(--ink-faint);">/ to search</span>
+  </div>
+
+  <div class="runs-table">
+
+    <div class="runs-day"><span>today · Fri May 23</span><span class="total">$31.46 · 24 runs</span></div>
+
+    <div class="run-row">
+      <span class="when">12:04</span>
+      <span class="glyph ask">?</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">shell.exec on incident — waiting on you</span></span>
+      <span class="meta">incident · req-1a4b</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">—</span>
+    </div>
+    <div class="run-row">
+      <span class="when">11:30</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">claude-code</span><span class="purpose">refactor auth middleware</span></span>
+      <span class="meta">api · 1.3k tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$31.46</span>
+    </div>
+
+    <div class="runs-day"><span>yesterday · Thu May 22</span><span class="total">$98.95 · 41 runs</span></div>
+
+    <div class="run-row">
+      <span class="when">22:56</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">security triage spike</span></span>
+      <span class="meta">api · 438 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$10.42</span>
+    </div>
+    <div class="run-row" style="background: rgba(139,31,31,0.04);">
+      <span class="when">18:43</span>
+      <span class="glyph deny">✕</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">search runup — <b style="color:var(--deny)">budget exhausted at $50.04</b></span></span>
+      <span class="meta">search · 2.7k tools</span>
+      <span class="meta">gpt-4.1</span>
+      <span class="cost deny">$58.35</span>
+    </div>
+    <div class="run-row">
+      <span class="when">18:01</span>
+      <span class="glyph warn">▲</span>
+      <span class="what"><span class="agent">claude-code</span><span class="purpose">release notes draft (cost $2.81 over limit)</span></span>
+      <span class="meta">editor · 24 tools</span>
+      <span class="meta">claude-opus-4</span>
+      <span class="cost warn">$1.44</span>
+    </div>
+    <div class="run-row">
+      <span class="when">17:39</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">index migration plan</span></span>
+      <span class="meta">search · 12 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$0.39</span>
+    </div>
+    <div class="run-row">
+      <span class="when">15:14</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">dashboard polish</span></span>
+      <span class="meta">editor · 411 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$9.95</span>
+    </div>
+    <div class="run-row" style="background: rgba(139,31,31,0.04);">
+      <span class="when">12:28</span>
+      <span class="glyph deny">✕</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">agent runaway — tool loop hit retry limit</span></span>
+      <span class="meta">incident · 348 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost deny">$15.09</span>
+    </div>
+
+    <div class="runs-day"><span>Wed May 21</span><span class="total">$17.91 · 18 runs</span></div>
+    <div class="run-row">
+      <span class="when">19:42</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">claude-code</span><span class="purpose">vendor sdk integration</span></span>
+      <span class="meta">api · 88 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$3.66</span>
+    </div>
+    <div class="run-row">
+      <span class="when">14:30</span>
+      <span class="glyph warn">▲</span>
+      <span class="what"><span class="agent">codex</span><span class="purpose">long context experiment (tools per turn = 14)</span></span>
+      <span class="meta">labs · 792 tools</span>
+      <span class="meta">gpt-4.1</span>
+      <span class="cost warn">$11.40</span>
+    </div>
+    <div class="run-row">
+      <span class="when">10:07</span>
+      <span class="glyph ok">●</span>
+      <span class="what"><span class="agent">pi</span><span class="purpose">test sweep</span></span>
+      <span class="meta">api · 56 tools</span>
+      <span class="meta">claude-sonnet-4</span>
+      <span class="cost">$2.85</span>
+    </div>
+
+    <div class="runs-foot">
+      <span><b style="color:var(--ink);">114</b> runs · <b style="color:var(--ink);">53.8M</b> tokens · 4 limits hit · 1 awaiting you</span>
+      <span class="grow"></span>
+      <button class="btn">Export ledger (CSV)</button>
+      <button class="btn">Attribute differently</button>
+    </div>
+  </div>
+
+  <!-- cross-link strip -->
+  <div class="cross">
+    <span class="label">next</span>
+    <span class="grow">2 runs hit <span class="mono" style="font-size:12px">cap_usd</span> this week. Turn that into a policy proposal?</span>
+    <button class="btn">→ Propose change in Policy</button>
+    <button class="btn">→ Replay last 7d with new cap</button>
+  </div>
+</section>
+
+<!-- ============================== REPLAY ============================== -->
+<section class="surface" id="surface-replay" data-screen-label="03 Replay">
+
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">replay</div>
+      <h1>What would change.</h1>
+      <p class="lede">Run the proposed policy against your real history (or a synthetic scenario) before flipping enforce.</p>
+    </div>
+    <div class="right">
+      <div class="big">last 7 days</div>
+      <div class="sub">114 real runs · $148.32 baseline</div>
+    </div>
+  </div>
+
+  <!-- pickers -->
+  <div class="replay-head">
+    <div class="pickers">
+      <div class="picker"><span class="k">against</span><span class="v">real · last 7d</span></div>
+      <div class="picker"><span class="k">strategies</span><span class="v">current · proposed-A</span></div>
+      <div class="picker"><span class="k">scope</span><span class="v">all projects</span></div>
+      <button class="btn ghost">+ add strategy</button>
+      <button class="btn">change scenario</button>
+    </div>
+    <div>
+      <button class="btn primary">Re-run</button>
+    </div>
+  </div>
+
+  <!-- scenarios A vs B -->
+  <div class="scenarios">
+
+    <div class="scenario">
+      <div class="h">
+        <span class="name">current</span>
+        <span class="tag">policy @ HEAD</span>
+        <span class="ribbon"><span class="pill"><span class="ball" style="background:var(--ink-faint)"></span>baseline</span></span>
+      </div>
+      <p class="desc">cap_usd $50 · request_cost_usd $2.50 · tools_per_turn 12 · ask_for shell/fs/net</p>
+
+      <div class="stats">
+        <div><div class="k">spent</div><div class="v">$148.32</div></div>
+        <div><div class="k">prevented</div><div class="v">$73.44</div></div>
+        <div><div class="k">denied</div><div class="v">4</div></div>
+        <div><div class="k">asked</div><div class="v">7</div></div>
+        <div><div class="k">cap headroom</div><div class="v" style="color:var(--deny)">$0 left</div></div>
+        <div><div class="k">runaway exposure</div><div class="v">medium</div></div>
+      </div>
+    </div>
+
+    <div class="scenario winner">
+      <div class="h">
+        <span class="name">proposed</span>
+        <span class="tag">cap $50 → $65 · retries 3 → 2 · ask_for net.*</span>
+        <span class="ribbon"><span class="pill allow"><span class="ball"></span>recommended</span></span>
+      </div>
+      <p class="desc">Lifts the cap, tightens retries, narrows shell-ish tools to <i>ask</i>.</p>
+
+      <div class="diff">
+<span class="minus">- cap_usd: "$50"</span>
+<span class="plus">+ cap_usd: "$65"</span>
+<span class="minus">- retries: 3</span>
+<span class="plus">+ retries: 2</span>
+      </div>
+
+      <div class="stats">
+        <div><div class="k">spent</div><div class="v ok">$132.05 <span class="delta">−$16.27</span></div></div>
+        <div><div class="k">prevented</div><div class="v ok">$98.91 <span class="delta">+$25.47</span></div></div>
+        <div><div class="k">denied</div><div class="v">2 <span class="delta">−2</span></div></div>
+        <div><div class="k">asked</div><div class="v bad">11 <span class="delta">+4</span></div></div>
+        <div><div class="k">cap headroom</div><div class="v ok">$14.96 left</div></div>
+        <div><div class="k">runaway exposure</div><div class="v ok">low</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- recommendation -->
+  <div class="reco">
+    <div>
+      <div class="verdict">Proposed wins on every dimension <b>except</b> "asks per week" (+4).</div>
+      <div class="sub">No runs would have been wrongly denied. The +4 asks are all <span class="mono" style="font-size:12px">net.*</span> tool calls — review those individually below.</div>
+    </div>
+    <div class="right">
+      <button class="btn">Inspect diffs</button>
+      <button class="btn primary">Adopt &amp; enforce →</button>
+    </div>
+  </div>
+
+  <!-- difference rows -->
+  <div class="scenario-row">
+
+    <div class="row-card">
+      <div class="label"><b>req-1a49 · pi · search runup</b>2026-05-22 · $58.35 baseline</div>
+      <div class="bar-cmp">
+        <div class="row"><span class="l">cur</span><span class="seg"><span style="width:100%; background:var(--deny);"></span></span><span class="n">denied @ $50</span></div>
+        <div class="row"><span class="l">new</span><span class="seg"><span class="b" style="width:90%;"></span></span><span class="n">allowed $58.35</span></div>
+      </div>
+      <span class="pill ok" style="color:var(--ok); background:var(--ok-bg);"><span class="ball"></span>recovered</span>
+    </div>
+
+    <div class="row-card">
+      <div class="label"><b>req-1a4d · pi · runaway loop</b>2026-05-22 · $15.09</div>
+      <div class="bar-cmp">
+        <div class="row"><span class="l">cur</span><span class="seg"><span style="width:80%; background:var(--deny);"></span></span><span class="n">denied @ retry 3</span></div>
+        <div class="row"><span class="l">new</span><span class="seg"><span style="width:48%; background:var(--deny);"></span></span><span class="n">denied @ retry 2</span></div>
+      </div>
+      <span class="pill ok"><span class="ball"></span>stopped sooner</span>
+    </div>
+
+    <div class="row-card">
+      <div class="label"><b>req-1a47 · codex · long context</b>2026-05-21 · $11.40</div>
+      <div class="bar-cmp">
+        <div class="row"><span class="l">cur</span><span class="seg"><span style="width:70%; background:var(--warn);"></span></span><span class="n">warn</span></div>
+        <div class="row"><span class="l">new</span><span class="seg"><span style="width:70%; background:var(--accent);"></span></span><span class="n">asked you</span></div>
+      </div>
+      <span class="pill ask"><span class="ball"></span>+1 ask</span>
+    </div>
+
+  </div>
+
+  <!-- cross-link strip -->
+  <div class="cross">
+    <span class="label">next</span>
+    <span class="grow">Adopting the proposed policy writes 3 lines to <span class="mono" style="font-size:12px">policy.noet.yaml</span> and stays in dry-run.</span>
+    <button class="btn">→ Open the diff in Policy</button>
+    <button class="btn primary">Adopt &amp; enforce</button>
+  </div>
+
+</section>
+
+</main>
+
+<script>
+  // mode switch
+  const modeBtns = document.querySelectorAll(".modes button");
+  const surfaces = document.querySelectorAll(".surface");
+  function go(mode) {
+    modeBtns.forEach(b => b.setAttribute("aria-current", b.dataset.mode === mode ? "true" : "false"));
+    surfaces.forEach(s => s.classList.toggle("active", s.id === "surface-" + mode));
+    window.scrollTo({ top: 0 });
+  }
+  modeBtns.forEach(b => b.addEventListener("click", () => go(b.dataset.mode)));
+
+  // light cross-link clicks
+  document.querySelectorAll(".cross .btn").forEach(b => {
+    b.addEventListener("click", () => {
+      const t = (b.textContent || "").toLowerCase();
+      if (t.includes("policy")) go("policy");
+      else if (t.includes("runs")) go("runs");
+      else if (t.includes("replay")) go("replay");
+      else if (t.includes("enforce")) go("policy");
+    });
+  });
+
+  // ⌘K placeholder
+  document.addEventListener("keydown", e => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      const cmd = document.querySelector(".cmd");
+      cmd.style.outline = "2px solid var(--accent)";
+      setTimeout(() => cmd.style.outline = "", 600);
+    }
+  });
+</script>
+</body>
+</html>
