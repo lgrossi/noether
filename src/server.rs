@@ -67,6 +67,27 @@ struct AppPolicyProposal {
     source: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AppPolicyEnforceRequest {
+    #[serde(default)]
+    confirm_replay: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AppPolicyRollbackResponse {
+    policy: AppPolicyResponse,
+    restored_from: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    decision_mode: DecisionMode,
+    policy_loaded: bool,
+    upstream_configured: bool,
+    route_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct AppRuleStat {
     rule: String,
@@ -556,6 +577,7 @@ pub fn build_router(state: AppState) -> Router {
             post(apply_app_policy_suggestion),
         )
         .route("/v1/app/policy/enforce", post(enforce_app_policy_proposal))
+        .route("/v1/app/policy/rollback", post(rollback_app_policy))
         .route("/v1/app/runs", get(app_runs))
         .route("/v1/app/runs/{run_id}", get(app_run_detail))
         .route("/v1/app/replay", get(app_replay))
@@ -597,8 +619,14 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        decision_mode: state.decision_mode,
+        policy_loaded: state.active_policy().await.is_some(),
+        upstream_configured: state.upstream.is_some(),
+        route_count: state.routes.len(),
+    })
 }
 
 async fn authorize(
@@ -815,6 +843,7 @@ async fn apply_app_policy_suggestion(
 
 async fn enforce_app_policy_proposal(
     State(state): State<AppState>,
+    request: Option<Json<AppPolicyEnforceRequest>>,
 ) -> Result<Json<AppPolicyResponse>, NoetError> {
     let source = match fs::read_to_string(&state.policy_proposal_path).await {
         Ok(source) => source,
@@ -823,6 +852,24 @@ async fn enforce_app_policy_proposal(
         }
         Err(error) => return Err(error.into()),
     };
+    if !request
+        .as_ref()
+        .map(|request| request.confirm_replay)
+        .unwrap_or(false)
+    {
+        return Err(NoetError::InvalidPolicy(
+            "policy enforce requires confirm_replay=true after reviewing replay".to_owned(),
+        ));
+    }
+    if let Some((_, active_source, _)) = state.active_policy_source().await {
+        if active_source == source {
+            return Err(NoetError::InvalidPolicy(
+                "policy proposal matches active policy; nothing to enforce".to_owned(),
+            ));
+        }
+        write_previous_policy_snapshot(&state, &active_source).await?;
+        append_policy_audit(&state, "enforce", "saved draft promoted to active policy").await?;
+    }
     state.update_policy_source(source).await?;
     match fs::remove_file(&state.policy_proposal_path).await {
         Ok(()) => {}
@@ -835,6 +882,32 @@ async fn enforce_app_policy_proposal(
         trace_id: None,
     });
     Ok(response)
+}
+
+async fn rollback_app_policy(
+    State(state): State<AppState>,
+) -> Result<Json<AppPolicyRollbackResponse>, NoetError> {
+    let previous_path = policy_previous_path(&state);
+    let source = match fs::read_to_string(&previous_path).await {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NoetError::NotFound(
+                "no previous policy snapshot saved".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    state.update_policy_source(source).await?;
+    append_policy_audit(&state, "rollback", "previous policy snapshot restored").await?;
+    let policy = app_policy(State(state.clone())).await?.0;
+    let _ = state.report_updates.send(ReportUpdate {
+        kind: "policy",
+        trace_id: None,
+    });
+    Ok(Json(AppPolicyRollbackResponse {
+        policy,
+        restored_from: previous_path.display().to_string(),
+    }))
 }
 
 async fn app_runs(
@@ -2128,6 +2201,56 @@ fn finalize_trace_id(payload: &FinalizeReservation) -> Option<String> {
         .get("trace_id")
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
+}
+
+fn policy_previous_path(state: &AppState) -> PathBuf {
+    state
+        .policy_proposal_path
+        .parent()
+        .unwrap_or_else(|| Path::new(".noet"))
+        .join("policy.previous.yaml")
+}
+
+fn policy_audit_path(state: &AppState) -> PathBuf {
+    state
+        .policy_proposal_path
+        .parent()
+        .unwrap_or_else(|| Path::new(".noet"))
+        .join("policy.audit.jsonl")
+}
+
+async fn write_previous_policy_snapshot(state: &AppState, source: &str) -> Result<(), NoetError> {
+    let previous_path = policy_previous_path(state);
+    if let Some(parent) = previous_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(previous_path, source.as_bytes()).await?;
+    Ok(())
+}
+
+async fn append_policy_audit(
+    state: &AppState,
+    action: &str,
+    reason: &str,
+) -> Result<(), NoetError> {
+    let audit_path = policy_audit_path(state);
+    if let Some(parent) = audit_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let entry = serde_json::json!({
+        "occurred_at": chrono::Utc::now(),
+        "action": action,
+        "reason": reason,
+        "policy_proposal_path": state.policy_proposal_path,
+    });
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    let mut file = options.open(audit_path).await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(line.as_bytes()).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3511,6 +3634,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_exposes_sidecar_readiness() {
+        let app = build_router(test_state(Some(model_locked_policy())));
+
+        let health_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(health_response.status(), StatusCode::OK);
+        let health_body = to_bytes(health_response.into_body(), usize::MAX)
+            .await
+            .expect("health body");
+        let health_json: serde_json::Value =
+            serde_json::from_slice(&health_body).expect("health json");
+        assert_eq!(health_json["status"], "ok");
+        assert_eq!(health_json["policy_loaded"], true);
+        assert_eq!(health_json["decision_mode"], "dry_run");
+    }
+
+    #[tokio::test]
     async fn noether_app_policy_source_is_clean_user_yaml() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let policy_path = tempdir.path().join("policy.yaml");
@@ -3613,6 +3760,74 @@ budgets:
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("discard json");
         assert!(payload["proposal"].is_null());
         assert!(!tempdir.path().join("policy.proposed.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn noether_app_enforce_requires_confirmation_and_writes_rollback_snapshot() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let policy_path = tempdir.path().join("policy.yaml");
+        let active_source = serde_yaml::to_string(&model_locked_policy()).expect("active yaml");
+        std::fs::write(&policy_path, &active_source).expect("write active policy");
+        let policy = crate::policy::load_policy(&policy_path)
+            .await
+            .expect("load active policy");
+        let mut state = AppState::with_reloadable_policy(
+            tempdir.path().join("fixtures"),
+            None,
+            policy_path.clone(),
+            policy,
+            DecisionMode::DryRun,
+        );
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&strict_policy()).expect("proposal yaml"),
+        )
+        .expect("write proposal");
+        let app = build_router(state);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/policy/enforce")
+                    .body(Body::empty())
+                    .expect("unconfirmed enforce"),
+            )
+            .await
+            .expect("unconfirmed response");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let enforced = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/policy/enforce")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"confirm_replay":true}).to_string()))
+                    .expect("confirmed enforce"),
+            )
+            .await
+            .expect("confirmed response");
+        assert_eq!(enforced.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(tempdir.path().join("policy.previous.yaml"))
+                .expect("previous policy"),
+            active_source
+        );
+        assert!(tempdir.path().join("policy.audit.jsonl").exists());
+
+        let rolled_back = app
+            .oneshot(
+                Request::post("/v1/app/policy/rollback")
+                    .body(Body::empty())
+                    .expect("rollback request"),
+            )
+            .await
+            .expect("rollback response");
+        assert_eq!(rolled_back.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(policy_path).expect("rolled back policy"),
+            active_source
+        );
     }
 
     #[tokio::test]

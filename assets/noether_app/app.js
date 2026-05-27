@@ -362,7 +362,11 @@ async function enforcePolicy() {
   const status = $("[data-policy-save-state]");
   status.textContent = "Enforcing draft...";
   try {
-    storePolicy(await json("/v1/app/policy/enforce", { method: "POST" }), { resetEditor: true });
+    storePolicy(await json("/v1/app/policy/enforce", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm_replay: true }),
+    }), { resetEditor: true });
     state.policyEditorDirty = false;
     state.replay = null;
     renderPolicy();
