@@ -2,4 +2,5 @@
 .noet/
 .noether/
 /**/node_modules
+/sdk/typescript/dist
 /test-results
