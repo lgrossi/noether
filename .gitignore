@@ -3,4 +3,6 @@
 .noether/
 /**/node_modules
 /sdk/typescript/dist
+/sdk/python/.venv
+__pycache__/
 /test-results

@@ -1,0 +1,9 @@
+[project]
+name = "noether-sidecar"
+version = "0.1.0"
+description = "Python client for the Noether decision sidecar API"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
