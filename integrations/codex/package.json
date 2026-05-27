@@ -1,0 +1,10 @@
+{
+  "name": "noether-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex exec wrapper for the Noether decision sidecar",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

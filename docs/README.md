@@ -15,6 +15,8 @@ This directory holds Noether's north-star product and architecture notes.
   event/tool hooks, with provider-authorization limitations called out.
 - [Claude Code integration](./integrations/claude-code.md): Claude Code hook integration for
   tool/action authorization and documented lifecycle events.
+- [Codex integration](./integrations/codex.md): Codex `exec --json` wrapper that authorizes before
+  launch, records events, and keeps provider/model metadata separate from the harness.
 - [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
   live-dashboard data/update surfaces, artifact-backed simulation routes, and the CLI/HTTP contract
   shape they share.
