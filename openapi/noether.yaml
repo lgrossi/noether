@@ -80,6 +80,7 @@ paths:
             examples:
               providerUsage:
                 value:
+                  outcome: success
                   actual_cost_usd: 0.12
                   usage:
                     provider: openai
@@ -239,6 +240,8 @@ components:
       properties:
         reservation_id:
           type: string
+        outcome:
+          $ref: "#/components/schemas/FinalizeOutcome"
         usage:
           $ref: "#/components/schemas/UsageObservation"
         actual_cost_usd:
@@ -247,6 +250,14 @@ components:
         metadata:
           type: object
           additionalProperties: true
+    FinalizeOutcome:
+      type: string
+      enum: [success, failure, cancelled]
+      default: success
+      description: |
+        Integration-observed provider outcome. `success` means the provider call
+        completed and usage may be present. `failure` and `cancelled` must not
+        invent token usage; include usage only if the harness actually exposed it.
     UsageObservation:
       type: object
       additionalProperties: false

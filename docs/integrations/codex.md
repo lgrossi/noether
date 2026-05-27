@@ -15,5 +15,5 @@ Local evidence:
 - plugin CLI help exposes marketplace management but not a stable provider pre-call hook.
 
 The integration therefore authorizes before launching `codex exec --json`, records Codex JSONL
-events, and finalizes only when a Codex event exposes usage/cost data. It does not intercept or call
-model providers.
+events, and finalizes with `outcome: "success"` only when a Codex event exposes usage/cost data. It
+does not intercept or call model providers.

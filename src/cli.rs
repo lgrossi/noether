@@ -704,6 +704,7 @@ fn scenario_finalize_payload(
 
     FinalizeReservation {
         reservation_id: None,
+        outcome: crate::contract::FinalizeOutcome::Success,
         usage,
         actual_cost_usd: finalize.actual_cost_usd,
         metadata,

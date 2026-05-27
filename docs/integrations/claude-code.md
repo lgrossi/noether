@@ -13,5 +13,6 @@ Current Claude Code hook docs say:
 The public hook surface does not document a provider transport pre-call hook for the main model
 request, nor a guaranteed main-model usage/cost hook. So this integration supports Noether
 authorization for Claude Code tool actions and best-effort Agent subtask usage finalization only.
+Failure finalization uses `outcome: "failure"` and does not invent usage.
 
 It never calls providers and never rewrites Claude Code provider transport.

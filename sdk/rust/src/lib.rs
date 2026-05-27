@@ -241,6 +241,7 @@ mod tests {
                 "reservation-1",
                 &FinalizeReservation {
                     actual_cost_usd: Some(0.10),
+                    outcome: noether::contract::FinalizeOutcome::Success,
                     usage: Some(UsageObservation {
                         provider: Some("openai".to_owned()),
                         model: Some("gpt-4.1".to_owned()),

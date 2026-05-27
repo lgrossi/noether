@@ -426,6 +426,7 @@ pub fn compare_strategies(
             if let Some(reservation) = &decision.reservation {
                 let finalize = FinalizeReservation {
                     reservation_id: None,
+                    outcome: crate::contract::FinalizeOutcome::Success,
                     usage: Some(UsageObservation {
                         provider: Some(request.provider.clone()),
                         model: Some(request.model.clone()),

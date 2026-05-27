@@ -186,6 +186,7 @@ async function finalizeReservation(config, reservationId, decision, usage, exitC
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
 			reservation_id: reservationId,
+			outcome: "success",
 			actual_cost_usd: usage.cost_usd,
 			usage,
 			metadata: {

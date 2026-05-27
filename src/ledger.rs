@@ -421,6 +421,10 @@ impl BudgetLedger {
         reservation_id: &str,
         payload: &FinalizeReservation,
     ) -> Result<Reservation, NoetError> {
+        payload
+            .validate_accounting()
+            .map_err(NoetError::InvalidConfig)?;
+
         let stored = self
             .reservations
             .get_mut(reservation_id)
@@ -4813,6 +4817,7 @@ mod tests {
         let reservation_id = decision.reservation.expect("reservation").id;
         let payload = FinalizeReservation {
             reservation_id: None,
+            outcome: crate::contract::FinalizeOutcome::Success,
             usage: None,
             actual_cost_usd: Some(0.20),
             metadata: Default::default(),
@@ -4827,6 +4832,29 @@ mod tests {
 
         assert_eq!(first.status, ReservationStatus::Finalized);
         assert_eq!(second.amount_usd, 0.20);
+    }
+
+    #[test]
+    fn finalize_rejects_invalid_accounting_values() {
+        let policy = policy(1.0, 0.8);
+        let mut ledger = BudgetLedger::default();
+        let decision = ledger.authorize(Some(&policy), &request(0.25));
+        let reservation_id = decision.reservation.expect("reservation").id;
+
+        let error = ledger
+            .finalize(
+                &reservation_id,
+                &FinalizeReservation {
+                    reservation_id: None,
+                    outcome: crate::contract::FinalizeOutcome::Success,
+                    usage: None,
+                    actual_cost_usd: Some(-0.20),
+                    metadata: Default::default(),
+                },
+            )
+            .expect_err("invalid finalize should fail");
+
+        assert!(error.to_string().contains("actual_cost_usd"));
     }
 
     fn routing_policy<const N: usize>(budgets: [BudgetRule; N]) -> PolicyFile {

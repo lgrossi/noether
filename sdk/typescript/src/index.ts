@@ -3,6 +3,7 @@ export type DecisionOutcome = "allow" | "warn" | "deny";
 export type PolicyAction = "allow" | "warn" | "ask" | "block";
 export type DecisionSeverity = "info" | "warn" | "deny";
 export type ReservationStatus = "active" | "finalized";
+export type FinalizeOutcome = "success" | "failure" | "cancelled";
 
 export type NoetherClientOptions = {
 	url?: string;
@@ -60,6 +61,7 @@ export type UsageObservation = {
 
 export type FinalizeReservation = {
 	reservation_id?: string;
+	outcome?: FinalizeOutcome;
 	usage?: UsageObservation;
 	actual_cost_usd?: number;
 	metadata?: Record<string, unknown>;

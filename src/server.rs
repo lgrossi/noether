@@ -2368,6 +2368,7 @@ mod tests {
         metadata.insert("trace_id".to_owned(), json!(trace_id));
         FinalizeReservation {
             reservation_id: None,
+            outcome: crate::contract::FinalizeOutcome::Success,
             usage: Some(crate::contract::UsageObservation {
                 provider: Some("openai".to_owned()),
                 model: Some(model.to_owned()),
@@ -3110,6 +3111,48 @@ mod tests {
                 .expect("finalize response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn finalize_endpoint_rejects_invalid_accounting() {
+        let app = build_router(test_state(Some(strict_policy())));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"project":"noether","estimated_cost_usd":0.001}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("authorize response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("authorize body");
+        let decision: Value = serde_json::from_slice(&body).expect("authorize json");
+        let reservation_id = decision["reservation"]["id"]
+            .as_str()
+            .expect("reservation id");
+
+        let response = app
+            .oneshot(
+                Request::post(format!("/v1/reservations/{reservation_id}/finalize"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "outcome":"success",
+                            "actual_cost_usd": -0.001
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("finalize response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

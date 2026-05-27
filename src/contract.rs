@@ -97,16 +97,50 @@ pub enum ReservationStatus {
     Finalized,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizeOutcome {
+    #[default]
+    Success,
+    Failure,
+    Cancelled,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FinalizeReservation {
     #[serde(default)]
     pub reservation_id: Option<String>,
+    #[serde(default)]
+    pub outcome: FinalizeOutcome,
     #[serde(default)]
     pub usage: Option<UsageObservation>,
     #[serde(default)]
     pub actual_cost_usd: Option<f64>,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+}
+
+impl FinalizeReservation {
+    pub fn validate_accounting(&self) -> Result<(), String> {
+        if let Some(actual_cost_usd) = self.actual_cost_usd {
+            validate_non_negative_finite("actual_cost_usd", actual_cost_usd)?;
+        }
+        if let Some(usage) = &self.usage {
+            if let Some(cost_usd) = usage.cost_usd {
+                validate_non_negative_finite("usage.cost_usd", cost_usd)?;
+            }
+            if let (Some(input), Some(output), Some(total)) =
+                (usage.input_tokens, usage.output_tokens, usage.total_tokens)
+                && total < input + output
+            {
+                return Err(format!(
+                    "usage.total_tokens ({total}) must be at least input_tokens + output_tokens ({})",
+                    input + output
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -127,6 +161,13 @@ pub struct UsageObservation {
     pub latency_ms: Option<u64>,
     #[serde(default)]
     pub stop_reason: Option<String>,
+}
+
+fn validate_non_negative_finite(field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{field} must be a finite non-negative number"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

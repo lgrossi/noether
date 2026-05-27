@@ -9,6 +9,8 @@ This directory holds Noether's north-star product and architecture notes.
   and local-first compatibility notes.
 - [Integration readiness plan](./integration-readiness-plan.md): OpenAPI, SDK, and harness/gateway
   integration sequence for the decision-sidecar product boundary.
+- [Integration capability matrix](./integration-capability-matrix.md): supported authorization,
+  finalize, event, and limitation matrix for SDKs and harness/gateway integrations.
 - [LiteLLM integration](./integrations/litellm.md): LiteLLM callback integration that authorizes,
   finalizes, and records outcomes while LiteLLM owns provider transport.
 - [OpenCode integration](./integrations/opencode.md): OpenCode plugin integration for documented

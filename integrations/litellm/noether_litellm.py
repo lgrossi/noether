@@ -84,6 +84,7 @@ class NoetherLiteLLMHandler(CustomLogger):
         usage = extract_usage(data, response)
         payload = {
             "reservation_id": context["reservation_id"],
+            "outcome": "success",
             "actual_cost_usd": usage.get("cost_usd"),
             "usage": usage,
             "metadata": {
@@ -108,6 +109,7 @@ class NoetherLiteLLMHandler(CustomLogger):
             return None
         payload = {
             "reservation_id": context["reservation_id"],
+            "outcome": "failure",
             "actual_cost_usd": 0,
             "metadata": {
                 "trace_id": context.get("trace_id"),

@@ -200,6 +200,7 @@ async function finalizeReservation(config, reservationId, input, outcome, usage)
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
 			reservation_id: reservationId,
+			outcome: outcome === "success" ? "success" : "failure",
 			actual_cost_usd: 0,
 			usage,
 			metadata: dropUndefined({

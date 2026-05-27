@@ -430,6 +430,7 @@ mod tests {
         metadata.insert("trace_id".to_owned(), json!(trace_id));
         FinalizeReservation {
             reservation_id: None,
+            outcome: crate::contract::FinalizeOutcome::Success,
             usage: Some(UsageObservation {
                 provider: Some("openai".to_owned()),
                 model: Some(model.to_owned()),

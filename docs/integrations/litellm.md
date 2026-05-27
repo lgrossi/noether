@@ -8,7 +8,7 @@ Noether remains a decision sidecar:
 - The callback calls `POST /v1/authorize` before LiteLLM sends provider traffic.
 - A Noether `deny` returns LiteLLM's documented pre-call rejection string.
 - Success finalizes observed usage.
-- Failure finalizes the reservation with a failure outcome and records a `litellm.call_failure`
+- Failure finalizes the reservation with `outcome: "failure"` and records a `litellm.call_failure`
   event.
 
 Use the Noether Python SDK plus `integrations/litellm/noether_litellm.py`; see the integration

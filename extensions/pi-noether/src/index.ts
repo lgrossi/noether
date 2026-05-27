@@ -1312,6 +1312,7 @@ async function finalizeReservation(
 		`${noetherUrl}/v1/reservations/${encodeURIComponent(reservationId)}/finalize`,
 		{
 			reservation_id: reservationId,
+			outcome: "success",
 			usage,
 			actual_cost_usd: usage.cost_usd,
 			metadata: {
