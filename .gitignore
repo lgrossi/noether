@@ -6,3 +6,6 @@
 /sdk/python/.venv
 __pycache__/
 /test-results
+
+/sdk/rust/target
+/sdk/rust/Cargo.lock
