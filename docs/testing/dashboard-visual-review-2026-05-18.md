@@ -75,7 +75,8 @@ Captured screenshots:
 
 ### Overview
 
-- shell now uses real Noether assets from `assets/brand/`
+- shell used the former Noether brand assets that were later replaced by the current
+  `docs/design_handoff_noether/logo/` handoff brand
 - layout reads like an observability cockpit rather than prose-first cards
 - metrics, ranked concentration, policy posture, and trace ranking are visible above the fold
 - number formatting is materially stronger than the rejected pass

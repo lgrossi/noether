@@ -1,13 +1,19 @@
 # Noether
 
-**Not a proxy. Native governance for AI workflows.**
-
 <p align="center">
-  <img src="./assets/brand/noether-readme-hero-v2.svg" alt="Noether hero banner" width="100%">
+  <img src="./docs/design_handoff_noether/logo/noether-lockup.svg" alt="noether" width="180">
 </p>
 
-Noether is the local-first governance layer for AI work: an OpenAPI-backed decision sidecar that
-your harness, SDK, app, or gateway calls before and after model work.
+<p align="center">
+  <img src="./docs/design_handoff_noether/screenshots/01-policy-home.png" alt="Noether app policy home screen" width="100%">
+</p>
+
+**Noether is the policy file for agent work: written once, simulated honestly, enforced quietly,
+and explained by every decision it makes.**
+
+Noether is a local-first governance layer for AI work. Your harness, SDK, app, or gateway calls its
+OpenAPI-backed sidecar before and after model work; the app turns those decisions into a policy
+home, run evidence, and replayable policy changes.
 
 It is for:
 
@@ -27,10 +33,10 @@ integration owns provider transport. Noether decides, records, reconciles, and e
 
 Noether helps answer the questions that show up as soon as AI usage becomes real:
 
-- Should this request have been allowed before money was spent?
+- What's allowed here?
+- What actually happened?
+- What would change if we tightened or loosened this policy?
 - Which repo, project, user, or task should pay for this run?
-- Which tool burst, retry loop, or fallback path caused the cost?
-- Are we only controlling spend, or also protecting healthy adoption?
 
 Use your existing workflow. Keep your existing gateway if you have one. Use subscription-backed
 tools, API-driven apps, or both.
@@ -62,11 +68,11 @@ It is trying to solve a smaller set of workflow-governance problems well:
 
 ## What the product actually does
 
-- **Before spend:** allow, warn, block, ask, or fallback a request
-- **After spend:** finalize real usage, traces, tools, and policy outcomes
-- **For individuals:** keep local guardrails, visibility, and privacy without a platform rewrite
-- **For teams:** attribute spend and policy outcomes to the right work
-- **For rollout:** test policies in scenarios and simulations before enforcing them
+- **Policy:** the home screen is the small auditable file that controls agent work.
+- **Runs:** every decision is attributed to a rule, model, project, subject, and trace.
+- **Replay:** proposed policy changes are simulated against real history before enforcement.
+- **Authorize:** integrations ask before spend: allow, warn, block, ask, or fallback.
+- **Finalize:** integrations report real usage, traces, tools, and outcomes after provider work.
 
 The core integration lifecycle is:
 
@@ -84,6 +90,58 @@ GET /openapi.json
 GET /docs
 ```
 
+## Product surfaces
+
+The app is intentionally not a generic KPI dashboard. It has three first-class surfaces and one
+loop:
+
+```text
+Policy -> Runs -> Replay -> Policy
+```
+
+### Policy: what's allowed here.
+
+Policy is the home. The editor shows the live `policy.noet.yaml`, inline rule tallies, a live
+decision tail, and a quiet suggestion when the current rules are producing a pattern.
+
+<p align="center">
+  <img src="./docs/design_handoff_noether/screenshots/02-policy-editor.png" alt="Noether policy editor showing YAML with inline rule tallies." width="100%">
+</p>
+
+### Runs: what actually happened.
+
+Runs is the evidence surface: every agent run is a decision row, not a raw log line. Filter by
+project, agent, decision, or rule; open a run to see the policy reason and accounting trail.
+
+<p align="center">
+  <img src="./docs/design_handoff_noether/screenshots/06-runs-filtered.png" alt="Noether runs screen filtered to a policy rule." width="100%">
+</p>
+
+### Replay: what would change.
+
+Replay compares current and proposed policy against the same recorded history. It is the killer
+demo: try a stricter rule, inspect changed decisions, then adopt only if the tradeoff is right.
+
+<p align="center">
+  <img src="./docs/design_handoff_noether/screenshots/08-replay-with-diff.png" alt="Noether replay screen comparing current and proposed policy outcomes." width="100%">
+</p>
+
+### Approval and diff details stay in context.
+
+Pending asks, run details, command navigation, and policy diffs appear as focused overlays instead
+of becoming separate dashboards.
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="./docs/design_handoff_noether/screenshots/10-modal-ask.png" alt="Noether ask modal for approving a tool call.">
+    </td>
+    <td width="50%">
+      <img src="./docs/design_handoff_noether/screenshots/12-modal-diff.png" alt="Noether policy diff modal showing changed decisions.">
+    </td>
+  </tr>
+</table>
+
 ## From one operator to one org
 
 ### For individuals
@@ -100,48 +158,71 @@ GET /docs
 - keep existing harnesses and gateways
 - model policy changes before rollout
 
-## See the product
+## Why this is better than another AI dashboard
 
-<table>
-  <tr>
-    <td width="50%">
-      <strong>Operating picture</strong><br>
-      Live overview of spend, decision pressure, exceptions, and control posture.
-    </td>
-    <td width="50%">
-      <strong>Strategy lab</strong><br>
-      Compare policy strategies before rollout instead of guessing.
-    </td>
-  </tr>
-  <tr>
-    <td valign="top">
-      <img src="./docs/showcase/live-overview.png" alt="Live Noether overview dashboard showing spend, exception queue, and control posture.">
-    </td>
-    <td valign="top">
-      <img src="./docs/showcase/live-strategy-runaway.png" alt="Live Noether strategy lab showing a guarded team budget compared with an unguarded alternative.">
-    </td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <strong>Guardrail trace review</strong><br>
-      Inspect policy outcomes, tool bursts, and request traces in one place.
-    </td>
-    <td width="50%">
-      <strong>Adoption view</strong><br>
-      See where usage is healthy, underused, or needs intervention.
-    </td>
-  </tr>
-  <tr>
-    <td valign="top">
-      <img src="./docs/showcase/live-traces-guardrail.png" alt="Live Noether trace explorer showing policy and tool events for a guarded request." height="420">
-    </td>
-    <td valign="top">
-      <img src="./docs/showcase/live-adoption.png" alt="Live Noether adoption dashboard showing queueing, health, and intervention surfaces.">
-    </td>
-  </tr>
-</table>
+Noether is useful because it puts policy at the center:
 
-These are current product surfaces from the live dashboard, not placeholder mockups.
+| Without Noether | With Noether |
+| --- | --- |
+| Spend appears later on a provider bill. | Every run can be attributed to a project, subject, model, trace, and budget. |
+| Agents can retry, switch models, or burst tools without a local policy gate. | Integrations ask before spend and can block, warn, or request approval. |
+| Dashboards show cost but not why it happened. | Reports connect policy decisions, reservations, usage, tool events, and replay. |
+| Policy rollout is guesswork. | Scenarios and simulations show what would change before enforcement. |
+
+## Killer workflows
+
+### 1. Block un-attributed AI work before it spends money
+
+If a harness, gateway, or SDK call does not include a project, Noether can deny it before the
+provider call happens:
+
+```json
+{
+  "outcome": "deny",
+  "action": "block",
+  "explanations": [
+    {
+      "rule_id": "require-project",
+      "reason": "project is required for budget attribution",
+      "severity": "deny"
+    }
+  ]
+}
+```
+
+### 2. Stop runaway agents without replacing your tools
+
+Use rolling burst caps, daily caps, model allowlists, and request-cost limits beside the tools you
+already use. Pi keeps its provider auth. LiteLLM keeps routing. Codex, Claude Code, and OpenCode keep
+their own harness behavior. Noether supplies the decision boundary and evidence trail.
+
+### 3. Explain the bill after the run
+
+Finalize actual usage after the provider call and connect it to the decision that allowed it:
+
+```text
+decision.allow -> reservation.active -> usage.finalized
+trace_id=run-123 project=noether subject=user:local model=gpt-demo cost=$0.0021
+```
+
+That gives reports answers a provider dashboard cannot:
+
+- which policy allowed it
+- which project/user should pay
+- which model and harness were involved
+- which tool events happened around the run
+
+### 4. Test policy changes before enforcing them
+
+Run scenarios and simulations locally before rollout:
+
+```bash
+cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
+cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
+```
+
+Use this to answer: "Would this policy block the expensive bad run without killing healthy
+adoption?"
 
 ## Policy examples to copy
 
