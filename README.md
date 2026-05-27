@@ -6,7 +6,8 @@
   <img src="./assets/brand/noether-readme-hero-v2.svg" alt="Noether hero banner" width="100%">
 </p>
 
-Noether is the local-first governance layer for AI work.
+Noether is the local-first governance layer for AI work: an OpenAPI-backed decision sidecar that
+your harness, SDK, app, or gateway calls before and after model work.
 
 It is for:
 
@@ -20,6 +21,9 @@ It works beside the workflow you already use:
 - subscription-backed tools
 - API-driven apps and SDKs
 - existing gateways and proxies
+
+Noether does **not** call model providers as part of its production integration surface. The
+integration owns provider transport. Noether decides, records, reconciles, and explains.
 
 Noether helps answer the questions that show up as soon as AI usage becomes real:
 
@@ -59,10 +63,26 @@ It is trying to solve a smaller set of workflow-governance problems well:
 ## What the product actually does
 
 - **Before spend:** allow, warn, block, ask, or fallback a request
-- **After spend:** reconcile usage, traces, tools, and policy outcomes
+- **After spend:** finalize real usage, traces, tools, and policy outcomes
 - **For individuals:** keep local guardrails, visibility, and privacy without a platform rewrite
 - **For teams:** attribute spend and policy outcomes to the right work
 - **For rollout:** test policies in scenarios and simulations before enforcing them
+
+The core integration lifecycle is:
+
+```text
+integration -> POST /v1/authorize
+integration -> provider call
+integration -> POST /v1/reservations/{id}/finalize
+integration -> POST /v1/events
+```
+
+The machine-readable API is served by Noether itself:
+
+```text
+GET /openapi.json
+GET /docs
+```
 
 ## From one operator to one org
 
@@ -297,7 +317,7 @@ cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
 Ask Noether for a decision before spend:
 
 ```bash
-curl -fsS http://127.0.0.1:4050/v1/authorize \
+curl -fsS http://127.0.0.1:4040/v1/authorize \
   -H 'content-type: application/json' \
   -d '{
     "subject": "user:demo",
@@ -313,6 +333,33 @@ curl -fsS http://127.0.0.1:4050/v1/authorize \
     }
   }'
 ```
+
+After your integration owns the provider outcome, finalize the reservation:
+
+```bash
+curl -fsS http://127.0.0.1:4040/v1/reservations/<reservation-id>/finalize \
+  -H 'content-type: application/json' \
+  -d '{
+    "outcome": "success",
+    "actual_cost_usd": 0.0021,
+    "usage": {
+      "provider": "openai",
+      "model": "gpt-demo",
+      "input_tokens": 900,
+      "output_tokens": 180,
+      "total_tokens": 1080,
+      "cost_usd": 0.0021
+    },
+    "metadata": {
+      "trace_id": "demo-trace-1",
+      "request_id": "demo-request-1"
+    }
+  }'
+```
+
+`outcome` is explicit: `success`, `failure`, or `cancelled`. Noether rejects invalid accounting
+such as negative costs or impossible token totals. Failure and cancellation finalization should not
+invent usage; include usage only when the harness or gateway actually exposed it.
 
 ### CLI
 
@@ -346,7 +393,27 @@ xdg-open .noet/noether-dashboard.html
 
 Noether is designed to be useful whether or not it owns the model call.
 
-### Harness-first
+### SDKs and adapter kits
+
+Use these when you are integrating Noether from an app, gateway, wrapper, or harness:
+
+- TypeScript SDK: `sdk/typescript`
+- Python SDK: `sdk/python`
+- Rust SDK: `sdk/rust`
+
+Each SDK supports:
+
+- `authorize`
+- `finalize`
+- `event`
+- `health`
+- helper methods that deny/block work when Noether says `deny`
+- explicit fail-open / fail-closed behavior
+
+SDKs do not call providers and do not infer usage. Your integration remains responsible for the
+provider call and for reporting only usage it actually observed.
+
+### Harness-first integrations
 
 Best fit when you want native workflow awareness:
 
@@ -355,23 +422,29 @@ Best fit when you want native workflow awareness:
 - tool, retry, and agent-step visibility
 - approval inside the workflow when policy says `ask`
 
-Current real integration:
+Current integrations:
 
-- **Pi extension**
+- **Pi extension**: strongest harness integration today; authorizes before provider send and
+  finalizes observed usage when Pi exposes it.
+- **Claude Code hook bridge**: authorizes documented tool/permission hooks; main model provider
+  pre-call hooks are not currently documented.
+- **OpenCode event plugin**: records documented event/tool hooks; provider pre-call and usage hooks
+  are not currently documented.
+- **Codex exec wrapper**: authorizes before launching `codex exec --json`, records JSONL events,
+  and finalizes only when Codex events expose usage/cost.
 
-Planned near-term harness direction:
-
-- Claude Code
-- Codex
-- OpenCode
-
-### Gateway-sidecar
+### Gateway-sidecar integrations
 
 Best fit when you already have central routing and want governance beside it:
 
 - keep your gateway
 - add policy decisions, attribution, approval semantics, and analysis
 - avoid turning Noether into another provider-compatibility product
+
+Current integration:
+
+- **LiteLLM callback**: authorizes through LiteLLM's pre-call hook, blocks denies, finalizes
+  observed usage on success, and records failure outcomes.
 
 ## Use with Pi today
 
@@ -428,17 +501,36 @@ Noether is early, but real.
 
 Today it includes:
 
-- local `noet` sidecar
+- local `noet` sidecar and repo-local `.noether/` runtime
+- OpenAPI spec served at `/openapi.json`
+- human API docs served at `/docs`
 - `POST /v1/authorize`
-- reservation finalization
+- `POST /v1/reservations/{id}/finalize`
 - `POST /v1/events`
+- structured `GET /health`
 - SQLite-backed decision / usage / event ledger
+- explicit finalize outcomes: `success`, `failure`, `cancelled`
+- accounting validation for costs and token totals
 - served live dashboard
 - static export dashboards
 - story-shaped CLI reports
 - Pi extension integration
+- LiteLLM callback integration
+- TypeScript, Python, and Rust SDKs
+- OpenCode, Claude Code, and Codex integrations with documented capability limits
 - bodyless authorization metadata by default
 - checked-in scenarios and simulations
+
+Recent validation covered:
+
+- OpenAPI and health endpoints against a live sidecar
+- TypeScript and Python SDK authorize/finalize against a live sidecar
+- LiteLLM authorize/finalize against a live sidecar
+- OpenCode and Claude Code event/tool hooks against a live sidecar
+- Codex wrapper event/finalize flow against a live sidecar
+- policy denial for missing project attribution
+
+See [`docs/testing/integration-readiness-validation-2026-05-27.md`](./docs/testing/integration-readiness-validation-2026-05-27.md).
 
 ## Privacy defaults
 
@@ -454,9 +546,15 @@ Noether is local-first and privacy-secure by default:
 
 - [Product vision](./docs/product-vision.md)
 - [Roadmap](./docs/roadmap.md)
+- [OpenAPI-backed integration plan](./docs/integration-readiness-plan.md)
+- [Integration capability matrix](./docs/integration-capability-matrix.md)
 - [Control contract v0](./docs/control-contract-v0.md)
 - [Policy v0](./docs/policy-v0.md)
 - [Pi extension integration](./docs/integrations/pi-extension.md)
+- [LiteLLM integration](./docs/integrations/litellm.md)
+- [OpenCode integration](./docs/integrations/opencode.md)
+- [Claude Code integration](./docs/integrations/claude-code.md)
+- [Codex integration](./docs/integrations/codex.md)
 - [Export and reporting API contract](./docs/export-reporting-api.md)
 - [Team deployment](./docs/team-deployment.md)
 
