@@ -1,0 +1,10 @@
+{
+  "name": "noether-claude-code",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code hook integration for the Noether decision sidecar",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

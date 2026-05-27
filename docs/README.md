@@ -13,6 +13,8 @@ This directory holds Noether's north-star product and architecture notes.
   finalizes, and records outcomes while LiteLLM owns provider transport.
 - [OpenCode integration](./integrations/opencode.md): OpenCode plugin integration for documented
   event/tool hooks, with provider-authorization limitations called out.
+- [Claude Code integration](./integrations/claude-code.md): Claude Code hook integration for
+  tool/action authorization and documented lifecycle events.
 - [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
   live-dashboard data/update surfaces, artifact-backed simulation routes, and the CLI/HTTP contract
   shape they share.
