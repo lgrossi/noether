@@ -4,6 +4,7 @@
 /**/node_modules
 /sdk/typescript/dist
 /sdk/python/.venv
+/integrations/litellm/.venv
 __pycache__/
 /test-results
 

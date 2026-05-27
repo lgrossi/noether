@@ -9,6 +9,8 @@ This directory holds Noether's north-star product and architecture notes.
   and local-first compatibility notes.
 - [Integration readiness plan](./integration-readiness-plan.md): OpenAPI, SDK, and harness/gateway
   integration sequence for the decision-sidecar product boundary.
+- [LiteLLM integration](./integrations/litellm.md): LiteLLM callback integration that authorizes,
+  finalizes, and records outcomes while LiteLLM owns provider transport.
 - [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
   live-dashboard data/update surfaces, artifact-backed simulation routes, and the CLI/HTTP contract
   shape they share.

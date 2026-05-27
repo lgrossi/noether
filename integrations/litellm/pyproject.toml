@@ -1,0 +1,6 @@
+[project]
+name = "noether-litellm"
+version = "0.1.0"
+description = "LiteLLM callback integration for the Noether decision sidecar"
+requires-python = ">=3.11"
+dependencies = []
