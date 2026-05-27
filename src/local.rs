@@ -103,12 +103,12 @@ pub async fn write_local_sidecar_owner(
     Ok(owner)
 }
 
-pub async fn read_local_sidecar_owner(
-    root: &Path,
-) -> Result<Option<LocalSidecarOwner>, NoetError> {
+pub async fn read_local_sidecar_owner(root: &Path) -> Result<Option<LocalSidecarOwner>, NoetError> {
     let layout = LocalRuntimeLayout::for_root(root);
     match fs::read(&layout.owner_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(NoetError::from),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(NoetError::from),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }

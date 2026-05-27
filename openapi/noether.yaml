@@ -1,0 +1,313 @@
+openapi: 3.1.0
+info:
+  title: Noether Sidecar API
+  version: 0.1.0
+  summary: Decision sidecar API for AI harnesses, gateways, and local tools.
+  description: |
+    Noether is a decision sidecar. Integrations call Noether to authorize
+    planned AI work, report actual usage, and record trace events.
+
+    Noether does not call model providers as part of this API. Harnesses,
+    gateways, SDKs, and proxies own provider transport.
+servers:
+  - url: http://127.0.0.1:4051
+    description: Default local sidecar
+tags:
+  - name: Decision
+  - name: Reservations
+  - name: Events
+  - name: Health
+paths:
+  /v1/authorize:
+    post:
+      tags: [Decision]
+      summary: Authorize a planned AI request.
+      description: |
+        The integration calls this before it calls a provider. If the outcome is
+        `deny`, the integration must not call the provider. If a reservation is
+        returned, finalize it after the provider call completes, fails, or is
+        cancelled.
+      operationId: authorize
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthorizeRequest"
+            examples:
+              projectRun:
+                value:
+                  project: noether
+                  subject: user:local
+                  provider: openai
+                  model: gpt-4.1
+                  estimated_tokens: 1500
+                  estimated_cost_usd: 0.12
+                  metadata:
+                    harness: pi
+                    agent_run_id: run_123
+                    request_id: req_456
+                    trace_id: trace_789
+      responses:
+        "200":
+          description: Decision result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorizeDecision"
+        "400":
+          $ref: "#/components/responses/Error"
+  /v1/reservations/{id}/finalize:
+    post:
+      tags: [Reservations]
+      summary: Finalize an authorization reservation with actual outcome data.
+      description: |
+        The integration calls this after it owns the provider call outcome.
+        Finalization is idempotent for an already finalized reservation.
+      operationId: finalizeReservation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinalizeReservation"
+            examples:
+              providerUsage:
+                value:
+                  actual_cost_usd: 0.12
+                  usage:
+                    provider: openai
+                    model: gpt-4.1
+                    input_tokens: 1200
+                    output_tokens: 300
+                    total_tokens: 1500
+                    cost_usd: 0.12
+                    latency_ms: 2400
+                    stop_reason: stop
+                  metadata:
+                    trace_id: trace_789
+                    request_id: req_456
+      responses:
+        "200":
+          description: Finalized or already finalized reservation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/events:
+    post:
+      tags: [Events]
+      summary: Record a trace or harness event.
+      operationId: recordEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TraceEvent"
+            examples:
+              toolObserved:
+                value:
+                  id: evt_123
+                  trace_id: trace_789
+                  kind: tool.observed
+                  payload:
+                    name: bash
+                    success: true
+                    duration_ms: 42
+      responses:
+        "202":
+          description: Event accepted.
+        "400":
+          $ref: "#/components/responses/Error"
+  /health:
+    get:
+      tags: [Health]
+      summary: Read sidecar health.
+      operationId: health
+      responses:
+        "200":
+          description: Sidecar health and runtime posture.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+components:
+  responses:
+    Error:
+      description: Error response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    AuthorizeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        budget_id:
+          type: string
+        entities:
+          type: array
+          items:
+            type: string
+        subject:
+          type: string
+        project:
+          type: string
+        provider:
+          type: string
+          description: Provider namespace observed by the integration, not the harness name.
+        model:
+          type: string
+        estimated_tokens:
+          type: integer
+          minimum: 0
+        estimated_cost_usd:
+          type: number
+          minimum: 0
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Correlation metadata such as harness, agent_run_id, request_id, and trace_id.
+    AuthorizeDecision:
+      type: object
+      required: [decision_id, outcome, action, explanations, created_at]
+      properties:
+        decision_id:
+          type: string
+        outcome:
+          $ref: "#/components/schemas/DecisionOutcome"
+        action:
+          $ref: "#/components/schemas/PolicyAction"
+        reservation:
+          $ref: "#/components/schemas/Reservation"
+        explanations:
+          type: array
+          items:
+            $ref: "#/components/schemas/DecisionExplanation"
+        created_at:
+          type: string
+          format: date-time
+    DecisionOutcome:
+      type: string
+      enum: [allow, warn, deny]
+    PolicyAction:
+      type: string
+      enum: [allow, warn, ask, block]
+    DecisionExplanation:
+      type: object
+      required: [rule_id, reason, severity]
+      properties:
+        rule_id:
+          type: string
+        reason:
+          type: string
+        severity:
+          type: string
+          enum: [info, warn, deny]
+    Reservation:
+      type: object
+      required: [id, amount_usd, currency, status, created_at, expires_at]
+      properties:
+        id:
+          type: string
+        amount_usd:
+          type: number
+        currency:
+          type: string
+        status:
+          type: string
+          enum: [active, finalized]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    FinalizeReservation:
+      type: object
+      additionalProperties: false
+      properties:
+        reservation_id:
+          type: string
+        usage:
+          $ref: "#/components/schemas/UsageObservation"
+        actual_cost_usd:
+          type: number
+          minimum: 0
+        metadata:
+          type: object
+          additionalProperties: true
+    UsageObservation:
+      type: object
+      additionalProperties: false
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+        cost_usd:
+          type: number
+          minimum: 0
+        latency_ms:
+          type: integer
+          minimum: 0
+        stop_reason:
+          type: string
+    TraceEvent:
+      type: object
+      required: [kind]
+      properties:
+        id:
+          type: string
+        trace_id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        kind:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+    HealthResponse:
+      type: object
+      required: [status, decision_mode, policy_loaded, upstream_configured, route_count]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        decision_mode:
+          type: string
+          enum: [dry_run, enforce]
+        policy_loaded:
+          type: boolean
+        upstream_configured:
+          type: boolean
+        route_count:
+          type: integer
+          minimum: 0
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

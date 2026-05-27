@@ -7,6 +7,7 @@ pub mod ledger;
 pub mod local;
 pub mod mock;
 pub mod noether_app;
+pub mod openapi;
 pub mod policy;
 pub mod proxy;
 pub mod redaction;

@@ -29,6 +29,7 @@ use crate::contract::{
 use crate::error::NoetError;
 use crate::ledger::{BudgetLedger, TraceReportItem};
 use crate::noether_app;
+use crate::openapi;
 use crate::policy::PolicyFile;
 use crate::proxy::ProxyRoute;
 use crate::reporting;
@@ -608,6 +609,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/app/app.css", get(noether_app_css))
         .route("/app/logo.svg", get(noether_app_logo))
         .route("/app/favicon.svg", get(noether_app_favicon))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(api_docs))
+        .route("/api/docs", get(api_docs))
         .route("/dashboard", any(deprecated_dashboard_surface))
         .route("/dashboard/{*path}", any(deprecated_dashboard_surface))
         .route("/v1/chat/completions", any(capture))
@@ -2166,6 +2170,14 @@ async fn noether_app_favicon() -> impl IntoResponse {
     )
 }
 
+async fn openapi_json() -> Result<impl IntoResponse, NoetError> {
+    openapi::openapi_json_response()
+}
+
+async fn api_docs() -> impl IntoResponse {
+    openapi::api_docs_html()
+}
+
 async fn deprecated_dashboard_surface() -> impl IntoResponse {
     (
         StatusCode::GONE,
@@ -3707,6 +3719,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_openapi_json_and_api_docs() {
+        let app = build_router(test_state(Some(model_locked_policy())));
+
+        let openapi_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .expect("openapi request"),
+            )
+            .await
+            .expect("openapi response");
+        assert_eq!(openapi_response.status(), StatusCode::OK);
+        assert_eq!(
+            openapi_response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json; charset=utf-8")
+        );
+        let openapi_body = to_bytes(openapi_response.into_body(), usize::MAX)
+            .await
+            .expect("openapi body");
+        let spec: serde_json::Value = serde_json::from_slice(&openapi_body).expect("openapi json");
+        assert_eq!(spec["info"]["title"], "Noether Sidecar API");
+        assert!(
+            spec["info"]["description"]
+                .as_str()
+                .expect("description")
+                .contains("Noether does not call model providers")
+        );
+        assert!(spec["paths"]["/v1/authorize"]["post"].is_object());
+        assert!(spec["paths"]["/v1/reservations/{id}/finalize"]["post"].is_object());
+        assert!(spec["paths"]["/v1/events"]["post"].is_object());
+        assert!(spec["paths"]["/health"]["get"].is_object());
+
+        for path in ["/docs", "/api/docs"] {
+            let docs_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("docs request"),
+                )
+                .await
+                .expect("docs response");
+            assert_eq!(docs_response.status(), StatusCode::OK);
+            let docs_body = to_bytes(docs_response.into_body(), usize::MAX)
+                .await
+                .expect("docs body");
+            let html = String::from_utf8(docs_body.to_vec()).expect("docs html");
+            assert!(html.contains("Noether Sidecar API"));
+            assert!(html.contains("/openapi.json"));
+            assert!(html.contains("Noether does not call model providers"));
+        }
+    }
+
+    #[tokio::test]
     async fn noether_app_policy_source_is_clean_user_yaml() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let policy_path = tempdir.path().join("policy.yaml");
@@ -4120,7 +4192,8 @@ budgets:
 
         assert_eq!(live.outcome, DecisionOutcome::Warn);
         assert!(live.explanations.iter().any(|explanation| {
-            explanation.rule_id == "require-project" && explanation.severity == DecisionSeverity::Warn
+            explanation.rule_id == "require-project"
+                && explanation.severity == DecisionSeverity::Warn
         }));
         assert!(live.explanations.iter().any(|explanation| {
             explanation.rule_id == "personal-local.context_tokens"
