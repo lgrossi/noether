@@ -11,6 +11,8 @@ This directory holds Noether's north-star product and architecture notes.
   integration sequence for the decision-sidecar product boundary.
 - [LiteLLM integration](./integrations/litellm.md): LiteLLM callback integration that authorizes,
   finalizes, and records outcomes while LiteLLM owns provider transport.
+- [OpenCode integration](./integrations/opencode.md): OpenCode plugin integration for documented
+  event/tool hooks, with provider-authorization limitations called out.
 - [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
   live-dashboard data/update surfaces, artifact-backed simulation routes, and the CLI/HTTP contract
   shape they share.
