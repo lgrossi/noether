@@ -25,6 +25,12 @@ Pi normal extension
 
 The extension package lives at [`extensions/pi-noether`](../../extensions/pi-noether). It is commit-safe: no credentials, no real Pi config, and no captured prompts are stored in the repository.
 
+The stable sidecar API is documented by Noether's OpenAPI endpoint at `/openapi.json` and the
+human docs at `/docs`. The extension payloads are tested against that API shape. The extension keeps
+its small hot-path HTTP calls local instead of importing the TypeScript SDK package because Pi loads
+extensions directly and the authorization hook must stay packaging-light and latency-bound. Other
+TypeScript integrations should prefer the SDK under [`sdk/typescript`](../../sdk/typescript).
+
 ## Hook flow and emitted payloads
 
 Noether currently uses seven normal-path Pi hooks:

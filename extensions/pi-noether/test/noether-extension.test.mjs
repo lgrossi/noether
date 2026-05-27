@@ -205,6 +205,53 @@ function deferred() {
 }
 
 {
+	const request = extension.buildAuthorizeRequest(
+		{
+			payload: {
+				model: "gpt-5.5",
+				input: [{ role: "user", content: "private" }],
+			},
+		},
+		fakeContext({
+			model: {
+				provider: "openai-codex",
+				id: "gpt-5.5",
+				api: "openai-codex-responses",
+			},
+		}),
+		{
+			subject: "user:alice",
+			project: "noether",
+			failMode: "fail_open",
+			noetherUrl: "http://127.0.0.1:4051",
+			version: "test",
+			includeBody: false,
+		},
+		{
+			traceId: "trace-openapi",
+			sessionId: "session-openapi",
+			agentRunId: "run-openapi",
+			requestId: "request-openapi",
+			providerCallId: "provider-call-openapi",
+		},
+	);
+
+	assert.equal(request.metadata.harness, "pi");
+	assert.equal(request.metadata.extension, "noether-pi");
+	assert.equal(request.metadata.trace_id, "trace-openapi");
+	assert.equal(request.metadata.session_id, "session-openapi");
+	assert.equal(request.metadata.agent_run_id, "run-openapi");
+	assert.equal(request.metadata.request_id, "request-openapi");
+	assert.equal(request.metadata.provider_call_id, "provider-call-openapi");
+	assert.equal(request.provider, "openai-codex");
+	assert.equal(request.model, "gpt-5.5");
+	assert.equal(request.metadata.model_api, "openai-codex-responses");
+	assert.equal(request.metadata.request_surface, "responses");
+	assert.equal(request.metadata.harness, "pi");
+	assert.notEqual(request.provider, "pi");
+}
+
+{
 	const originalUser = process.env.USER;
 	const originalLogname = process.env.LOGNAME;
 	process.env.USER = "lgrossi";
