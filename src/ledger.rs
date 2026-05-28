@@ -2658,24 +2658,31 @@ fn backfill_reservation_limit_scope_rollups(conn: &Connection) -> Result<(), Noe
 }
 
 fn backfill_rolling_spend_buckets(conn: &Connection) -> Result<(), NoetError> {
-    let existing = conn.query_row("SELECT COUNT(*) FROM rolling_spend_buckets", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
-    if existing > 0 {
+    let migrated_to_seconds = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if migrated_to_seconds {
         return Ok(());
     }
+    conn.execute("DELETE FROM rolling_spend_buckets", [])?;
     conn.execute(
         "
         INSERT INTO rolling_spend_buckets (rule_id, limit_id, scope_key, bucket_start, amount_usd)
         SELECT rule_id,
                limit_id,
                scope_key,
-               strftime('%Y-%m-%dT%H:%M:00+00:00', created_at),
+               strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at),
                COALESCE(SUM(amount_usd), 0)
         FROM reservation_limit_scopes
         WHERE created_at IS NOT NULL
-        GROUP BY rule_id, limit_id, scope_key, strftime('%Y-%m-%dT%H:%M:00+00:00', created_at)
+        GROUP BY rule_id, limit_id, scope_key, strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at)
         ",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'))",
         [],
     )?;
     Ok(())
@@ -3667,7 +3674,7 @@ fn recent_spend_usd(
         if bucket_since == bucket_now {
             return exact_recent_spend_usd(conn, rule_id, limit_id, scope_key, since, now);
         }
-        let first_full_bucket = bucket_since + Duration::minutes(1);
+        let first_full_bucket = bucket_since + Duration::seconds(1);
         let value = conn.query_row(
             "
             SELECT
@@ -3760,8 +3767,7 @@ fn exact_recent_spend_usd(
 
 fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
     let timestamp = at.timestamp();
-    DateTime::from_timestamp(timestamp - timestamp.rem_euclid(60), 0)
-        .expect("valid rolling bucket timestamp")
+    DateTime::from_timestamp(timestamp, 0).expect("valid rolling bucket timestamp")
 }
 
 fn matched_entity_and_rank(
@@ -4815,11 +4821,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 30).unwrap();
         let since = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap();
         let out_of_window = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 10).unwrap();
+        let edge_since = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap();
         let middle = Utc.with_ymd_and_hms(2026, 5, 28, 12, 1, 0).unwrap();
-        let edge_now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 20).unwrap();
+        let edge_now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 30).unwrap();
 
         for (reservation_id, amount, created_at) in [
             ("outside", 9.0, out_of_window),
+            ("edge-since", 4.0, edge_since),
             ("middle", 1.0, middle),
             ("edge-now", 2.0, edge_now),
         ] {
@@ -4869,6 +4877,7 @@ mod tests {
 
         for (bucket_start, amount) in [
             (rolling_bucket_start(out_of_window), 9.0),
+            (rolling_bucket_start(edge_since), 4.0),
             (rolling_bucket_start(middle), 1.0),
             (rolling_bucket_start(edge_now), 2.0),
         ] {
@@ -4891,7 +4900,7 @@ mod tests {
 
         let spend = recent_spend_usd(&ledger, rule_id, limit_id, scope_key, since, now);
 
-        assert_eq!(spend, 3.0);
+        assert_eq!(spend, 7.0);
     }
 
     #[test]
