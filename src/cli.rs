@@ -71,6 +71,10 @@ struct ServeArgs {
     #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
 
+    /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
+    #[arg(long, env = "NOET_DATABASE_URL")]
+    database_url: Option<String>,
+
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
     upstream: Option<url::Url>,
@@ -169,6 +173,10 @@ struct ReportCommand {
     #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
 
+    /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
+    #[arg(long, env = "NOET_DATABASE_URL")]
+    database_url: Option<String>,
+
     /// Emit JSON instead of human-readable text.
     #[arg(long)]
     json: bool,
@@ -249,6 +257,7 @@ pub async fn run() -> Result<(), NoetError> {
                 fixture_dir: args.fixture_dir,
                 simulation_dir: args.simulation_dir,
                 db_path: args.db_path,
+                database_url: args.database_url,
                 upstream: args.upstream,
                 routes,
                 policy_path,
@@ -281,6 +290,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 fixture_dir: layout.fixture_dir,
                 simulation_dir: layout.simulation_dir,
                 db_path: layout.db_path,
+                database_url: None,
                 upstream: args.upstream,
                 routes,
                 policy_path: Some(layout.policy_path),
@@ -356,7 +366,10 @@ async fn run_fixtures(command: FixturesCommand) -> Result<(), NoetError> {
 }
 
 async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
-    let ledger = BudgetLedger::open_sqlite(&command.db_path)?;
+    let ledger = match command.database_url.as_deref() {
+        Some(database_url) => BudgetLedger::open_postgres(database_url)?,
+        None => BudgetLedger::open_sqlite(&command.db_path)?,
+    };
     match command.command {
         ReportSubcommand::Usage => {
             let report = reporting::usage_report(&ledger)?;

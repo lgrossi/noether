@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use noether::contract::{AuthorizeRequest, DecisionMode, FinalizeReservation, TraceEvent};
-use noether::ledger::BudgetLedger;
+use noether::ledger::{AsyncPostgresLedger, BudgetLedger};
 use noether::policy::parse_policy_bytes;
-use noether::server::{AppState, build_router};
+use noether::server::{AppState, LedgerBackend, build_router};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -85,15 +86,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = std::fs::remove_dir_all(&fixture_dir);
     std::fs::create_dir_all(&fixture_dir)?;
 
-    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
-    match config.seed_mode {
-        SeedMode::Product => seed_ledger(&mut ledger, &policy, config.rows)?,
-        SeedMode::BulkCompany => {
-            drop(ledger);
-            seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
-            ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let mut postgres_ledger = None;
+    let ledger = match (config.seed_mode, config.database_url.as_deref()) {
+        (SeedMode::Product, Some(database_url)) => {
+            let ledger = AsyncPostgresLedger::connect(database_url).await?;
+            seed_async_postgres_ledger(&ledger, &policy, config.rows).await?;
+            postgres_ledger = Some(ledger);
+            BudgetLedger::default()
         }
-    }
+        (SeedMode::Product, None) => {
+            let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+            seed_ledger(&mut ledger, &policy, config.rows)?;
+            ledger
+        }
+        (SeedMode::BulkCompany, Some(_)) => {
+            return Err("--seed-mode bulk-company is currently SQLite-only".into());
+        }
+        (SeedMode::BulkCompany, None) => {
+            seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
+            BudgetLedger::open_sqlite(&db_path)?
+        }
+    };
 
     let mut state = AppState::new(
         fixture_dir.clone(),
@@ -101,52 +114,73 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(policy),
         DecisionMode::Enforce,
     );
+    if let Some((database_url, postgres_ledger)) =
+        config.database_url.clone().zip(postgres_ledger.clone())
+    {
+        state.ledger_backend = LedgerBackend::Postgres {
+            database_url,
+            ledger: postgres_ledger,
+        };
+    } else {
+        state.ledger_backend = LedgerBackend::SQLite {
+            path: db_path.clone(),
+        };
+    }
     state.policy_proposal_path = proposal_path.clone();
     *state.ledger.lock().await = ledger;
     let app = build_router(state.clone());
 
     println!(
-        "noet-bench rows={} iterations={} db={}",
+        "noet-bench rows={} iterations={} backend={} db={}",
         config.rows,
         config.iterations,
+        if config.database_url.is_some() {
+            "postgres"
+        } else {
+            "sqlite"
+        },
         db_path.display()
     );
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+    println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
 
-    bench_get(
-        "GET /v1/app/policy",
-        app.clone(),
-        "/v1/app/policy",
-        config.iterations,
-    )
-    .await?;
-    bench_get(
-        "GET /v1/app/runs",
-        app.clone(),
-        "/v1/app/runs?limit=80",
-        config.iterations,
-    )
-    .await?;
-    bench_get(
-        "GET /v1/app/replay",
-        app.clone(),
-        "/v1/app/replay",
-        config.iterations,
-    )
-    .await?;
-    if !config.skip_draft_replay {
-        std::fs::write(&proposal_path, BENCH_REPLAY_PROPOSAL)?;
+    if !config.hot_only {
         bench_get(
-            "GET /v1/app/replay (draft simulation)",
+            "GET /v1/app/policy",
+            app.clone(),
+            "/v1/app/policy",
+            config.iterations,
+        )
+        .await?;
+        bench_get(
+            "GET /v1/app/runs",
+            app.clone(),
+            "/v1/app/runs?limit=80",
+            config.iterations,
+        )
+        .await?;
+        bench_get(
+            "GET /v1/app/replay",
             app.clone(),
             "/v1/app/replay",
             config.iterations,
         )
         .await?;
+        if !config.skip_draft_replay {
+            std::fs::write(&proposal_path, BENCH_REPLAY_PROPOSAL)?;
+            bench_get(
+                "GET /v1/app/replay (draft simulation)",
+                app.clone(),
+                "/v1/app/replay",
+                config.iterations,
+            )
+            .await?;
+        }
     }
     bench_authorize(app.clone(), config.iterations).await?;
     bench_finalize(app.clone(), config.iterations).await?;
-    bench_event(app, config.iterations).await?;
+    if !config.hot_only {
+        bench_event(app, config.iterations).await?;
+    }
 
     remove_sqlite_files(&db_path);
     let _ = std::fs::remove_dir_all(&fixture_dir);
@@ -158,9 +192,11 @@ struct BenchConfig {
     rows: usize,
     iterations: usize,
     base_url: Option<String>,
+    database_url: Option<String>,
     seed_mode: SeedMode,
     events_per_decision: usize,
     skip_draft_replay: bool,
+    hot_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,9 +210,11 @@ impl BenchConfig {
         let mut rows = 1_000;
         let mut iterations = 30;
         let mut base_url = None;
+        let mut database_url = std::env::var("NOET_DATABASE_URL").ok();
         let mut seed_mode = SeedMode::Product;
         let mut events_per_decision = 1;
         let mut skip_draft_replay = false;
+        let mut hot_only = false;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -195,6 +233,9 @@ impl BenchConfig {
                 "--base-url" => {
                     base_url = Some(args.next().ok_or("--base-url requires a value")?);
                 }
+                "--database-url" => {
+                    database_url = Some(args.next().ok_or("--database-url requires a value")?);
+                }
                 "--seed-mode" => {
                     seed_mode = match args.next().ok_or("--seed-mode requires a value")?.as_str() {
                         "product" => SeedMode::Product,
@@ -211,9 +252,12 @@ impl BenchConfig {
                 "--skip-draft-replay" => {
                     skip_draft_replay = true;
                 }
+                "--hot-only" => {
+                    hot_only = true;
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--base-url URL]"
+                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--hot-only] [--database-url URL] [--base-url URL]"
                     );
                     std::process::exit(0);
                 }
@@ -224,9 +268,11 @@ impl BenchConfig {
             rows,
             iterations,
             base_url,
+            database_url,
             seed_mode,
             events_per_decision,
             skip_draft_replay,
+            hot_only,
         })
     }
 }
@@ -265,6 +311,48 @@ fn seed_ledger(
                 "metadata": { "agent_run_id": agent_run_id, "request_id": request_id }
             }),
         })?;
+    }
+    Ok(())
+}
+
+async fn seed_async_postgres_ledger(
+    ledger: &AsyncPostgresLedger,
+    policy: &noether::policy::PolicyFile,
+    rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    let base_time = Utc::now() - ChronoDuration::seconds(rows as i64);
+    for index in 0..rows {
+        let trace_id = format!("bench-trace-{index}");
+        let request_id = format!("bench-request-{index}");
+        let agent_run_id = format!("bench-run-{index}");
+        let request = authorize_request(
+            index,
+            Some(&trace_id),
+            Some(&request_id),
+            Some(&agent_run_id),
+        );
+        let created_at = base_time + ChronoDuration::seconds(index as i64);
+        let decision = ledger
+            .try_authorize_at(Some(Arc::new(policy.clone())), request, created_at)
+            .await?;
+        if let Some(reservation) = decision.reservation {
+            let finalize = finalize_payload(index, &trace_id, &request_id, &agent_run_id);
+            ledger.finalize(reservation.id, finalize).await?;
+        }
+        ledger
+            .record_event(TraceEvent {
+                id: None,
+                trace_id: Some(trace_id),
+                occurred_at: Some(created_at),
+                kind: "tool.observed".to_owned(),
+                payload: json!({
+                    "name": "shell",
+                    "duration_ms": 10 + (index % 90),
+                    "success": index % 17 != 0,
+                    "metadata": { "agent_run_id": agent_run_id, "request_id": request_id }
+                }),
+            })
+            .await?;
     }
     Ok(())
 }
@@ -615,7 +703,7 @@ async fn run_live_bench(base_url: &str, iterations: usize) -> Result<(), Box<dyn
     let base_url = base_url.trim_end_matches('/');
     let client = reqwest::Client::new();
     println!("noet-bench-live base_url={base_url} iterations={iterations}");
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+    println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
     bench_live_authorize(&client, base_url, iterations).await?;
     bench_live_finalize(&client, base_url, iterations).await?;
     Ok(())
@@ -774,13 +862,14 @@ fn print_summary(name: &str, samples: &[Duration]) {
     let max = values.last().copied().unwrap_or_default();
     let p50 = percentile(&values, 0.50);
     let p95 = percentile(&values, 0.95);
+    let p99 = percentile(&values, 0.99);
     let avg = if values.is_empty() {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
     };
     println!(
-        "{name},{},{min:.3},{p50:.3},{p95:.3},{max:.3},{avg:.3}",
+        "{name},{},{min:.3},{p50:.3},{p95:.3},{p99:.3},{max:.3},{avg:.3}",
         values.len()
     );
 }
