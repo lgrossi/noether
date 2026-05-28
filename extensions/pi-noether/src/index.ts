@@ -131,6 +131,21 @@ type DecisionRouting = {
 	remaining_budget_usd?: number;
 };
 
+type AuthorizeMessageHint = {
+	kind?: string;
+	rule_id?: string;
+	severity?: string;
+	limit_type?: string;
+	window_id?: string;
+	window_label?: string;
+	window_mode?: string;
+	window_ends_at?: string;
+	projected_spend_usd?: number;
+	max_usd?: number;
+	threshold_usd?: number;
+	threshold_percent?: number;
+};
+
 type AuthorizeDecision = {
 	decision_id?: string;
 	outcome?: string;
@@ -1176,19 +1191,165 @@ function appliedPolicyAction(
 	return userApproval === "approved" ? "approved" : "block";
 }
 
-function messageWithDecisionId(message: string, decisionId: string | undefined): string {
-	return decisionId ? `${message} [decision ${decisionId}]` : message;
+function buildShortDecisionReason(
+	decision: AuthorizeDecision,
+	attemptedModel?: AttemptedModelContext,
+): string {
+	const hint = primaryMessageHint(decision, decisionAction(decision));
+	if (hint) {
+		return messageForHint(hint, decisionAction(decision));
+	}
+	return buildUserDecisionMessage(decision, decisionAction(decision), attemptedModel);
+}
+
+function primaryMessageHint(
+	decision: AuthorizeDecision | undefined,
+	action: DecisionAction,
+): AuthorizeMessageHint | undefined {
+	const hints = messageHints(decision);
+	if (!hints.length) {
+		return undefined;
+	}
+	const wantedSeverity = action === "warn" ? "warn" : "deny";
+	return hints.find((hint) => hint.severity === wantedSeverity) || hints[0];
+}
+
+function messageHints(decision: AuthorizeDecision | undefined): AuthorizeMessageHint[] {
+	const metadata = isRecord(decision?.metadata) ? decision?.metadata : undefined;
+	const hints = Array.isArray(metadata?.message_hints) ? metadata.message_hints : [];
+	return hints.filter((hint): hint is AuthorizeMessageHint => isRecord(hint));
+}
+
+function messageForHint(hint: AuthorizeMessageHint, action: DecisionAction): string {
+	if (hint.kind === "request_cost") {
+		return action === "warn"
+			? "High-cost request. Consider a cheaper model or shorter context."
+			: "Request is too expensive. Use a cheaper model or shorten context.";
+	}
+	if (hint.kind === "context_tokens") {
+		return action === "warn"
+			? "Large context. Consider clearing context to lower cost."
+			: "Context is too large. Clear context and try again.";
+	}
+	if (hint.limit_type === "spend" || hint.kind?.startsWith("spend_")) {
+		return spendWindowMessage(hint, action);
+	}
+	return action === "warn" ? "Policy warning. Consider a cheaper model." : "Request blocked by policy.";
+}
+
+function spendWindowMessage(hint: AuthorizeMessageHint, action: DecisionAction): string {
+	const budget = budgetWindowName(hint);
+	const timing = budgetWindowTiming(hint, action);
+	if (action === "warn") {
+		const status = hint.kind === "spend_limit" ? "exceeded" : nearLimitStatus(hint);
+		return compactJoin([`${budget} ${status}.`, timing, "Consider a cheaper model."]);
+	}
+	return compactJoin([`${budget} reached.`, timing || "Use a cheaper model or wait."]);
+}
+
+function nearLimitStatus(hint: AuthorizeMessageHint): string {
+	if (typeof hint.threshold_percent === "number" && Number.isFinite(hint.threshold_percent)) {
+		return `${Math.max(0, Math.round(hint.threshold_percent))}% reached`;
+	}
+	return "near limit";
+}
+
+function budgetWindowTiming(hint: AuthorizeMessageHint, action: DecisionAction): string | undefined {
+	const resetAt = formatDecisionTime(hint.window_ends_at);
+	if (!resetAt) {
+		return undefined;
+	}
+	if (hint.window_mode === "rolling") {
+		return action === "warn" ? `Frees up around ${resetAt}.` : `Available around ${resetAt}.`;
+	}
+	return action === "warn" ? `Resets ${resetAt}.` : `Available ${resetAt}.`;
+}
+
+function budgetWindowName(hint: AuthorizeMessageHint): string {
+	const id = `${hint.window_id || ""} ${hint.rule_id || ""}`.toLowerCase();
+	if (id.includes("month")) {
+		return "Monthly budget";
+	}
+	const label = hint.window_label || hint.window_id;
+	const parsed = parseWindowLabel(label);
+	if (parsed) {
+		return `${parsed} budget`;
+	}
+	return "Budget";
+}
+
+function parseWindowLabel(value: string | undefined): string | undefined {
+	const match = value?.match(/^(\d+)([smhd])$/i);
+	if (!match) {
+		return undefined;
+	}
+	const amount = Number.parseInt(match[1], 10);
+	const unit = match[2].toLowerCase();
+	const label =
+		unit === "s"
+			? "second"
+			: unit === "m"
+				? "minute"
+				: unit === "h"
+					? "hour"
+					: unit === "d" && amount === 1
+						? "day"
+						: "day";
+	if (unit === "d" && amount === 1) {
+		return "Daily";
+	}
+	return `${amount}-${label}`;
+}
+
+function formatDecisionTime(value: string | undefined): string | undefined {
+	if (!value) {
+		return undefined;
+	}
+	const date = new Date(value);
+	if (!Number.isFinite(date.getTime())) {
+		return undefined;
+	}
+	return new Intl.DateTimeFormat(undefined, {
+		month: "short",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	}).format(date);
+}
+
+function plainDecisionReason(decision: AuthorizeDecision | undefined): string | undefined {
+	return decisionExplanations(decision)
+		.map((explanation) => stringValue(explanation.reason))
+		.find((reason) =>
+			Boolean(
+				reason &&
+					!reason.startsWith("selected requested budget") &&
+					!reason.startsWith("selected fallback budget") &&
+					reason !== "requested budget does not exist",
+			),
+		);
+}
+
+function normalizeSentence(value: string): string {
+	const trimmed = value.trim().replace(/\s+/g, " ");
+	if (!trimmed) {
+		return trimmed;
+	}
+	const sentence = trimmed[0].toUpperCase() + trimmed.slice(1);
+	return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
+}
+
+function compactJoin(parts: Array<string | undefined>): string {
+	return parts.filter(Boolean).join(" ");
 }
 
 function buildUserApprovalPrompt(
 	decision: AuthorizeDecision,
 	attemptedModel?: AttemptedModelContext,
 ): { title: string; message: string } {
-	const reason = describeDecisionReason(decision, attemptedModel);
-	const header = decision.decision_id ? `Decision ${decision.decision_id}` : "Noether deny decision";
 	return {
-		title: "Noether requested approval",
-		message: `${header}: ${reason}\n\nProceed anyway?`,
+		title: "Continue anyway?",
+		message: `${buildShortDecisionReason(decision, attemptedModel)}\n\nContinue this request?`,
 	};
 }
 
@@ -1214,34 +1375,56 @@ function buildPolicyDecisionMessage(
 	userApproval?: UserApproval,
 	attemptedModel?: AttemptedModelContext,
 ): string {
-	const reason = describeDecisionReason(decision, attemptedModel);
 	if (action === "ask") {
 		if (userApproval === "approved") {
-			return messageWithDecisionId(
-				`Noether requested approval for this request, and you approved proceeding: ${reason}`,
-				decision.decision_id,
-			);
+			return "Continuing by request.";
 		}
 		if (userApproval === "rejected") {
-			return messageWithDecisionId(
-				`Noether asked for approval, you rejected proceeding, so the request stayed blocked: ${reason}`,
-				decision.decision_id,
-			);
+			return "Request canceled.";
 		}
-		return messageWithDecisionId(
-			`Noether would normally ask for approval here, but this Pi run could not show an approval prompt, so the request was blocked: ${reason}`,
-			decision.decision_id,
-		);
+		return "Could not ask whether to continue. Request blocked.";
+	}
+	return buildUserDecisionMessage(decision, action, attemptedModel);
+}
+
+function buildUserDecisionMessage(
+	decision: AuthorizeDecision,
+	action: DecisionAction,
+	attemptedModel?: AttemptedModelContext,
+): string {
+	const hint = primaryMessageHint(decision, action);
+	if (hint) {
+		return messageForHint(hint, action);
+	}
+	if (decisionHasReason(decision, "provider/model is not allowed")) {
+		const budgetId = decisionBudgetId(decision);
+		return budgetId
+			? "Model not available on this budget. Choose another model or budget."
+			: "Model not available for this work. Choose another model.";
+	}
+	if (decisionHasReason(decision, "no fallback budget can satisfy the request")) {
+		return "No budget covers this request. Choose another model or budget.";
+	}
+	if (decisionHasReason(decision, "requested budget does not exist")) {
+		return "Selected budget was not found. Choose another budget.";
+	}
+	if (decisionHasReason(decision, "requested budget does not match the request")) {
+		return "Selected budget does not apply here. Choose another budget.";
 	}
 	if (action === "warn") {
-		return messageWithDecisionId(`Noether warned on this request: ${reason}`, decision.decision_id);
+		const reason = plainDecisionReason(decision);
+		return reason ? normalizeSentence(reason) : "Policy warning. Consider a cheaper model.";
 	}
-	return messageWithDecisionId(`Noether blocked this request: ${reason}`, decision.decision_id);
+	const reason = plainDecisionReason(decision);
+	return reason ? normalizeSentence(reason) : "Request blocked by policy.";
 }
 
 function buildAuthorizeFailureMessage(error: unknown, failMode: FailMode): string {
-	const detail = error instanceof Error ? error.message : String(error);
-	return `Noether authorization failed and failMode=${failMode} blocked this provider request: ${detail}`;
+	const timedOut =
+		error instanceof Error && error.message.includes("timed out")
+			? " Noether did not respond in time."
+			: "";
+	return failMode === "fail_closed" ? `Noether unavailable. Request blocked.${timedOut}` : "Noether unavailable. Continuing.";
 }
 
 function truncateSingleLine(value: string, maxLength = 160): string {

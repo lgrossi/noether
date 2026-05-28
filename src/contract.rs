@@ -54,6 +54,8 @@ pub struct AuthorizeDecision {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<Reservation>,
     pub explanations: Vec<DecisionExplanation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
 }
 

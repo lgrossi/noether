@@ -657,11 +657,9 @@ function deferred() {
 		assert.equal(aborted, true);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "error");
-		assert.match(ui.notifications[0].message, /daily budget exceeded/);
-		assert.match(ui.notifications[0].message, /decision dec_1/);
-		assert(
-			ui.statuses.some((status) => typeof status.text === "string" && status.text.includes("Noether blocked")),
-		);
+		assert.equal(ui.notifications[0].message, "Daily budget exceeded.");
+		assert.doesNotMatch(ui.notifications[0].message, /decision dec_1/);
+		assert(ui.statuses.some((status) => status.text === "Daily budget exceeded."));
 		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
 		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
 		assert.equal(typeof authorizeCall.body.metadata.trace_id, "string");
@@ -727,13 +725,90 @@ function deferred() {
 		assert.equal(aborted, false);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "warning");
-		assert.match(ui.notifications[0].message, /Noether warned on this request/);
-		assert.match(ui.notifications[0].message, /model access requires a different budget/);
+		assert.equal(ui.notifications[0].message, "Model access requires a different budget.");
 		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize warn-mode event");
 		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
 		assert.equal(authorizeEvent.body.payload.decision_action, "warn");
 		assert.equal(authorizeEvent.body.payload.policy_action, "warn");
 		assert.match(authorizeEvent.body.payload.decision_reason, /different budget/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_spend_warn",
+				outcome: "warn",
+				action: "warn",
+				explanations: [
+					{
+						rule_id: "personal-local.spend_window.monthly-cap",
+						reason: "projected spend $800.230526 reaches warning threshold $800.000000 for 30d window",
+						severity: "warn",
+					},
+				],
+				metadata: {
+					message_hints: [
+						{
+							kind: "spend_threshold",
+							rule_id: "personal-local.spend_window.monthly-cap",
+							severity: "warn",
+							limit_type: "spend",
+							window_id: "monthly-cap",
+							window_label: "30d",
+							window_mode: "tumbling",
+							window_ends_at: "2026-06-01T09:00:00.000Z",
+							threshold_percent: 80,
+						},
+					],
+				},
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		let aborted = false;
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")(
+			{ payload: { model: "local" } },
+			fakeContext({ ui: ui.ui, abort: () => { aborted = true; } }),
+		);
+
+		assert.equal(aborted, false);
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "warning");
+		assert.match(ui.notifications[0].message, /^Monthly budget 80% reached\./);
+		assert.match(ui.notifications[0].message, /Resets/);
+		assert.match(ui.notifications[0].message, /Jun 1/);
+		assert.match(ui.notifications[0].message, /Consider a cheaper model\./);
+		assert.doesNotMatch(ui.notifications[0].message, /projected spend/);
+		assert.doesNotMatch(ui.notifications[0].message, /decision dec_spend_warn/);
+		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize spend warning event");
+		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
+		assert.match(authorizeEvent.body.payload.decision_reason, /projected spend/);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -811,9 +886,7 @@ function deferred() {
 		assert.equal(aborted, true);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "error");
-		assert.match(ui.notifications[0].message, /openai-codex\/gpt-5\.4-mini/);
-		assert.match(ui.notifications[0].message, /not allowed on budget personal-local/);
-		assert.match(ui.notifications[0].message, /no fallback budget/);
+		assert.equal(ui.notifications[0].message, "Model not available on this budget. Choose another model or budget.");
 		assert.doesNotMatch(ui.notifications[0].message, /requested provider\/model is not allowed by budget/);
 		assert.doesNotMatch(ui.notifications[0].message, /requested provider\/model is not allowed by requested budget/);
 	} finally {
@@ -874,12 +947,12 @@ function deferred() {
 
 		assert.equal(aborted, false);
 		assert.equal(ui.confirms.length, 1);
-		assert.match(ui.confirms[0].title, /Noether requested approval/);
-		assert.match(ui.confirms[0].message, /tool access requires explicit approval/);
-		assert.match(ui.confirms[0].message, /Proceed anyway\?/);
+		assert.equal(ui.confirms[0].title, "Continue anyway?");
+		assert.match(ui.confirms[0].message, /Tool access requires explicit approval/);
+		assert.match(ui.confirms[0].message, /Continue this request\?/);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "warning");
-		assert.match(ui.notifications[0].message, /approved proceeding/);
+		assert.equal(ui.notifications[0].message, "Continuing by request.");
 		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize user-approved approval event");
 		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
 		assert.equal(authorizeEvent.body.payload.decision_action, "ask");
@@ -940,10 +1013,10 @@ function deferred() {
 
 		assert.equal(aborted, true);
 		assert.equal(ui.confirms.length, 1);
-		assert.match(ui.confirms[0].message, /after-hours policy requires manual override/);
+		assert.match(ui.confirms[0].message, /After-hours policy requires manual override/);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "error");
-		assert.match(ui.notifications[0].message, /you rejected proceeding/);
+		assert.equal(ui.notifications[0].message, "Request canceled.");
 		await waitFor(() => calls.some((call) => call.body?.kind === "pi.authorize"), "authorize user-approved rejection event");
 		const authorizeEvent = calls.find((call) => call.body?.kind === "pi.authorize");
 		assert.equal(authorizeEvent.body.payload.decision_action, "ask");
@@ -1004,8 +1077,7 @@ function deferred() {
 		assert.equal(aborted, true);
 		assert.equal(ui.notifications.length, 1);
 		assert.equal(ui.notifications[0].type, "error");
-		assert.match(ui.notifications[0].message, /would normally ask for approval here/);
-		assert.match(ui.notifications[0].message, /could not show an approval prompt/);
+		assert.equal(ui.notifications[0].message, "Could not ask whether to continue. Request blocked.");
 		assert.doesNotMatch(ui.notifications[0].message, /policyMode=user_approved could not collect approval/);
 	} finally {
 		globalThis.fetch = originalFetch;

@@ -195,6 +195,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DecisionExplanation"
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Optional machine-readable presentation hints and diagnostics.
         created_at:
           type: string
           format: date-time

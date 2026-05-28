@@ -45,6 +45,7 @@ export type AuthorizeDecision = {
 	action: PolicyAction;
 	reservation?: Reservation;
 	explanations: DecisionExplanation[];
+	metadata?: Record<string, unknown>;
 	created_at: string;
 };
 

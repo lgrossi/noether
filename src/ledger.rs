@@ -4,7 +4,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::contract::{
@@ -90,6 +90,31 @@ struct SpendWindowProjection {
     warn_at_fraction: f64,
     scope_key: String,
     window_seconds: Duration,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuthorizeMessageHint {
+    kind: String,
+    rule_id: String,
+    severity: DecisionSeverity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_ends_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projected_spend_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_percent: Option<u64>,
 }
 
 #[derive(Default)]
@@ -351,6 +376,7 @@ impl BudgetLedger {
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
         let mut limit_hits = Vec::new();
+        let mut message_hints = Vec::new();
         let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
@@ -367,6 +393,7 @@ impl BudgetLedger {
                     &mut action,
                     &mut explanations,
                     &mut limit_hits,
+                    &mut message_hints,
                 );
             }
         } else {
@@ -393,6 +420,7 @@ impl BudgetLedger {
             action,
             reservation,
             explanations,
+            metadata: message_hints_metadata(&message_hints),
             created_at: now,
         };
         self.persist_decision(
@@ -414,6 +442,7 @@ impl BudgetLedger {
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
         let mut limit_hits = Vec::new();
+        let mut message_hints = Vec::new();
         let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
@@ -430,6 +459,7 @@ impl BudgetLedger {
                     &mut action,
                     &mut explanations,
                     &mut limit_hits,
+                    &mut message_hints,
                 );
             }
         } else {
@@ -457,6 +487,7 @@ impl BudgetLedger {
             action,
             reservation,
             explanations,
+            metadata: message_hints_metadata(&message_hints),
             created_at: now,
         })
     }
@@ -1325,6 +1356,7 @@ impl BudgetLedger {
         action: &mut PolicyAction,
         explanations: &mut Vec<DecisionExplanation>,
         limit_hits: &mut Vec<DecisionLimitHitReport>,
+        message_hints: &mut Vec<AuthorizeMessageHint>,
     ) -> Option<String> {
         let estimated_cost = request.estimated_cost();
         let candidate = self.select_budget_rule(policy, request, now, explanations);
@@ -1339,6 +1371,7 @@ impl BudgetLedger {
                         reason: hit.reason.clone(),
                         severity: hit.severity,
                     });
+                    message_hints.push(message_hint_from_limit_hit("spend_limit", &hit));
                     limit_hits.push(hit);
                 }
                 return None;
@@ -1392,6 +1425,7 @@ impl BudgetLedger {
             action,
             explanations,
             limit_hits,
+            message_hints,
         ) {
             return Some(rule.id.clone());
         }
@@ -3220,10 +3254,12 @@ fn apply_budget_limits(
     action: &mut PolicyAction,
     explanations: &mut Vec<DecisionExplanation>,
     limit_hits: &mut Vec<DecisionLimitHitReport>,
+    message_hints: &mut Vec<AuthorizeMessageHint>,
 ) -> bool {
     if let Some(limit) = &rule.limits.request_cost
         && estimated_cost > limit.max_usd
-        && push_limit_explanation(
+    {
+        let denied = push_limit_explanation(
             format!("{}.request_cost", rule.id),
             format!(
                 "estimated request cost ${estimated_cost:.6} exceeds limit max ${:.6}",
@@ -3236,15 +3272,31 @@ fn apply_budget_limits(
             limit.action,
             action,
             explanations,
-        )
-    {
-        return true;
+        );
+        message_hints.push(AuthorizeMessageHint {
+            kind: "request_cost".to_owned(),
+            rule_id: format!("{}.request_cost", rule.id),
+            severity: limit.action.decision_severity(),
+            limit_type: Some("request_cost".to_owned()),
+            window_id: None,
+            window_label: None,
+            window_mode: None,
+            window_ends_at: None,
+            projected_spend_usd: Some(estimated_cost),
+            max_usd: Some(limit.max_usd),
+            threshold_usd: None,
+            threshold_percent: None,
+        });
+        if denied {
+            return true;
+        }
     }
 
     if let Some(limit) = &rule.limits.context_tokens
         && let Some(estimated_tokens) = request.estimated_tokens
         && estimated_tokens > limit.max_tokens
-        && push_limit_explanation(
+    {
+        let denied = push_limit_explanation(
             format!("{}.context_tokens", rule.id),
             format!(
                 "estimated context tokens {estimated_tokens} exceed limit max {}",
@@ -3257,9 +3309,24 @@ fn apply_budget_limits(
             limit.action,
             action,
             explanations,
-        )
-    {
-        return true;
+        );
+        message_hints.push(AuthorizeMessageHint {
+            kind: "context_tokens".to_owned(),
+            rule_id: format!("{}.context_tokens", rule.id),
+            severity: limit.action.decision_severity(),
+            limit_type: Some("context_tokens".to_owned()),
+            window_id: None,
+            window_label: None,
+            window_mode: None,
+            window_ends_at: None,
+            projected_spend_usd: None,
+            max_usd: None,
+            threshold_usd: None,
+            threshold_percent: None,
+        });
+        if denied {
+            return true;
+        }
     }
 
     for projection in spend_window_projections(ledger, rule, request, estimated_cost, now)
@@ -3276,6 +3343,12 @@ fn apply_budget_limits(
                 ),
                 severity: DecisionSeverity::Warn,
             });
+            message_hints.push(message_hint_from_projection(
+                "spend_threshold",
+                &projection,
+                DecisionSeverity::Warn,
+                Some(warn_threshold),
+            ));
         }
         if projection.projected_spend_usd > projection.max_usd {
             let hit = spend_limit_hit(&projection);
@@ -3287,6 +3360,12 @@ fn apply_budget_limits(
                 action,
                 explanations,
             );
+            message_hints.push(message_hint_from_projection(
+                "spend_limit",
+                &projection,
+                hit.severity,
+                None,
+            ));
             limit_hits.push(hit);
             if denied {
                 return true;
@@ -3295,6 +3374,52 @@ fn apply_budget_limits(
     }
 
     false
+}
+
+fn message_hints_metadata(message_hints: &[AuthorizeMessageHint]) -> Option<Value> {
+    (!message_hints.is_empty()).then(|| json!({ "message_hints": message_hints }))
+}
+
+fn message_hint_from_projection(
+    kind: &str,
+    projection: &SpendWindowProjection,
+    severity: DecisionSeverity,
+    threshold_usd: Option<f64>,
+) -> AuthorizeMessageHint {
+    AuthorizeMessageHint {
+        kind: kind.to_owned(),
+        rule_id: projection.rule_id.clone(),
+        severity,
+        limit_type: Some("spend".to_owned()),
+        window_id: Some(projection.limit_id.clone()),
+        window_label: Some(projection.window_label.clone()),
+        window_mode: Some(match projection.limit_mode {
+            SpendWindowMode::Rolling => "rolling".to_owned(),
+            SpendWindowMode::Tumbling => "tumbling".to_owned(),
+        }),
+        window_ends_at: projection.window_ends_at,
+        projected_spend_usd: Some(projection.projected_spend_usd),
+        max_usd: Some(projection.max_usd),
+        threshold_usd,
+        threshold_percent: threshold_usd.map(|threshold| ((threshold / projection.max_usd) * 100.0).round() as u64),
+    }
+}
+
+fn message_hint_from_limit_hit(kind: &str, hit: &DecisionLimitHitReport) -> AuthorizeMessageHint {
+    AuthorizeMessageHint {
+        kind: kind.to_owned(),
+        rule_id: hit.rule_id.clone(),
+        severity: hit.severity,
+        limit_type: Some("spend".to_owned()),
+        window_id: hit.window_id.clone(),
+        window_label: hit.window_id.clone(),
+        window_mode: hit.window_mode.clone(),
+        window_ends_at: hit.window_ends_at,
+        projected_spend_usd: hit.projected_spend_usd,
+        max_usd: hit.max_usd,
+        threshold_usd: None,
+        threshold_percent: None,
+    }
 }
 
 fn spend_window_projections(

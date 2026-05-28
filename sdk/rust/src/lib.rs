@@ -183,6 +183,7 @@ fn synthetic_decision(fail_mode: FailMode, error: &NoetherClientError) -> Author
             reason: format!("Noether sidecar unavailable; applying {fail_mode:?}: {error}"),
             severity,
         }],
+        metadata: None,
         created_at: chrono::Utc::now(),
     }
 }
