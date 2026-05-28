@@ -10,6 +10,8 @@ use crate::contract::{
 };
 use crate::error::NoetError;
 
+const MAX_ROLLING_SPEND_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PolicyFile {
     pub version: u16,
@@ -118,10 +120,21 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
         }
         let mut spend_window_ids = BTreeSet::new();
         for limit in &budget.limits.spend {
-            if parse_limit_window(&limit.window).is_none() {
+            let parsed_window = parse_limit_window(&limit.window);
+            if parsed_window.is_none() {
                 errors.push(format!(
                     "budget {} limits.spend.window must use <number><s|m|h|d>, got {}",
                     budget.id, limit.window
+                ));
+            }
+            if matches!(limit.mode, Some(SpendWindowMode::Rolling))
+                && parsed_window
+                    .is_some_and(|window| window.num_seconds() > MAX_ROLLING_SPEND_WINDOW_SECONDS)
+            {
+                errors.push(format!(
+                    "budget {} limits.spend[{}].window must be <= 24h when mode is rolling",
+                    budget.id,
+                    spend_window_label(limit)
                 ));
             }
             if matches!(limit.by, SpendWindowBy::User) && budget.allocation.is_some() {
@@ -719,6 +732,30 @@ budgets:
         let error = validate_policy(&policy).expect_err("duplicate limit ids should be invalid");
         assert!(error.to_string().contains(
             "budget duplicate-limits limits.spend ids must be unique, found duplicate id daily-cap"
+        ));
+    }
+
+    #[test]
+    fn rejects_rolling_spend_windows_over_24h() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: long-rolling
+    limits:
+      spend:
+        - id: weekly-burn
+          window: 7d
+          mode: rolling
+          max_usd: 10
+          action: warn
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("long rolling window should be invalid");
+        assert!(error.to_string().contains(
+            "budget long-rolling limits.spend[weekly-burn].window must be <= 24h when mode is rolling"
         ));
     }
 

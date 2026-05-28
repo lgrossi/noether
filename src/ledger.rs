@@ -3671,49 +3671,22 @@ fn recent_spend_usd(
     if let Some(conn) = &ledger.conn {
         let bucket_since = rolling_bucket_start(since);
         let bucket_now = rolling_bucket_start(now);
-        if bucket_since == bucket_now {
-            return exact_recent_spend_usd(conn, rule_id, limit_id, scope_key, since, now);
-        }
-        let first_full_bucket = bucket_since + Duration::seconds(1);
         let value = conn.query_row(
             "
-            SELECT
-                COALESCE((
-                    SELECT SUM(amount_usd)
-                    FROM rolling_spend_buckets
-                    WHERE rule_id = ?1
-                      AND limit_id = ?2
-                      AND scope_key = ?3
-                      AND bucket_start >= ?4
-                      AND bucket_start < ?5
-                ), 0)
-                + COALESCE((
-                    SELECT SUM(amount_usd)
-                    FROM reservation_limit_scopes
-                    WHERE rule_id = ?1
-                      AND limit_id = ?2
-                      AND scope_key = ?3
-                      AND created_at >= ?6
-                      AND created_at < ?4
-                ), 0)
-                + COALESCE((
-                    SELECT SUM(amount_usd)
-                    FROM reservation_limit_scopes
-                    WHERE rule_id = ?1
-                      AND limit_id = ?2
-                      AND scope_key = ?3
-                      AND created_at >= ?5
-                      AND created_at <= ?7
-                ), 0)
+            SELECT COALESCE(SUM(amount_usd), 0)
+            FROM rolling_spend_buckets
+            WHERE rule_id = ?1
+              AND limit_id = ?2
+              AND scope_key = ?3
+              AND bucket_start >= ?4
+              AND bucket_start <= ?5
             ",
             params![
                 rule_id,
                 limit_id,
                 scope_key,
-                first_full_bucket.to_rfc3339(),
-                bucket_now.to_rfc3339(),
-                since.to_rfc3339(),
-                now.to_rfc3339()
+                bucket_since.to_rfc3339(),
+                bucket_now.to_rfc3339()
             ],
             |row| row.get::<_, f64>(0),
         );
@@ -3733,36 +3706,6 @@ fn recent_spend_usd(
         })
         .map(|stored| stored.reservation.amount_usd)
         .sum()
-}
-
-fn exact_recent_spend_usd(
-    conn: &Connection,
-    rule_id: &str,
-    limit_id: &str,
-    scope_key: &str,
-    since: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> f64 {
-    conn.query_row(
-        "
-        SELECT COALESCE(SUM(amount_usd), 0)
-        FROM reservation_limit_scopes
-        WHERE rule_id = ?1
-          AND limit_id = ?2
-          AND scope_key = ?3
-          AND created_at >= ?4
-          AND created_at <= ?5
-        ",
-        params![
-            rule_id,
-            limit_id,
-            scope_key,
-            since.to_rfc3339(),
-            now.to_rfc3339()
-        ],
-        |row| row.get::<_, f64>(0),
-    )
-    .unwrap_or(0.0)
 }
 
 fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
@@ -4810,7 +4753,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_rolling_spend_uses_exact_window_edges() {
+    fn sqlite_rolling_spend_uses_second_buckets_with_conservative_boundary() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("rolling-edges.sqlite");
         let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
@@ -4818,8 +4761,10 @@ mod tests {
         let rule_id = "dev-budget";
         let limit_id = "rolling";
         let scope_key = "project:noether";
-        let now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 30).unwrap();
-        let since = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap();
+        let now =
+            Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 30).unwrap() + Duration::milliseconds(750);
+        let since =
+            Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap() + Duration::milliseconds(750);
         let out_of_window = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 10).unwrap();
         let edge_since = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap();
         let middle = Utc.with_ymd_and_hms(2026, 5, 28, 12, 1, 0).unwrap();
