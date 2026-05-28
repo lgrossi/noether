@@ -7,6 +7,10 @@ edition = "2024"
 name = "noet"
 path = "src/main.rs"
 
+[[bin]]
+name = "noet-bench"
+path = "src/bin/noet-bench.rs"
+
 [dependencies]
 axum = "0.8.9"
 chrono = { version = "0.4.44", features = ["serde"] }

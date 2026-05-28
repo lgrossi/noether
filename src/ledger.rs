@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
     DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction, Reservation,
-    ReservationStatus, RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode, ToolEvent,
-    TraceEvent, UsageObservation,
+    ReservationStatus, RuleMatch, SpendWindowBy, SpendWindowMode, ToolEvent, TraceEvent,
+    UsageObservation,
 };
 use crate::error::NoetError;
 use crate::policy::{
@@ -167,6 +167,30 @@ pub struct UsageActivityRecord {
     pub cost_usd: f64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RunTotalsReport {
+    pub runs: u64,
+    pub allow: u64,
+    pub warn: u64,
+    pub deny: u64,
+    pub ask: u64,
+    pub limit_hits: u64,
+    pub spend_usd: f64,
+    pub tokens: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuleStatsReport {
+    pub rule: String,
+    pub allow: u64,
+    pub warn: u64,
+    pub deny: u64,
+    pub ask: u64,
+    pub limit_hits: u64,
+    pub top_reason: Option<String>,
+    pub top_model: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoricalAuthorizeRequest {
     pub occurred_at: DateTime<Utc>,
@@ -269,6 +293,9 @@ impl BudgetLedger {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         init_schema(&conn)?;
         let mut ledger = Self {
             conn: Some(conn),
@@ -531,6 +558,250 @@ impl BudgetLedger {
         self.decisions_report_since(None)
     }
 
+    pub fn decisions_report_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TraceReportItem>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
+                   action,
+                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, entities_json,
+                   selected_budget_id, matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
+                   model_check, budget_window_remaining_usd, routing_json, limit_hits_json,
+                   json_extract(metadata_json, '$.agent_run_id')
+            FROM decisions
+            ORDER BY created_at DESC
+            LIMIT ?1 OFFSET ?2
+            ",
+        )?;
+        stmt.query_map(
+            params![limit as i64, offset as i64],
+            decision_report_item_from_row,
+        )?
+        .collect::<Result<_, _>>()
+        .map_err(NoetError::from)
+    }
+
+    pub fn run_totals_report(&self) -> Result<RunTotalsReport, NoetError> {
+        self.run_totals_report_since(None)
+    }
+
+    pub fn run_totals_report_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<RunTotalsReport, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(RunTotalsReport::default());
+        };
+        let since = since.map(|since| since.to_rfc3339());
+        let mut totals = RunTotalsReport {
+            runs: if let Some(since) = since.as_deref() {
+                conn.query_row(
+                    "
+                    SELECT COUNT(DISTINCT COALESCE(
+                        json_extract(metadata_json, '$.agent_run_id'),
+                        trace_id,
+                        decision_id
+                    ))
+                    FROM decisions
+                    WHERE created_at >= ?1
+                    ",
+                    [since],
+                    |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+                )?
+            } else {
+                conn.query_row(
+                    "
+                SELECT COUNT(DISTINCT COALESCE(
+                    json_extract(metadata_json, '$.agent_run_id'),
+                    trace_id,
+                    decision_id
+                ))
+                FROM decisions
+                ",
+                    [],
+                    |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+                )?
+            },
+            ..RunTotalsReport::default()
+        };
+        let mut outcome_sql = "
+                SELECT outcome, COUNT(*)
+                FROM decisions"
+            .to_owned();
+        if since.is_some() {
+            outcome_sql.push_str(" WHERE created_at >= ?1");
+        }
+        outcome_sql.push_str(" GROUP BY outcome");
+        let mut stmt = conn.prepare(&outcome_sql)?;
+        let rows = if let Some(since) = since.as_deref() {
+            stmt.query_map([since], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for (outcome, count) in rows {
+            match outcome.as_str() {
+                "allow" => totals.allow += count,
+                "warn" => totals.warn += count,
+                "deny" => totals.deny += count,
+                "ask" => totals.ask += count,
+                _ => {}
+            }
+        }
+        totals.limit_hits = if let Some(since) = since.as_deref() {
+            conn.query_row(
+                "
+                SELECT COALESCE(SUM(COALESCE(json_array_length(limit_hits_json), 0)), 0)
+                FROM decisions
+                WHERE created_at >= ?1
+                ",
+                [since],
+                |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+            )?
+        } else {
+            conn.query_row(
+                "
+            SELECT COALESCE(SUM(COALESCE(json_array_length(limit_hits_json), 0)), 0)
+            FROM decisions
+            ",
+                [],
+                |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+            )?
+        };
+        let (tokens, spend): (i64, f64) = if let Some(since) = since.as_deref() {
+            conn.query_row(
+                "
+                SELECT COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_usd), 0)
+                FROM usage_observations
+                WHERE created_at >= ?1
+                ",
+                [since],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            conn.query_row(
+                "
+            SELECT COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_usd), 0)
+            FROM usage_observations
+            ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        totals.tokens = tokens.max(0) as u64;
+        totals.spend_usd = spend;
+        Ok(totals)
+    }
+
+    pub fn rule_stats_report(&self) -> Result<Vec<RuleStatsReport>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stats = HashMap::<String, RuleStatsReport>::new();
+        let mut stmt = conn.prepare(
+            "
+            SELECT COALESCE(selected_budget_id, json_extract(explanations_json, '$[0].rule_id'), 'unattributed'),
+                   outcome,
+                   COUNT(*),
+                   COALESCE(SUM(COALESCE(json_array_length(limit_hits_json), 0)), 0)
+            FROM decisions
+            GROUP BY 1, 2
+            ",
+        )?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?.max(0) as u64,
+                row.get::<_, i64>(3)?.max(0) as u64,
+            ))
+        })? {
+            let (rule, outcome, count, limit_hits) = row?;
+            let stat = stats
+                .entry(rule.clone())
+                .or_insert_with(|| RuleStatsReport {
+                    rule,
+                    ..RuleStatsReport::default()
+                });
+            match outcome.as_str() {
+                "allow" => stat.allow += count,
+                "warn" => stat.warn += count,
+                "deny" => stat.deny += count,
+                "ask" => stat.ask += count,
+                _ => {}
+            }
+            stat.limit_hits += limit_hits;
+        }
+
+        let mut reasons = HashMap::<String, HashMap<String, u64>>::new();
+        let mut models = HashMap::<String, HashMap<String, u64>>::new();
+        let mut stmt = conn.prepare(
+            "
+            SELECT COALESCE(selected_budget_id, json_extract(explanations_json, '$[0].rule_id'), 'unattributed'),
+                   explanations_json,
+                   provider,
+                   model,
+                   limit_hits_json
+            FROM decisions
+            WHERE outcome = 'deny'
+               OR COALESCE(json_array_length(limit_hits_json), 0) > 0
+            ",
+        )?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })? {
+            let (rule, explanations_json, provider, model, limit_hits_json) = row?;
+            if let Some(reason) = rule_stat_reason(&explanations_json, limit_hits_json.as_deref()) {
+                *reasons
+                    .entry(rule.clone())
+                    .or_default()
+                    .entry(reason)
+                    .or_default() += 1;
+            }
+            if let Some(model) = model {
+                let model_ref = provider
+                    .map(|provider| format!("{provider}/{model}"))
+                    .unwrap_or(model);
+                *models
+                    .entry(rule)
+                    .or_default()
+                    .entry(model_ref)
+                    .or_default() += 1;
+            }
+        }
+
+        let mut stats = stats.into_values().collect::<Vec<_>>();
+        for stat in &mut stats {
+            stat.top_reason = reasons.get(&stat.rule).and_then(most_common_count);
+            stat.top_model = models.get(&stat.rule).and_then(most_common_count);
+        }
+        stats.sort_by(|left, right| left.rule.cmp(&right.rule));
+        Ok(stats)
+    }
+
     pub fn decisions_report_since(
         &self,
         since: Option<DateTime<Utc>>,
@@ -629,6 +900,45 @@ impl BudgetLedger {
         self.usage_activity_report_since(None)
     }
 
+    pub fn usage_activity_report_for_agent_runs(
+        &self,
+        agent_run_ids: &[String],
+    ) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        if self.conn.is_none() {
+            return Ok(Vec::new());
+        }
+        if agent_run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", agent_run_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "
+            SELECT u.created_at, COALESCE(u.trace_id, d.trace_id), d.subject, d.project,
+                   COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
+                   d.selected_budget_id, d.matched_entity, d.entities_json,
+                   COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0),
+                   COALESCE(CAST(json_extract(u.metadata_json, '$.usage_details.cache_read_tokens') AS INTEGER), 0),
+                   COALESCE(CAST(json_extract(u.metadata_json, '$.usage_details.cache_write_tokens') AS INTEGER), 0),
+                   COALESCE(u.total_tokens, 0),
+                   COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0),
+                   COALESCE(json_extract(u.metadata_json, '$.agent_run_id'), json_extract(d.metadata_json, '$.agent_run_id')),
+                   COALESCE(json_extract(u.metadata_json, '$.request_id'), d.request_id)
+            FROM usage_observations u
+            LEFT JOIN reservations r ON r.id = u.reservation_id
+            LEFT JOIN decisions d ON d.decision_id = r.decision_id
+            WHERE COALESCE(json_extract(u.metadata_json, '$.agent_run_id'), json_extract(d.metadata_json, '$.agent_run_id')) IN ({placeholders})
+            ORDER BY u.created_at DESC
+            "
+        );
+        let params = agent_run_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        self.query_usage_activity_rows(&sql, params.as_slice())
+    }
+
     pub fn usage_activity_report_since(
         &self,
         since: Option<DateTime<Utc>>,
@@ -657,34 +967,28 @@ impl BudgetLedger {
         }
         sql.push_str(" ORDER BY u.created_at DESC");
         let mut stmt = conn.prepare(&sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| {
-            Ok(UsageActivityRecord {
-                occurred_at: parse_time(row.get::<_, String>(0)?),
-                trace_id: row.get(1)?,
-                agent_run_id: row.get(15)?,
-                request_id: row.get(16)?,
-                subject: row.get(2)?,
-                project: row.get(3)?,
-                provider: row.get(4)?,
-                model: row.get(5)?,
-                selected_budget_id: row.get(6)?,
-                matched_entity: row.get(7)?,
-                entities: parse_entities_json(row.get::<_, String>(8)?),
-                input_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(10)?.max(0) as u64,
-                cache_read_tokens: row.get::<_, i64>(11)?.max(0) as u64,
-                cache_write_tokens: row.get::<_, i64>(12)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(13)?.max(0) as u64,
-                cost_usd: row.get(14)?,
-            })
-        };
         let rows = if let Some(since) = since {
-            stmt.query_map([since.to_rfc3339()], map_row)?
+            stmt.query_map([since.to_rfc3339()], usage_activity_record_from_row)?
                 .collect::<Result<_, _>>()
         } else {
-            stmt.query_map([], map_row)?.collect::<Result<_, _>>()
+            stmt.query_map([], usage_activity_record_from_row)?
+                .collect::<Result<_, _>>()
         };
         rows.map_err(NoetError::from)
+    }
+
+    fn query_usage_activity_rows(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(sql)?;
+        stmt.query_map(params, usage_activity_record_from_row)?
+            .collect::<Result<_, _>>()
+            .map_err(NoetError::from)
     }
 
     pub fn observations_report(
@@ -2241,6 +2545,37 @@ fn protected_adoption_report(
     }))
 }
 
+fn rule_stat_reason(explanations_json: &str, limit_hits_json: Option<&str>) -> Option<String> {
+    limit_hits_json
+        .and_then(parse_optional_json::<Vec<DecisionLimitHitReport>>)
+        .and_then(|hits| hits.into_iter().next())
+        .map(|hit| hit.reason)
+        .or_else(|| {
+            serde_json::from_str::<Vec<DecisionExplanation>>(explanations_json)
+                .ok()?
+                .into_iter()
+                .find(|explanation| explanation.severity == DecisionSeverity::Deny)
+                .or_else(|| {
+                    serde_json::from_str::<Vec<DecisionExplanation>>(explanations_json)
+                        .ok()?
+                        .into_iter()
+                        .next()
+                })
+                .map(|explanation| explanation.reason)
+        })
+}
+
+fn most_common_count(values: &HashMap<String, u64>) -> Option<String> {
+    values
+        .iter()
+        .max_by(|(left_value, left_count), (right_value, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_value.cmp(left_value))
+        })
+        .map(|(value, _)| value.clone())
+}
+
 fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceReportItem> {
     let outcome: String = row.get(1)?;
     let decision_id: String = row.get(2)?;
@@ -2355,6 +2690,30 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
         binding_limit: limit_hits.as_deref().and_then(binding_limit_hit).cloned(),
         routing,
         limit_hits,
+    })
+}
+
+fn usage_activity_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<UsageActivityRecord> {
+    Ok(UsageActivityRecord {
+        occurred_at: parse_time(row.get::<_, String>(0)?),
+        trace_id: row.get(1)?,
+        agent_run_id: row.get(15)?,
+        request_id: row.get(16)?,
+        subject: row.get(2)?,
+        project: row.get(3)?,
+        provider: row.get(4)?,
+        model: row.get(5)?,
+        selected_budget_id: row.get(6)?,
+        matched_entity: row.get(7)?,
+        entities: parse_entities_json(row.get::<_, String>(8)?),
+        input_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+        output_tokens: row.get::<_, i64>(10)?.max(0) as u64,
+        cache_read_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+        cache_write_tokens: row.get::<_, i64>(12)?.max(0) as u64,
+        total_tokens: row.get::<_, i64>(13)?.max(0) as u64,
+        cost_usd: row.get(14)?,
     })
 }
 

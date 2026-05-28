@@ -760,11 +760,11 @@ async fn app_policy(State(state): State<AppState>) -> Result<Json<AppPolicyRespo
     let Some((path, _, policy)) = state.active_policy_source().await else {
         return Err(NoetError::NotFound("no active policy".to_owned()));
     };
-    let decisions = {
+    let report = {
         let ledger = state.ledger.lock().await;
-        reporting::decisions_report(&ledger)?
+        ledger.rule_stats_report()?
     };
-    let rule_stats = app_rule_stats(&policy, &decisions);
+    let rule_stats = app_rule_stats_from_report(policy.as_ref(), report);
     let suggestions = app_policy_suggestions(&rule_stats);
     let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
     let source = app_display_policy_source(policy.as_ref())?;
@@ -919,12 +919,29 @@ async fn app_runs(
     Query(query): Query<AppRunsQuery>,
 ) -> Result<Json<AppRunsResponse>, NoetError> {
     let ledger = state.ledger.lock().await;
+    let limit = query.limit.clamp(1, 250);
+    let offset = query.offset;
+    if app_runs_query_is_unfiltered(&query) {
+        let decisions = ledger.decisions_report_page(limit, offset)?;
+        let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
+        let usage_by_agent_run =
+            app_usage_by_agent_run(&ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?);
+        let runs = app_agent_runs(&decisions, &usage_by_agent_run);
+        let totals = app_run_totals_from_report(ledger.run_totals_report()?);
+        let filtered_total = totals.runs;
+        let next_offset =
+            (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
+        return Ok(Json(AppRunsResponse {
+            runs,
+            totals,
+            filtered_total,
+            next_offset,
+        }));
+    }
     let decisions = reporting::decisions_report(&ledger)?;
     let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
     let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
     let totals = app_run_totals_from_rows(&all_runs);
-    let limit = query.limit.clamp(1, 250);
-    let offset = query.offset;
     let filtered = all_runs
         .into_iter()
         .filter(|run| app_run_matches_query(run, &query))
@@ -943,6 +960,20 @@ async fn app_runs(
         filtered_total,
         next_offset,
     }))
+}
+
+fn app_runs_query_is_unfiltered(query: &AppRunsQuery) -> bool {
+    query
+        .decision
+        .as_deref()
+        .map(|value| value.is_empty() || value == "any")
+        .unwrap_or(true)
+        && query
+            .rule
+            .as_deref()
+            .map(|value| value.is_empty() || value == "any")
+            .unwrap_or(true)
+        && query.q.as_deref().map(str::trim).unwrap_or("").is_empty()
 }
 
 async fn app_run_detail(
@@ -968,7 +999,22 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
     const HISTORY_WINDOW_DAYS: i64 = 1;
     let history_window_end = chrono::Utc::now();
     let history_window_start = history_window_end - chrono::Duration::days(HISTORY_WINDOW_DAYS);
+    let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
+    let has_proposed_policy = proposal.is_some();
     let ledger = state.ledger.lock().await;
+    if !has_proposed_policy {
+        return Ok(Json(AppReplayResponse {
+            baseline: app_run_totals_from_report(
+                ledger.run_totals_report_since(Some(history_window_start))?,
+            ),
+            has_proposed_policy,
+            message: "No proposed policy has been saved for replay yet. Edit Policy first to create a local draft without enforcing it.".to_owned(),
+            history_window_days: HISTORY_WINDOW_DAYS,
+            history_window_start,
+            history_window_end,
+            proposal: None,
+        }));
+    }
     let decisions = ledger.decisions_report_since(Some(history_window_start))?;
     let historical_requests =
         ledger.historical_authorize_requests_since(Some(history_window_start))?;
@@ -981,8 +1027,6 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
         .transpose()?
         .unwrap_or_default();
-    let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
-    let has_proposed_policy = proposal.is_some();
     let replay_proposal = proposal
         .as_ref()
         .map(|proposal| {
@@ -1103,6 +1147,47 @@ fn app_rule_stats(policy: &PolicyFile, decisions: &[TraceReportItem]) -> Vec<App
         }
     }
     stats
+}
+
+fn app_rule_stats_from_report(
+    policy: &PolicyFile,
+    report: Vec<crate::ledger::RuleStatsReport>,
+) -> Vec<AppRuleStat> {
+    let mut stats = policy
+        .budgets
+        .iter()
+        .map(|budget| {
+            (
+                budget.id.clone(),
+                AppRuleStat {
+                    rule: budget.id.clone(),
+                    allow: 0,
+                    warn: 0,
+                    deny: 0,
+                    ask: 0,
+                    limit_hits: 0,
+                    top_reason: None,
+                    top_model: None,
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for row in report {
+        stats.insert(
+            row.rule.clone(),
+            AppRuleStat {
+                rule: row.rule,
+                allow: row.allow,
+                warn: row.warn,
+                deny: row.deny,
+                ask: row.ask,
+                limit_hits: row.limit_hits,
+                top_reason: row.top_reason,
+                top_model: row.top_model,
+            },
+        );
+    }
+    stats.into_values().collect()
 }
 
 fn app_policy_suggestions(stats: &[AppRuleStat]) -> Vec<AppSuggestion> {
@@ -1753,6 +1838,13 @@ fn replay_change_summary(request: &AuthorizeRequest) -> String {
     .join(" · ")
 }
 
+fn app_agent_run_ids_from_decisions(decisions: &[TraceReportItem]) -> Vec<String> {
+    decisions
+        .iter()
+        .filter_map(|decision| decision.agent_run_id.clone())
+        .collect()
+}
+
 fn app_run_totals_from_rows(runs: &[AppRunRow]) -> AppRunTotals {
     let mut totals = AppRunTotals {
         runs: runs.len() as u64,
@@ -1771,6 +1863,19 @@ fn app_run_totals_from_rows(runs: &[AppRunRow]) -> AppRunTotals {
         totals.tokens += run.actual_tokens.or(run.estimated_tokens).unwrap_or(0);
     }
     totals
+}
+
+fn app_run_totals_from_report(report: crate::ledger::RunTotalsReport) -> AppRunTotals {
+    AppRunTotals {
+        runs: report.runs,
+        allow: report.allow,
+        warn: report.warn,
+        deny: report.deny,
+        ask: report.ask,
+        limit_hits: report.limit_hits,
+        spend_usd: report.spend_usd,
+        tokens: report.tokens,
+    }
 }
 
 fn app_replay_baseline_totals(runs: &[AppRunRow]) -> AppRunTotals {
