@@ -819,6 +819,80 @@ function deferred() {
 	globalThis.fetch = async (url) => {
 		if (String(url).endsWith("/v1/authorize")) {
 			return Response.json({
+				decision_id: "dec_context_and_spend_warn",
+				outcome: "warn",
+				action: "warn",
+				explanations: [
+					{
+						rule_id: "personal-local.context_tokens",
+						reason: "estimated context tokens 120000 exceeds context limit max 100000",
+						severity: "warn",
+					},
+					{
+						rule_id: "personal-local.spend_window.monthly-cap",
+						reason: "projected spend $800.230526 reaches warning threshold $800.000000 for 30d window",
+						severity: "warn",
+					},
+				],
+				metadata: {
+					message_hints: [
+						{
+							kind: "context_tokens",
+							rule_id: "personal-local.context_tokens",
+							severity: "warn",
+							limit_type: "context_tokens",
+						},
+						{
+							kind: "spend_threshold",
+							rule_id: "personal-local.spend_window.monthly-cap",
+							severity: "warn",
+							limit_type: "spend",
+							window_id: "monthly-cap",
+							window_label: "30d",
+							window_mode: "tumbling",
+							window_ends_at: "2026-06-01T09:00:00.000Z",
+							threshold_percent: 80,
+						},
+					],
+				},
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext({ ui: ui.ui }));
+
+		assert.equal(ui.notifications.length, 1);
+		assert.match(ui.notifications[0].message, /Large context/);
+		assert.match(ui.notifications[0].message, /Monthly budget 80% reached/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
 				decision_id: "dec_model_block",
 				outcome: "deny",
 				action: "block",

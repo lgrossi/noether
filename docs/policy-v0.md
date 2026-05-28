@@ -102,6 +102,9 @@ The v0 evaluator is an in-memory fixed-window budget:
     `global`, `project`, `user`, `team`, `group`, `org`, `workflow`, or `surface`;
   - every spend window defines its own `window`, `mode`, `anchor`, `max_usd`,
     `warn_at_fraction`, and `action`;
+  - `warn_at_fraction` accepts either one fraction or an array such as
+    `[0.5, 0.75, 0.9, 0.95, 0.99]`; threshold warnings fire only when projected
+    spend crosses a configured threshold from below;
   - all spend windows compose with AND semantics;
   - if reporting needs one derived broad budget view, Noether uses the biggest window;
 - `limits.spend[]` supports explicit `id`, `mode`, and `anchor` for pacing and burst limits on

@@ -1195,29 +1195,27 @@ function buildShortDecisionReason(
 	decision: AuthorizeDecision,
 	attemptedModel?: AttemptedModelContext,
 ): string {
-	const hint = primaryMessageHint(decision, decisionAction(decision));
-	if (hint) {
-		return messageForHint(hint, decisionAction(decision));
+	const hinted = messagesForDecisionHints(decision, decisionAction(decision));
+	if (hinted.length > 0) {
+		return hinted.join(" ");
 	}
 	return buildUserDecisionMessage(decision, decisionAction(decision), attemptedModel);
-}
-
-function primaryMessageHint(
-	decision: AuthorizeDecision | undefined,
-	action: DecisionAction,
-): AuthorizeMessageHint | undefined {
-	const hints = messageHints(decision);
-	if (!hints.length) {
-		return undefined;
-	}
-	const wantedSeverity = action === "warn" ? "warn" : "deny";
-	return hints.find((hint) => hint.severity === wantedSeverity) || hints[0];
 }
 
 function messageHints(decision: AuthorizeDecision | undefined): AuthorizeMessageHint[] {
 	const metadata = isRecord(decision?.metadata) ? decision?.metadata : undefined;
 	const hints = Array.isArray(metadata?.message_hints) ? metadata.message_hints : [];
 	return hints.filter((hint): hint is AuthorizeMessageHint => isRecord(hint));
+}
+
+function messagesForDecisionHints(decision: AuthorizeDecision | undefined, action: DecisionAction): string[] {
+	const hints = messageHints(decision);
+	if (!hints.length) {
+		return [];
+	}
+	const wantedSeverity = action === "warn" ? "warn" : "deny";
+	const matching = hints.filter((hint) => hint.severity === wantedSeverity);
+	return uniqueStrings((matching.length > 0 ? matching : hints).map((hint) => messageForHint(hint, action)));
 }
 
 function messageForHint(hint: AuthorizeMessageHint, action: DecisionAction): string {
@@ -1392,9 +1390,9 @@ function buildUserDecisionMessage(
 	action: DecisionAction,
 	attemptedModel?: AttemptedModelContext,
 ): string {
-	const hint = primaryMessageHint(decision, action);
-	if (hint) {
-		return messageForHint(hint, action);
+	const hinted = messagesForDecisionHints(decision, action);
+	if (hinted.length > 0) {
+		return hinted.join(" ");
 	}
 	if (decisionHasReason(decision, "provider/model is not allowed")) {
 		const budgetId = decisionBudgetId(decision);

@@ -85,9 +85,10 @@ struct SpendWindowProjection {
     limit_mode: SpendWindowMode,
     window_started_at: Option<DateTime<Utc>>,
     window_ends_at: Option<DateTime<Utc>>,
+    current_spend_usd: f64,
     projected_spend_usd: f64,
     max_usd: f64,
-    warn_at_fraction: f64,
+    warn_at_fractions: Vec<f64>,
     scope_key: String,
     window_seconds: Duration,
 }
@@ -3332,8 +3333,8 @@ fn apply_budget_limits(
     for projection in spend_window_projections(ledger, rule, request, estimated_cost, now)
         .expect("selected budget has valid spend window scopes")
     {
-        let warn_threshold = projection.max_usd * projection.warn_at_fraction;
-        if projection.warn_at_fraction < 1.0 && projection.projected_spend_usd >= warn_threshold {
+        if let Some(warn_at_fraction) = newly_crossed_warn_at_fraction(&projection) {
+            let warn_threshold = projection.max_usd * warn_at_fraction;
             *action = merge_policy_action(*action, PolicyAction::Warn);
             explanations.push(DecisionExplanation {
                 rule_id: projection.rule_id.clone(),
@@ -3401,7 +3402,8 @@ fn message_hint_from_projection(
         projected_spend_usd: Some(projection.projected_spend_usd),
         max_usd: Some(projection.max_usd),
         threshold_usd,
-        threshold_percent: threshold_usd.map(|threshold| ((threshold / projection.max_usd) * 100.0).round() as u64),
+        threshold_percent: threshold_usd
+            .map(|threshold| ((threshold / projection.max_usd) * 100.0).round() as u64),
     }
 }
 
@@ -3491,14 +3493,28 @@ fn spend_window_projections(
                 limit_mode,
                 window_started_at,
                 window_ends_at,
+                current_spend_usd: current_spend,
                 projected_spend_usd: current_spend + estimated_cost,
                 max_usd: limit.max_usd,
-                warn_at_fraction: limit.warn_at_fraction,
+                warn_at_fractions: limit.warn_at_fractions.clone(),
                 scope_key,
                 window_seconds,
             })
         })
         .collect()
+}
+
+fn newly_crossed_warn_at_fraction(projection: &SpendWindowProjection) -> Option<f64> {
+    projection
+        .warn_at_fractions
+        .iter()
+        .copied()
+        .filter(|warn_at_fraction| *warn_at_fraction < 1.0)
+        .filter(|warn_at_fraction| {
+            let threshold = projection.max_usd * *warn_at_fraction;
+            projection.current_spend_usd < threshold && projection.projected_spend_usd >= threshold
+        })
+        .max_by(|left, right| left.total_cmp(right))
 }
 
 fn biggest_spend_window_projection(
@@ -4450,7 +4466,7 @@ mod tests {
                             kind: WindowAnchorKind::FirstSeen,
                         }),
                         max_usd: limit_usd,
-                        warn_at_fraction,
+                        warn_at_fractions: vec![warn_at_fraction],
                         action: PolicyAction::Block,
                     }],
                     tool_calls: None,
@@ -4521,7 +4537,7 @@ mod tests {
                             kind: WindowAnchorKind::FirstSeen,
                         }),
                         max_usd: 2000.0,
-                        warn_at_fraction: 1.0,
+                        warn_at_fractions: vec![1.0],
                         action: PolicyAction::Block,
                     }],
                     tool_calls: None,
@@ -4570,6 +4586,53 @@ mod tests {
             explanation.rule_id == "dev-budget.spend_window.budget-cap"
                 && explanation.severity == DecisionSeverity::Warn
         }));
+    }
+
+    #[test]
+    fn budget_evaluator_warns_only_when_crossing_threshold() {
+        let policy = policy(1.0, 0.5);
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request(0.50));
+        let second = ledger.authorize(Some(&policy), &request(0.10));
+
+        assert_eq!(first.outcome, DecisionOutcome::Warn);
+        assert_eq!(second.outcome, DecisionOutcome::Allow);
+    }
+
+    #[test]
+    fn budget_evaluator_warns_at_each_configured_threshold_once() {
+        let mut policy = policy(1.0, 1.0);
+        policy.budgets[0].limits.spend[0].warn_at_fractions = vec![0.5, 0.75, 0.9];
+        let mut ledger = BudgetLedger::default();
+
+        let fifty = ledger.authorize(Some(&policy), &request(0.50));
+        let no_new_threshold = ledger.authorize(Some(&policy), &request(0.10));
+        let seventy_five = ledger.authorize(Some(&policy), &request(0.20));
+        let ninety = ledger.authorize(Some(&policy), &request(0.11));
+
+        assert_eq!(fifty.outcome, DecisionOutcome::Warn);
+        assert_eq!(no_new_threshold.outcome, DecisionOutcome::Allow);
+        assert_eq!(seventy_five.outcome, DecisionOutcome::Warn);
+        assert_eq!(ninety.outcome, DecisionOutcome::Warn);
+        assert!(
+            fifty
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.to_string().contains("\"threshold_percent\":50"))
+        );
+        assert!(
+            seventy_five
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.to_string().contains("\"threshold_percent\":75"))
+        );
+        assert!(
+            ninety
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.to_string().contains("\"threshold_percent\":90"))
+        );
     }
 
     #[test]
@@ -4761,7 +4824,7 @@ mod tests {
                 mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Warn,
             }],
             tool_calls: None,
@@ -4796,7 +4859,7 @@ mod tests {
                 mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -4833,7 +4896,7 @@ mod tests {
                 mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -4988,7 +5051,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Warn,
             }],
             tool_calls: None,
@@ -5025,7 +5088,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -5062,7 +5125,7 @@ mod tests {
                         kind: WindowAnchorKind::FirstSeen,
                     }),
                     max_usd: 10.0,
-                    warn_at_fraction: 1.0,
+                    warn_at_fractions: vec![1.0],
                     action: PolicyAction::Warn,
                 },
                 SpendWindowLimit {
@@ -5072,7 +5135,7 @@ mod tests {
                     mode: Some(SpendWindowMode::Rolling),
                     anchor: None,
                     max_usd: 10.0,
-                    warn_at_fraction: 1.0,
+                    warn_at_fractions: vec![1.0],
                     action: PolicyAction::Warn,
                 },
             ],
@@ -5113,7 +5176,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -5536,7 +5599,7 @@ mod tests {
                     kind: WindowAnchorKind::FirstSeen,
                 }),
                 max_usd: 10.0,
-                warn_at_fraction: 1.0,
+                warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
             }],
             tool_calls: None,
@@ -5980,7 +6043,7 @@ mod tests {
                         kind: WindowAnchorKind::FirstSeen,
                     }),
                     max_usd: limit_usd,
-                    warn_at_fraction: 1.0,
+                    warn_at_fractions: vec![1.0],
                     action: PolicyAction::Block,
                 }],
                 tool_calls: None,

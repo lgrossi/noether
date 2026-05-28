@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -292,10 +292,13 @@ pub struct SpendWindowLimit {
     pub anchor: Option<WindowAnchorPolicy>,
     pub max_usd: f64,
     #[serde(
-        default = "default_limit_warn_at_fraction",
-        skip_serializing_if = "is_default_limit_warn_at_fraction"
+        default = "default_limit_warn_at_fractions",
+        deserialize_with = "deserialize_warn_at_fractions",
+        rename = "warn_at_fraction",
+        serialize_with = "serialize_warn_at_fractions",
+        skip_serializing_if = "is_default_limit_warn_at_fractions"
     )]
-    pub warn_at_fraction: f64,
+    pub warn_at_fractions: Vec<f64>,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
 }
@@ -451,12 +454,50 @@ fn default_limit_action() -> PolicyAction {
     PolicyAction::Block
 }
 
-fn default_limit_warn_at_fraction() -> f64 {
-    1.0
+fn default_limit_warn_at_fractions() -> Vec<f64> {
+    vec![1.0]
 }
 
-fn is_default_limit_warn_at_fraction(value: &f64) -> bool {
-    (*value - default_limit_warn_at_fraction()).abs() < f64::EPSILON
+fn is_default_limit_warn_at_fractions(value: &[f64]) -> bool {
+    value.len() == 1 && (value[0] - 1.0).abs() < f64::EPSILON
+}
+
+fn deserialize_warn_at_fractions<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .map(|value| vec![value])
+            .ok_or_else(|| serde::de::Error::custom("warn_at_fraction must be a number or array")),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::Number(number) => number.as_f64().ok_or_else(|| {
+                    serde::de::Error::custom("warn_at_fraction entries must be numbers")
+                }),
+                _ => Err(serde::de::Error::custom(
+                    "warn_at_fraction entries must be numbers",
+                )),
+            })
+            .collect(),
+        _ => Err(serde::de::Error::custom(
+            "warn_at_fraction must be a number or array",
+        )),
+    }
+}
+
+fn serialize_warn_at_fractions<S>(value: &[f64], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let [single] = value {
+        serializer.serialize_f64(*single)
+    } else {
+        value.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
@@ -566,7 +607,7 @@ limits:
                 kind: WindowAnchorKind::FirstSeen,
             })
         );
-        assert_eq!(rule.limits.spend[0].warn_at_fraction, 0.8);
+        assert_eq!(rule.limits.spend[0].warn_at_fractions, vec![0.8]);
 
         let encoded = serde_yaml::to_string(&rule).expect("explicit rule serializes");
         let decoded: BudgetRule = serde_yaml::from_str(&encoded).expect("explicit rule re-parses");
@@ -574,6 +615,38 @@ limits:
             decoded.limits.spend[0].mode,
             Some(SpendWindowMode::Tumbling)
         );
-        assert_eq!(decoded.limits.spend[0].warn_at_fraction, 0.8);
+        assert_eq!(decoded.limits.spend[0].warn_at_fractions, vec![0.8]);
+    }
+
+    #[test]
+    fn spend_window_warn_at_fraction_accepts_threshold_array() {
+        let rule: BudgetRule = serde_yaml::from_str(
+            r#"
+id: explicit-budget
+limits:
+  spend:
+    - id: monthly-cap
+      window: 30d
+      mode: tumbling
+      anchor:
+        kind: first_seen
+      max_usd: 10
+      warn_at_fraction: [0.5, 0.75, 0.9, 0.95, 0.99]
+      action: block
+"#,
+        )
+        .expect("explicit rule parses");
+
+        assert_eq!(
+            rule.limits.spend[0].warn_at_fractions,
+            vec![0.5, 0.75, 0.9, 0.95, 0.99]
+        );
+
+        let encoded = serde_yaml::to_string(&rule).expect("explicit rule serializes");
+        let decoded: BudgetRule = serde_yaml::from_str(&encoded).expect("explicit rule re-parses");
+        assert_eq!(
+            decoded.limits.spend[0].warn_at_fractions,
+            vec![0.5, 0.75, 0.9, 0.95, 0.99]
+        );
     }
 }

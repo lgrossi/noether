@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionSeverity, PolicyAction, PolicyRule,
-    RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode,
+    AuthorizeRequest, BudgetRule, DecisionExplanation, PolicyAction, PolicyRule, RuleMatch,
+    SpendWindowBy, SpendWindowLimit, SpendWindowMode,
 };
 use crate::error::NoetError;
 
@@ -150,11 +150,19 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                     budget.id
                 ));
             }
-            if !(0.0..=1.0).contains(&limit.warn_at_fraction) {
+            if limit.warn_at_fractions.is_empty() {
                 errors.push(format!(
-                    "budget {} limits.spend.warn_at_fraction must be between 0 and 1",
+                    "budget {} limits.spend.warn_at_fraction must include at least one threshold",
                     budget.id
                 ));
+            }
+            for warn_at_fraction in &limit.warn_at_fractions {
+                if !(0.0..=1.0).contains(warn_at_fraction) {
+                    errors.push(format!(
+                        "budget {} limits.spend.warn_at_fraction must be between 0 and 1",
+                        budget.id
+                    ));
+                }
             }
             if !limit_action_is_supported(limit.action) {
                 errors.push(format!(
