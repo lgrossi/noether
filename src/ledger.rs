@@ -3664,22 +3664,49 @@ fn recent_spend_usd(
     if let Some(conn) = &ledger.conn {
         let bucket_since = rolling_bucket_start(since);
         let bucket_now = rolling_bucket_start(now);
+        if bucket_since == bucket_now {
+            return exact_recent_spend_usd(conn, rule_id, limit_id, scope_key, since, now);
+        }
+        let first_full_bucket = bucket_since + Duration::minutes(1);
         let value = conn.query_row(
             "
-            SELECT COALESCE(SUM(amount_usd), 0)
-            FROM rolling_spend_buckets
-            WHERE rule_id = ?1
-              AND limit_id = ?2
-              AND scope_key = ?3
-              AND bucket_start >= ?4
-              AND bucket_start <= ?5
+            SELECT
+                COALESCE((
+                    SELECT SUM(amount_usd)
+                    FROM rolling_spend_buckets
+                    WHERE rule_id = ?1
+                      AND limit_id = ?2
+                      AND scope_key = ?3
+                      AND bucket_start >= ?4
+                      AND bucket_start < ?5
+                ), 0)
+                + COALESCE((
+                    SELECT SUM(amount_usd)
+                    FROM reservation_limit_scopes
+                    WHERE rule_id = ?1
+                      AND limit_id = ?2
+                      AND scope_key = ?3
+                      AND created_at >= ?6
+                      AND created_at < ?4
+                ), 0)
+                + COALESCE((
+                    SELECT SUM(amount_usd)
+                    FROM reservation_limit_scopes
+                    WHERE rule_id = ?1
+                      AND limit_id = ?2
+                      AND scope_key = ?3
+                      AND created_at >= ?5
+                      AND created_at <= ?7
+                ), 0)
             ",
             params![
                 rule_id,
                 limit_id,
                 scope_key,
-                bucket_since.to_rfc3339(),
-                bucket_now.to_rfc3339()
+                first_full_bucket.to_rfc3339(),
+                bucket_now.to_rfc3339(),
+                since.to_rfc3339(),
+                now.to_rfc3339()
             ],
             |row| row.get::<_, f64>(0),
         );
@@ -3699,6 +3726,36 @@ fn recent_spend_usd(
         })
         .map(|stored| stored.reservation.amount_usd)
         .sum()
+}
+
+fn exact_recent_spend_usd(
+    conn: &Connection,
+    rule_id: &str,
+    limit_id: &str,
+    scope_key: &str,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> f64 {
+    conn.query_row(
+        "
+        SELECT COALESCE(SUM(amount_usd), 0)
+        FROM reservation_limit_scopes
+        WHERE rule_id = ?1
+          AND limit_id = ?2
+          AND scope_key = ?3
+          AND created_at >= ?4
+          AND created_at <= ?5
+        ",
+        params![
+            rule_id,
+            limit_id,
+            scope_key,
+            since.to_rfc3339(),
+            now.to_rfc3339()
+        ],
+        |row| row.get::<_, f64>(0),
+    )
+    .unwrap_or(0.0)
 }
 
 fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
@@ -4744,6 +4801,97 @@ mod tests {
             )
             .expect("rolling bucket amount");
         assert_eq!(bucket_amount, 6.0);
+    }
+
+    #[test]
+    fn sqlite_rolling_spend_uses_exact_window_edges() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("rolling-edges.sqlite");
+        let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let rule_id = "dev-budget";
+        let limit_id = "rolling";
+        let scope_key = "project:noether";
+        let now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 30).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 30).unwrap();
+        let out_of_window = Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, 10).unwrap();
+        let middle = Utc.with_ymd_and_hms(2026, 5, 28, 12, 1, 0).unwrap();
+        let edge_now = Utc.with_ymd_and_hms(2026, 5, 28, 12, 10, 20).unwrap();
+
+        for (reservation_id, amount, created_at) in [
+            ("outside", 9.0, out_of_window),
+            ("middle", 1.0, middle),
+            ("edge-now", 2.0, edge_now),
+        ] {
+            let decision_id = format!("{reservation_id}-decision");
+            conn.execute(
+                "
+                INSERT INTO decisions (
+                    decision_id, outcome, action, explanations_json, metadata_json,
+                    entities_json, created_at
+                ) VALUES (?1, 'allow', 'allow', '[]', '{}', '[]', ?2)
+                ",
+                params![decision_id.as_str(), created_at.to_rfc3339()],
+            )
+            .expect("insert decision row");
+            conn.execute(
+                "
+                INSERT INTO reservations (
+                    id, decision_id, amount_usd, estimated_amount_usd, currency, status,
+                    created_at, expires_at
+                ) VALUES (?1, ?2, ?3, ?3, 'USD', 'active', ?4, ?4)
+                ",
+                params![
+                    reservation_id,
+                    decision_id.as_str(),
+                    amount,
+                    created_at.to_rfc3339()
+                ],
+            )
+            .expect("insert reservation row");
+            conn.execute(
+                "
+                INSERT INTO reservation_limit_scopes (
+                    reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    reservation_id,
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    amount,
+                    created_at.to_rfc3339()
+                ],
+            )
+            .expect("insert scope row");
+        }
+
+        for (bucket_start, amount) in [
+            (rolling_bucket_start(out_of_window), 9.0),
+            (rolling_bucket_start(middle), 1.0),
+            (rolling_bucket_start(edge_now), 2.0),
+        ] {
+            conn.execute(
+                "
+                INSERT INTO rolling_spend_buckets (
+                    rule_id, limit_id, scope_key, bucket_start, amount_usd
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    bucket_start.to_rfc3339(),
+                    amount
+                ],
+            )
+            .expect("insert rolling bucket");
+        }
+
+        let spend = recent_spend_usd(&ledger, rule_id, limit_id, scope_key, since, now);
+
+        assert_eq!(spend, 3.0);
     }
 
     #[test]
