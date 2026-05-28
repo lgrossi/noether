@@ -1904,6 +1904,22 @@ impl BudgetLedger {
                         reservation.created_at.to_rfc3339()
                     ],
                 )?;
+                conn.execute(
+                    "
+                    INSERT INTO rolling_spend_buckets (
+                        rule_id, limit_id, scope_key, bucket_start, amount_usd
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
+                        amount_usd = amount_usd + excluded.amount_usd
+                    ",
+                    params![
+                        spend.rule_id.as_str(),
+                        spend.limit_id.as_str(),
+                        spend.scope_key.as_str(),
+                        rolling_bucket_start(reservation.created_at).to_rfc3339(),
+                        reservation.amount_usd
+                    ],
+                )?;
             }
         }
         Ok(())
@@ -2434,6 +2450,15 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         CREATE INDEX IF NOT EXISTS idx_decisions_created_decision
             ON decisions(created_at, decision_id);
 
+        CREATE TABLE IF NOT EXISTS rolling_spend_buckets (
+            rule_id TEXT NOT NULL,
+            limit_id TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            amount_usd REAL NOT NULL,
+            PRIMARY KEY (rule_id, limit_id, scope_key, bucket_start)
+        );
+
         CREATE TABLE IF NOT EXISTS usage_observations (
             id TEXT PRIMARY KEY,
             reservation_id TEXT REFERENCES reservations(id),
@@ -2599,6 +2624,7 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_rolling ON reservation_limit_scopes(rule_id, limit_id, scope_key, created_at)",
         [],
     )?;
+    backfill_rolling_spend_buckets(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reservations_decision ON reservations(decision_id)",
         [],
@@ -2625,6 +2651,30 @@ fn backfill_reservation_limit_scope_rollups(conn: &Connection) -> Result<(), Noe
                 WHERE r.id = reservation_limit_scopes.reservation_id
             )
         WHERE created_at IS NULL OR amount_usd = 0
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+fn backfill_rolling_spend_buckets(conn: &Connection) -> Result<(), NoetError> {
+    let existing = conn.query_row("SELECT COUNT(*) FROM rolling_spend_buckets", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    if existing > 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "
+        INSERT INTO rolling_spend_buckets (rule_id, limit_id, scope_key, bucket_start, amount_usd)
+        SELECT rule_id,
+               limit_id,
+               scope_key,
+               strftime('%Y-%m-%dT%H:%M:00+00:00', created_at),
+               COALESCE(SUM(amount_usd), 0)
+        FROM reservation_limit_scopes
+        WHERE created_at IS NOT NULL
+        GROUP BY rule_id, limit_id, scope_key, strftime('%Y-%m-%dT%H:%M:00+00:00', created_at)
         ",
         [],
     )?;
@@ -3612,22 +3662,24 @@ fn recent_spend_usd(
     now: DateTime<Utc>,
 ) -> f64 {
     if let Some(conn) = &ledger.conn {
+        let bucket_since = rolling_bucket_start(since);
+        let bucket_now = rolling_bucket_start(now);
         let value = conn.query_row(
             "
             SELECT COALESCE(SUM(amount_usd), 0)
-            FROM reservation_limit_scopes
+            FROM rolling_spend_buckets
             WHERE rule_id = ?1
               AND limit_id = ?2
               AND scope_key = ?3
-              AND created_at >= ?4
-              AND created_at <= ?5
+              AND bucket_start >= ?4
+              AND bucket_start <= ?5
             ",
             params![
                 rule_id,
                 limit_id,
                 scope_key,
-                since.to_rfc3339(),
-                now.to_rfc3339()
+                bucket_since.to_rfc3339(),
+                bucket_now.to_rfc3339()
             ],
             |row| row.get::<_, f64>(0),
         );
@@ -3647,6 +3699,12 @@ fn recent_spend_usd(
         })
         .map(|stored| stored.reservation.amount_usd)
         .sum()
+}
+
+fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
+    let timestamp = at.timestamp();
+    DateTime::from_timestamp(timestamp - timestamp.rem_euclid(60), 0)
+        .expect("valid rolling bucket timestamp")
 }
 
 fn matched_entity_and_rank(
@@ -4672,6 +4730,20 @@ mod tests {
             .expect("scope rollup row");
         assert_eq!(row.0, 6.0);
         assert!(row.1.is_some());
+        let bucket_amount = conn
+            .query_row(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = 'dev-budget'
+                  AND limit_id = 'rolling'
+                  AND scope_key = 'project:noether'
+                ",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("rolling bucket amount");
+        assert_eq!(bucket_amount, 6.0);
     }
 
     #[test]
