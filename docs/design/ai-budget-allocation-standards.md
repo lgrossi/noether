@@ -242,7 +242,7 @@ budgets:
         cap_usd: 50
     limits:
       spend:
-        - window: 5h
+        - window: 5m
           max_usd: 10
         - window: 7d
           max_usd: 75

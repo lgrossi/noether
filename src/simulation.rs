@@ -1117,7 +1117,7 @@ strategies:
             guarded
                 .policy_moves
                 .iter()
-                .any(|entry| entry.contains("bursts above $1.20 in 5h"))
+                .any(|entry| entry.contains("bursts above $1.20 in 5m"))
         );
         assert!(guarded.denied_requests > pooled.denied_requests);
         assert!(guarded.total_cost_usd < pooled.total_cost_usd);

@@ -374,8 +374,8 @@ budgets:
           max_usd: 500
           warn_at_fraction: 0.58
           action: block
-        - id: burst-12h
-          window: 12h
+        - id: spike-15m
+          window: 15m
           mode: rolling
           max_usd: 32
           action: warn

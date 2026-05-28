@@ -24,9 +24,9 @@ policy:
               kind: first_seen
             max_usd: 100
             action: block
-          - id: burst-5h
+          - id: spike-5m
             by: user
-            window: 5h
+            window: 5m
             mode: rolling
             max_usd: 40
             action: block
@@ -45,8 +45,8 @@ requests:
       model: gpt-4.1
       estimated_cost_usd: 15
     denial:
-      rule_id: personal-primary.spend_window.burst-5h
-      reason_contains: enforced 5h limit
+      rule_id: personal-primary.spend_window.spike-5m
+      reason_contains: enforced 5m limit
   - id: req-3
     authorize:
       project: noether
@@ -64,7 +64,7 @@ assertions:
     request_id: req-2
   - kind: limit_hit
     request_id: req-2
-    rule_id: personal-primary.spend_window.burst-5h
+    rule_id: personal-primary.spend_window.spike-5m
   - kind: denied
     request_id: req-3
   - kind: limit_hit

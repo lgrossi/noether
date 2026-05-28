@@ -10,7 +10,8 @@ use crate::contract::{
 };
 use crate::error::NoetError;
 
-const MAX_ROLLING_SPEND_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const MAX_ROLLING_SPEND_WINDOW_SECONDS: i64 = 60 * 60;
+const MIN_ROLLING_SPEND_WINDOW_SECONDS: i64 = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PolicyFile {
@@ -128,11 +129,14 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 ));
             }
             if matches!(limit.mode, Some(SpendWindowMode::Rolling))
-                && parsed_window
-                    .is_some_and(|window| window.num_seconds() > MAX_ROLLING_SPEND_WINDOW_SECONDS)
+                && parsed_window.is_some_and(|window| {
+                    let seconds = window.num_seconds();
+                    !(MIN_ROLLING_SPEND_WINDOW_SECONDS..=MAX_ROLLING_SPEND_WINDOW_SECONDS)
+                        .contains(&seconds)
+                })
             {
                 errors.push(format!(
-                    "budget {} limits.spend[{}].window must be <= 24h when mode is rolling",
+                    "budget {} limits.spend[{}].window must be between 10s and 1h when mode is rolling",
                     budget.id,
                     spend_window_label(limit)
                 ));
@@ -557,8 +561,8 @@ budgets:
           max_usd: 1.0
           warn_at_fraction: 0.5
           action: block
-        - id: burst-5h
-          window: 5h
+        - id: spike-5m
+          window: 5m
           mode: rolling
           max_usd: 10
           action: warn
@@ -674,7 +678,7 @@ budgets:
     limits:
       spend:
         - id: rolling-with-anchor
-          window: 5h
+          window: 5m
           mode: rolling
           anchor:
             kind: first_seen
@@ -721,7 +725,7 @@ budgets:
           max_usd: 1
           action: warn
         - id: daily-cap
-          window: 5h
+          window: 5m
           mode: rolling
           max_usd: 2
           action: block
@@ -736,7 +740,7 @@ budgets:
     }
 
     #[test]
-    fn rejects_rolling_spend_windows_over_24h() {
+    fn rejects_rolling_spend_windows_outside_spike_guard_range() {
         let policy: PolicyFile = serde_yaml::from_str(
             r#"
 version: 0
@@ -744,6 +748,11 @@ budgets:
   - id: long-rolling
     limits:
       spend:
+        - id: too-short
+          window: 5s
+          mode: rolling
+          max_usd: 1
+          action: warn
         - id: weekly-burn
           window: 7d
           mode: rolling
@@ -754,8 +763,12 @@ budgets:
         .expect("policy parses");
 
         let error = validate_policy(&policy).expect_err("long rolling window should be invalid");
-        assert!(error.to_string().contains(
-            "budget long-rolling limits.spend[weekly-burn].window must be <= 24h when mode is rolling"
+        let message = error.to_string();
+        assert!(message.contains(
+            "budget long-rolling limits.spend[too-short].window must be between 10s and 1h when mode is rolling"
+        ));
+        assert!(message.contains(
+            "budget long-rolling limits.spend[weekly-burn].window must be between 10s and 1h when mode is rolling"
         ));
     }
 

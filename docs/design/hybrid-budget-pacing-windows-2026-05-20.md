@@ -47,8 +47,8 @@ budgets:
             kind: first_seen
           max_usd: 100
           action: block
-        - id: burst-5h
-          window: 5h
+        - id: spike-5m
+          window: 5m
           mode: rolling
           max_usd: 40
           action: block

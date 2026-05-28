@@ -47,9 +47,9 @@ budgets:
           max_usd: 1.00
           warn_at_fraction: 0.8
           action: block
-        - id: burst-5h
+        - id: spike-5m
           by: project
-          window: 5h
+          window: 5m
           mode: rolling
           max_usd: 40
           action: block
@@ -107,7 +107,7 @@ The v0 evaluator is an in-memory fixed-window budget:
 - `limits.spend[]` supports explicit `id`, `mode`, and `anchor` for pacing and burst limits on
   the same budget:
   - `mode: tumbling` uses persisted bucket state and requires `anchor.kind: first_seen`;
-  - `mode: rolling` keeps trailing recent-spend behavior and must omit `anchor`;
+  - `mode: rolling` keeps trailing recent-spend behavior for 10s-1h spike guards and must omit `anchor`;
 - spend-window ids must be unique within one budget so report output can distinguish, for example,
   a `1d tumbling` pacing limit from a `1d rolling` burst limit;
 - if a request does not include `estimated_tokens`, `limits.context_tokens` does not fire and the
@@ -133,4 +133,4 @@ that demonstrates:
 
 - a `30d` tumbling spend cap;
 - a `1d` tumbling pacing limit deny;
-- a `5h` rolling burst limit deny.
+- a `5m` rolling spike-guard limit deny.

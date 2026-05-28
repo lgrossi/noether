@@ -339,7 +339,7 @@ Use both a rolling burst cap and a daily cap:
 ```yaml
 limits:
   spend:
-    - window: 5h
+    - window: 5m
       max_usd: 40
       action: block
     - window: 1d
@@ -419,9 +419,9 @@ budgets:
             kind: first_seen
           max_usd: 100
           action: block
-        - id: burst-5h
+        - id: spike-5m
           by: user
-          window: 5h
+          window: 5m
           mode: rolling
           max_usd: 40
           action: block
@@ -439,7 +439,7 @@ cargo run --bin noet -- scenario run examples/scenarios/hybrid-budget-pacing-win
 That scenario shows:
 
 - one request allowed normally
-- one request blocked by a 5-hour burst window
+- one request blocked by a 5-minute spike guard
 - one request blocked by a daily cap
 
 It writes a local ledger, reports, traces, and a dashboard under:

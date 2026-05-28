@@ -4632,7 +4632,7 @@ mod tests {
             spend: vec![SpendWindowLimit {
                 by: SpendWindowBy::Project,
                 id: None,
-                window: "5h".to_owned(),
+                window: "5m".to_owned(),
                 mode: Some(SpendWindowMode::Rolling),
                 anchor: None,
                 max_usd: 10.0,
@@ -4651,9 +4651,9 @@ mod tests {
         assert_eq!(first.outcome, DecisionOutcome::Allow);
         assert_eq!(second.outcome, DecisionOutcome::Warn);
         assert!(second.explanations.iter().any(|explanation| {
-            explanation.rule_id == "dev-budget.spend_window.5h"
+            explanation.rule_id == "dev-budget.spend_window.5m"
                 && explanation.reason
-                    == "projected spend $11.000000 exceeds 5h limit max $10.000000"
+                    == "projected spend $11.000000 exceeds 5m limit max $10.000000"
                 && explanation.severity == DecisionSeverity::Warn
         }));
     }
