@@ -199,6 +199,23 @@ pub struct HistoricalAuthorizeRequest {
     pub request: AuthorizeRequest,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplaySpendSeed {
+    pub rule_id: String,
+    pub limit_id: String,
+    pub scope_key: String,
+    pub amount_usd: f64,
+    pub mode: SpendWindowMode,
+    pub seeded_at: DateTime<Utc>,
+    pub window_started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpendScopeTotal {
+    pub scope_key: String,
+    pub amount_usd: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProtectedAdoptionReport {
     pub unused_protected_opportunity_usd: f64,
@@ -441,6 +458,54 @@ impl BudgetLedger {
             explanations,
             created_at: now,
         })
+    }
+
+    pub fn seed_replay_spend(&mut self, seed: ReplaySpendSeed) {
+        if seed.amount_usd <= 0.0 {
+            return;
+        }
+        match seed.mode {
+            SpendWindowMode::Tumbling => {
+                let key = (seed.rule_id, seed.limit_id, seed.scope_key);
+                let entry = self.limit_windows.entry(key).or_insert(WindowState {
+                    started_at: seed.window_started_at,
+                    used_usd: 0.0,
+                });
+                entry.started_at = seed.window_started_at;
+                entry.used_usd += seed.amount_usd;
+            }
+            SpendWindowMode::Rolling => {
+                let id = format!(
+                    "replay-seed-{}-{}-{}-{}",
+                    seed.rule_id,
+                    seed.limit_id,
+                    seed.scope_key,
+                    self.reservations.len() + 1
+                );
+                self.reservations.insert(
+                    id.clone(),
+                    StoredReservation {
+                        reservation: Reservation {
+                            id,
+                            amount_usd: seed.amount_usd,
+                            currency: "USD".to_owned(),
+                            status: ReservationStatus::Finalized,
+                            created_at: seed.seeded_at,
+                            expires_at: seed.seeded_at,
+                        },
+                        estimated_cost_usd: seed.amount_usd,
+                        budget_rule_ids: vec![seed.rule_id.clone()],
+                        limit_window_spends: vec![LimitWindowReservationSpend {
+                            rule_id: seed.rule_id,
+                            limit_id: seed.limit_id,
+                            scope_key: seed.scope_key,
+                        }],
+                        allocation_spends: Vec::new(),
+                        matched_entity: None,
+                    },
+                );
+            }
+        }
     }
 
     pub fn finalize(
@@ -956,6 +1021,41 @@ impl BudgetLedger {
             .collect::<Result<_, _>>()
         };
         rows.map_err(NoetError::from)
+    }
+
+    pub fn spend_scope_totals(
+        &self,
+        rule_id: &str,
+        limit_id: &str,
+        since: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<SpendScopeTotal>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT scope_key, COALESCE(SUM(amount_usd), 0)
+            FROM reservation_limit_scopes
+            WHERE rule_id = ?1
+              AND limit_id = ?2
+              AND created_at >= ?3
+              AND created_at < ?4
+            GROUP BY scope_key
+            HAVING COALESCE(SUM(amount_usd), 0) > 0
+            ",
+        )?;
+        stmt.query_map(
+            params![rule_id, limit_id, since.to_rfc3339(), before.to_rfc3339()],
+            |row| {
+                Ok(SpendScopeTotal {
+                    scope_key: row.get(0)?,
+                    amount_usd: row.get(1)?,
+                })
+            },
+        )?
+        .collect::<Result<_, _>>()
+        .map_err(NoetError::from)
     }
 
     pub fn usage_activity_report(&self) -> Result<Vec<UsageActivityRecord>, NoetError> {

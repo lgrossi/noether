@@ -25,10 +25,10 @@ use uuid::Uuid;
 use crate::capture::capture;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, DecisionMode, DecisionOutcome, FinalizeReservation,
-    Reservation, TraceEvent,
+    Reservation, SpendWindowMode, TraceEvent,
 };
 use crate::error::NoetError;
-use crate::ledger::{BudgetLedger, TraceReportItem};
+use crate::ledger::{BudgetLedger, ReplaySpendSeed, TraceReportItem};
 use crate::noether_app;
 use crate::openapi;
 use crate::policy::PolicyFile;
@@ -262,6 +262,7 @@ struct AppReplayScope {
     changed_runs_returned: usize,
     changed_runs_total: usize,
     full_replay_available: bool,
+    window_seeded: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1113,18 +1114,26 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         history_window_end - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
     let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
     let has_proposed_policy = proposal.is_some();
+    let proposed_policy = proposal
+        .as_ref()
+        .map(|proposal| crate::policy::parse_policy_bytes(proposal.source.as_bytes()))
+        .transpose()?;
     let active_source = state
         .active_policy_source()
         .await
         .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
         .transpose()?
         .unwrap_or_default();
-    let ledger = state.ledger.lock().await;
     if !has_proposed_policy {
+        let baseline = state
+            .read_ledger(|ledger| {
+                Ok(app_run_totals_from_report(
+                    ledger.run_totals_report_since(Some(history_window_start))?,
+                ))
+            })
+            .await?;
         return Ok(Json(AppReplayResponse {
-            baseline: app_run_totals_from_report(
-                ledger.run_totals_report_since(Some(history_window_start))?,
-            ),
+            baseline,
             has_proposed_policy,
             message: "No proposed policy has been saved for replay yet. Edit Policy first to create a local draft without enforcing it.".to_owned(),
             history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
@@ -1133,29 +1142,41 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
             proposal: None,
         }));
     }
-    let (total_requests, historical_requests, usage_by_agent_run, baseline) = {
-        let total_requests =
-            ledger.historical_authorize_request_count_since(Some(history_window_start))?;
-        let historical_requests = ledger.latest_historical_authorize_requests_since(
-            Some(history_window_start),
-            APP_REPLAY_PREVIEW_REQUEST_CAP,
-        )?;
-        let agent_run_ids = historical_requests
-            .iter()
-            .filter_map(|request| string_metadata_value(&request.request, "agent_run_id"))
-            .collect::<Vec<_>>();
-        let usage_by_agent_run =
-            app_usage_by_agent_run(&ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?);
-        let baseline =
-            app_run_totals_from_report(ledger.run_totals_report_since(Some(history_window_start))?);
-        (
-            total_requests,
-            historical_requests,
-            usage_by_agent_run,
-            baseline,
-        )
-    };
-    drop(ledger);
+    let (total_requests, historical_requests, usage_by_agent_run, baseline, spend_seeds) = state
+        .read_ledger(|ledger| {
+            let total_requests =
+                ledger.historical_authorize_request_count_since(Some(history_window_start))?;
+            let historical_requests = ledger.latest_historical_authorize_requests_since(
+                Some(history_window_start),
+                APP_REPLAY_PREVIEW_REQUEST_CAP,
+            )?;
+            let spend_seeds = historical_requests
+                .first()
+                .zip(proposed_policy.as_ref())
+                .map(|(first, policy)| {
+                    app_replay_spend_seeds(ledger, policy, history_window_start, first.occurred_at)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let agent_run_ids = historical_requests
+                .iter()
+                .filter_map(|request| string_metadata_value(&request.request, "agent_run_id"))
+                .collect::<Vec<_>>();
+            let usage_by_agent_run = app_usage_by_agent_run(
+                &ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?,
+            );
+            let baseline = app_run_totals_from_report(
+                ledger.run_totals_report_since(Some(history_window_start))?,
+            );
+            Ok((
+                total_requests,
+                historical_requests,
+                usage_by_agent_run,
+                baseline,
+                spend_seeds,
+            ))
+        })
+        .await?;
     let replay_proposal = proposal
         .as_ref()
         .map(|proposal| {
@@ -1164,12 +1185,14 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
                 proposal,
                 &historical_requests,
                 &usage_by_agent_run,
+                &spend_seeds,
                 ReplayScopeOptions {
                     mode: "preview".to_owned(),
                     request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
                     total_requests_in_window: total_requests,
                     full_replay_available: total_requests > historical_requests.len(),
                     changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+                    window_seeded: !spend_seeds.is_empty(),
                 },
             )
         })
@@ -1284,35 +1307,39 @@ async fn app_replay_full_month_response(state: AppState) -> Result<AppReplayResp
         .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
         .transpose()?
         .unwrap_or_default();
-    let (total_requests, historical_requests, usage_by_agent_run, baseline) = {
-        let ledger = state.ledger.lock().await;
-        let total_requests =
-            ledger.historical_authorize_request_count_since(Some(history_window_start))?;
-        let historical_requests =
-            ledger.historical_authorize_requests_since(Some(history_window_start))?;
-        let usage_by_agent_run = app_usage_by_agent_run(
-            &ledger.usage_activity_report_since(Some(history_window_start))?,
-        );
-        let baseline =
-            app_run_totals_from_report(ledger.run_totals_report_since(Some(history_window_start))?);
-        (
-            total_requests,
-            historical_requests,
-            usage_by_agent_run,
-            baseline,
-        )
-    };
+    let (total_requests, historical_requests, usage_by_agent_run, baseline) = state
+        .read_ledger(|ledger| {
+            let total_requests =
+                ledger.historical_authorize_request_count_since(Some(history_window_start))?;
+            let historical_requests =
+                ledger.historical_authorize_requests_since(Some(history_window_start))?;
+            let usage_by_agent_run = app_usage_by_agent_run(
+                &ledger.usage_activity_report_since(Some(history_window_start))?,
+            );
+            let baseline = app_run_totals_from_report(
+                ledger.run_totals_report_since(Some(history_window_start))?,
+            );
+            Ok((
+                total_requests,
+                historical_requests,
+                usage_by_agent_run,
+                baseline,
+            ))
+        })
+        .await?;
     let proposal = app_replay_proposal(
         &active_source,
         &proposal,
         &historical_requests,
         &usage_by_agent_run,
+        &[],
         ReplayScopeOptions {
             mode: "full_month".to_owned(),
             request_cap: None,
             total_requests_in_window: total_requests,
             full_replay_available: false,
             changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+            window_seeded: false,
         },
     )?;
     Ok(AppReplayResponse {
@@ -1850,6 +1877,7 @@ fn app_replay_proposal(
     proposal: &AppPolicyProposal,
     historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
     usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+    spend_seeds: &[ReplaySpendSeed],
     scope_options: ReplayScopeOptions,
 ) -> Result<AppReplayProposal, NoetError> {
     let active_lines = active_source
@@ -1879,7 +1907,12 @@ fn app_replay_proposal(
     let changed_lines = added_lines + removed_lines;
     let proposed_policy = crate::policy::parse_policy_bytes(proposal.source.as_bytes())?;
     let (proposed, mut changed_runs, spend_delta_usd, changed_runs_total) =
-        replay_historical_requests(&proposed_policy, historical_requests, usage_by_agent_run)?;
+        replay_historical_requests(
+            &proposed_policy,
+            historical_requests,
+            usage_by_agent_run,
+            spend_seeds,
+        )?;
     let recommendations = app_replay_recommendations(&changed_runs, spend_delta_usd);
     changed_runs.truncate(scope_options.changed_runs_cap);
     let changed_runs_returned = changed_runs.len();
@@ -1917,6 +1950,7 @@ fn app_replay_proposal(
             changed_runs_returned,
             changed_runs_total,
             full_replay_available: scope_options.full_replay_available,
+            window_seeded: scope_options.window_seeded,
         },
     })
 }
@@ -1927,6 +1961,46 @@ struct ReplayScopeOptions {
     total_requests_in_window: usize,
     full_replay_available: bool,
     changed_runs_cap: usize,
+    window_seeded: bool,
+}
+
+fn app_replay_spend_seeds(
+    ledger: &BudgetLedger,
+    proposed_policy: &PolicyFile,
+    history_window_start: chrono::DateTime<chrono::Utc>,
+    preview_start: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ReplaySpendSeed>, NoetError> {
+    if preview_start <= history_window_start {
+        return Ok(Vec::new());
+    }
+    let seed_at = preview_start - chrono::Duration::nanoseconds(1);
+    let mut seeds = Vec::new();
+    for rule in &proposed_policy.budgets {
+        for limit in &rule.limits.spend {
+            let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
+                continue;
+            };
+            let limit_id = limit.id.as_deref().unwrap_or(limit.window.as_str());
+            let mode = limit.mode.unwrap_or(SpendWindowMode::Tumbling);
+            let since = match mode {
+                SpendWindowMode::Rolling => (preview_start - window).max(history_window_start),
+                SpendWindowMode::Tumbling => (preview_start - window).max(history_window_start),
+            };
+            let totals = ledger.spend_scope_totals(&rule.id, limit_id, since, preview_start)?;
+            for total in totals {
+                seeds.push(ReplaySpendSeed {
+                    rule_id: rule.id.clone(),
+                    limit_id: limit_id.to_owned(),
+                    scope_key: total.scope_key,
+                    amount_usd: total.amount_usd,
+                    mode,
+                    seeded_at: seed_at,
+                    window_started_at: since,
+                });
+            }
+        }
+    }
+    Ok(seeds)
 }
 
 fn app_replay_recommendations(
@@ -2008,8 +2082,12 @@ fn replay_historical_requests(
     proposed_policy: &PolicyFile,
     historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
     usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+    spend_seeds: &[ReplaySpendSeed],
 ) -> Result<(AppRunTotals, Vec<AppReplayChangedRun>, f64, usize), NoetError> {
     let mut replay_ledger = BudgetLedger::default();
+    for seed in spend_seeds {
+        replay_ledger.seed_replay_spend(seed.clone());
+    }
     let mut runs = std::collections::BTreeMap::<String, ReplayRunAggregate>::new();
 
     for historical in historical_requests {
@@ -4486,12 +4564,14 @@ budgets:
             &proposal,
             &historical_requests,
             &std::collections::BTreeMap::new(),
+            &[],
             ReplayScopeOptions {
                 mode: "preview".to_owned(),
                 request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
                 total_requests_in_window: 150,
                 full_replay_available: true,
                 changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+                window_seeded: false,
             },
         )
         .expect("replay proposal");
@@ -4663,12 +4743,14 @@ budgets:
             &proposal,
             &[],
             &std::collections::BTreeMap::new(),
+            &[],
             ReplayScopeOptions {
                 mode: "preview".to_owned(),
                 request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
                 total_requests_in_window: 0,
                 full_replay_available: false,
                 changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+                window_seeded: false,
             },
         )
         .expect("replay proposal");
@@ -4733,6 +4815,7 @@ budgets:
             &policy,
             &historical_requests,
             &std::collections::BTreeMap::new(),
+            &[],
         )
         .expect("replay");
 
@@ -4740,6 +4823,42 @@ budgets:
         assert_eq!(totals.deny, 0);
         assert!(changed_runs.is_empty());
         assert_eq!(spend_delta, 0.0);
+    }
+
+    #[test]
+    fn noether_app_replay_preview_seeds_prior_window_spend() {
+        let policy = strict_policy();
+        let occurred_at = chrono::Utc::now();
+        let historical_requests = vec![crate::ledger::HistoricalAuthorizeRequest {
+            occurred_at,
+            decision_id: "decision-seeded".to_owned(),
+            baseline_outcome: DecisionOutcome::Allow,
+            request: report_request("trace-seeded", "request-seeded", "gpt-4.1", 0.007),
+        }];
+        let seed = ReplaySpendSeed {
+            rule_id: "tiny".to_owned(),
+            limit_id: "budget-cap".to_owned(),
+            scope_key: "global".to_owned(),
+            amount_usd: 0.007,
+            mode: SpendWindowMode::Tumbling,
+            seeded_at: occurred_at - chrono::Duration::seconds(1),
+            window_started_at: occurred_at - chrono::Duration::seconds(10),
+        };
+
+        let (totals, changed_runs, _, _) = replay_historical_requests(
+            &policy,
+            &historical_requests,
+            &std::collections::BTreeMap::new(),
+            &[seed],
+        )
+        .expect("replay");
+
+        assert_eq!(totals.deny, 1);
+        assert_eq!(changed_runs[0].to_decision, "deny");
+        assert_eq!(
+            changed_runs[0].rule.as_deref(),
+            Some("tiny.spend_window.budget-cap")
+        );
     }
 
     #[test]
@@ -4765,6 +4884,7 @@ budgets:
             &policy,
             &historical_requests,
             &std::collections::BTreeMap::new(),
+            &[],
         )
         .expect("replay");
 
