@@ -11,83 +11,146 @@
 **Noether is the policy file for agent work: written once, simulated honestly, enforced quietly,
 and explained by every decision it makes.**
 
-Noether is a local-first governance layer for AI work. Your harness, SDK, app, or gateway calls its
-OpenAPI-backed sidecar before and after model work; the app turns those decisions into a policy
-home, run evidence, and replayable policy changes.
-
-It is for:
-
-- individual operators who want local guardrails, visibility, and spend control
-- teams that want attribution, approvals, and rollout safety
-- orgs that want governance beside their existing harnesses and gateways
-
-It works beside the workflow you already use:
-
-- coding-agent harnesses
-- subscription-backed tools
-- API-driven apps and SDKs
-- existing gateways and proxies
+Noether is a local-first governance layer for AI work. Your harness, SDK, app, or gateway calls the
+sidecar before and after model work; Noether handles policy, attribution, usage accounting, and
+replay. Your integration still owns provider transport.
 
 Noether does **not** call model providers as part of its production integration surface. The
 integration owns provider transport. Noether decides, records, reconciles, and explains.
 
-Noether helps answer the questions that show up as soon as AI usage becomes real:
+## Getting started
 
-- What's allowed here?
-- What actually happened?
-- What would change if we tightened or loosened this policy?
-- Which repo, project, user, or task should pay for this run?
+Prerequisite: Rust/Cargo.
 
-Use your existing workflow. Keep your existing gateway if you have one. Use subscription-backed
-tools, API-driven apps, or both.
+### 1. Run the end-to-end local proof
 
-## Why people use this
-
-Most AI tooling is optimized for one of two jobs:
-
-- make model access easier
-- route model traffic more centrally
-
-Those are useful, but they leave a governance gap:
-
-- billing pages do not explain which run caused the spend
-- harness logs do not decide whether the spend should have happened
-- quotas do not distinguish productive adoption from runaway waste
-- most people want progressive governance, not a forced platform rewrite
-
-**Noether is the missing layer between AI usage and AI accountability.**
-
-It is not trying to solve all of AI infrastructure.
-It is trying to solve a smaller set of workflow-governance problems well:
-
-- policy before spend
-- attribution after the fact
-- approval when needed
-- simulation before rollout
-- privacy by default throughout
-
-## What the product actually does
-
-- **Policy:** the home screen is the small auditable file that controls agent work.
-- **Runs:** every decision is attributed to a rule, model, project, subject, and trace.
-- **Replay:** proposed policy changes are simulated against real history before enforcement.
-- **Authorize:** integrations ask before spend: allow, warn, block, ask, or fallback.
-- **Finalize:** integrations report real usage, traces, tools, and outcomes after provider work.
-
-The core integration lifecycle is:
-
-```text
-integration -> POST /v1/authorize
-integration -> provider call
-integration -> POST /v1/reservations/{id}/finalize
-integration -> POST /v1/events
+```bash
+./examples/vertical-mvp-demo.sh
 ```
 
-The machine-readable API is served by Noether itself:
+That script starts a temporary sidecar, authorizes a request, reserves budget, finalizes observed
+usage, records trace/tool/eval events, and prints usage, decision, trace, and observation reports.
+
+It writes the demo ledger here:
+
+```text
+.noet/demo/vertical-mvp.sqlite
+```
+
+### 2. Open the app against that ledger
+
+```bash
+cargo run --bin noet -- serve \
+  --policy examples/policy.noet.yaml \
+  --decision-mode enforce \
+  --db-path .noet/demo/vertical-mvp.sqlite
+```
+
+Open:
+
+```text
+http://127.0.0.1:4040/policy
+http://127.0.0.1:4040/runs
+http://127.0.0.1:4040/replay
+http://127.0.0.1:4040/docs
+```
+
+Check that the sidecar is healthy:
+
+```bash
+curl -fsS http://127.0.0.1:4040/health
+```
+
+### 3. Replay a policy scenario
+
+```bash
+cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
+```
+
+Open the generated artifact:
+
+```text
+.noet/scenarios/runaway-agent-limit/noether-dashboard.html
+```
+
+## How to use Noether
+
+### Use the app
+
+- `/policy`: edit and inspect the active `policy.noet.yaml`
+- `/runs`: browse attributed decisions and usage evidence
+- `/replay`: compare current and proposed policy against recorded history
+- `/docs`: read the served API docs
+
+### Use the sidecar API
+
+The integration lifecycle is:
+
+```text
+authorize -> provider call -> finalize -> events
+```
+
+Ask Noether before provider spend:
+
+```bash
+curl -fsS http://127.0.0.1:4040/v1/authorize \
+  -H 'content-type: application/json' \
+  -d '{
+    "subject": "user:demo",
+    "project": "noether",
+    "provider": "openai-codex",
+    "model": "gpt-demo",
+    "estimated_tokens": 1200,
+    "estimated_cost_usd": 0.0024
+  }'
+```
+
+Then your integration calls the provider. Afterward, finalize the reservation with the actual
+outcome and usage:
+
+```bash
+curl -fsS http://127.0.0.1:4040/v1/reservations/<reservation-id>/finalize \
+  -H 'content-type: application/json' \
+  -d '{
+    "outcome": "success",
+    "actual_cost_usd": 0.0021,
+    "usage": {
+      "provider": "openai",
+      "model": "gpt-demo",
+      "input_tokens": 900,
+      "output_tokens": 180,
+      "total_tokens": 1080,
+      "cost_usd": 0.0021
+    }
+  }'
+```
+
+`outcome` is explicit: `success`, `failure`, or `cancelled`. Noether rejects invalid accounting
+such as negative costs or impossible token totals.
+
+Machine-readable API docs are served by Noether:
 
 ```text
 GET /openapi.json
 GET /docs
+```
+
+### Use an SDK or integration
+
+- TypeScript SDK: `sdk/typescript`
+- Python SDK: `sdk/python`
+- Rust SDK: `sdk/rust`
+- Pi extension: `extensions/pi-noether`
+- LiteLLM callback: `integrations/litellm`
+- OpenCode, Claude Code, and Codex adapters: `integrations/`
+
+### Use the CLI
+
+```bash
+cargo run --bin noet -- report decisions
+cargo run --bin noet -- report usage
+cargo run --bin noet -- report trace <trace_id>
+cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
 ```
 
 ## Product surfaces
@@ -389,85 +452,6 @@ And if you want to compare whole policy strategies before rollout:
 
 ```bash
 cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
-```
-
-## HTTP or CLI, your choice
-
-### HTTP
-
-Ask Noether for a decision before spend:
-
-```bash
-curl -fsS http://127.0.0.1:4040/v1/authorize \
-  -H 'content-type: application/json' \
-  -d '{
-    "subject": "user:demo",
-    "project": "noether",
-    "provider": "openai-codex",
-    "model": "gpt-demo",
-    "estimated_tokens": 1200,
-    "estimated_cost_usd": 0.0024,
-    "metadata": {
-      "trace_id": "demo-trace-1",
-      "request_id": "demo-request-1",
-      "harness": "pi"
-    }
-  }'
-```
-
-After your integration owns the provider outcome, finalize the reservation:
-
-```bash
-curl -fsS http://127.0.0.1:4040/v1/reservations/<reservation-id>/finalize \
-  -H 'content-type: application/json' \
-  -d '{
-    "outcome": "success",
-    "actual_cost_usd": 0.0021,
-    "usage": {
-      "provider": "openai",
-      "model": "gpt-demo",
-      "input_tokens": 900,
-      "output_tokens": 180,
-      "total_tokens": 1080,
-      "cost_usd": 0.0021
-    },
-    "metadata": {
-      "trace_id": "demo-trace-1",
-      "request_id": "demo-request-1"
-    }
-  }'
-```
-
-`outcome` is explicit: `success`, `failure`, or `cancelled`. Noether rejects invalid accounting
-such as negative costs or impossible token totals. Failure and cancellation finalization should not
-invent usage; include usage only when the harness or gateway actually exposed it.
-
-### CLI
-
-Run the end-to-end local proof:
-
-```bash
-./examples/vertical-mvp-demo.sh
-```
-
-Compare a policy strategy before rollout:
-
-```bash
-cargo run --bin noet -- simulate examples/simulations/runaway-pressure.noet.yaml
-```
-
-## Try it in 3 commands
-
-```bash
-./examples/vertical-mvp-demo.sh
-cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
-cargo run --bin noet -- simulate examples/simulations/adoption-pressure.noet.yaml
-```
-
-Then open the generated dashboard artifact:
-
-```bash
-xdg-open .noet/noether-dashboard.html
 ```
 
 ## Works with the setup you already have
