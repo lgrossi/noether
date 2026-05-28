@@ -221,7 +221,7 @@ of becoming separate dashboards.
 - keep existing harnesses and gateways
 - model policy changes before rollout
 
-## Why this is better than another AI dashboard
+## Why this is different from another AI dashboard
 
 Noether is useful because it puts policy at the center:
 
@@ -268,7 +268,7 @@ decision.allow -> reservation.active -> usage.finalized
 trace_id=run-123 project=noether subject=user:local model=gpt-demo cost=$0.0021
 ```
 
-That gives reports answers a provider dashboard cannot:
+That gives reports answers a generic dashboard usually cannot:
 
 - which policy allowed it
 - which project/user should pay
@@ -427,8 +427,8 @@ budgets:
           action: block
 ```
 
-This is the kind of policy a real operator or team would actually run: one broad shared `30d` pool,
-plus per-user pacing and burst protection against unhealthy agent behavior.
+A typical team policy combines one broad shared `30d` pool with per-user pacing and burst
+protection against unhealthy agent behavior.
 
 You can run the checked-in scenario for it here:
 
@@ -480,7 +480,7 @@ provider call and for reporting only usage it actually observed.
 
 ### Harness-first integrations
 
-Best fit when you want native workflow awareness:
+Use these when you want native workflow awareness:
 
 - authorization before provider send
 - repo / project / session-aware attribution
@@ -489,8 +489,7 @@ Best fit when you want native workflow awareness:
 
 Current integrations:
 
-- **Pi extension**: strongest harness integration today; authorizes before provider send and
-  finalizes observed usage when Pi exposes it.
+- **Pi extension**: authorizes before provider send and finalizes observed usage when Pi exposes it.
 - **Claude Code hook bridge**: authorizes documented tool/permission hooks; main model provider
   pre-call hooks are not currently documented.
 - **OpenCode event plugin**: records documented event/tool hooks; provider pre-call and usage hooks
@@ -500,7 +499,7 @@ Current integrations:
 
 ### Gateway-sidecar integrations
 
-Best fit when you already have central routing and want governance beside it:
+Use these when you already have central routing and want governance beside it:
 
 - keep your gateway
 - add policy decisions, attribution, approval semantics, and analysis
@@ -546,7 +545,8 @@ cargo run --bin noet -- report dashboard --out .noet/noether-dashboard.html
 
 ## Why this is different from a generic gateway
 
-Noether is strongest where generic gateways are weakest:
+Gateways usually focus on provider transport. Noether focuses on the policy and workflow layer
+around that transport:
 
 - harness-aware attribution
 - repo / project / task / session-aware budgeting
@@ -562,8 +562,6 @@ That is the boundary:
 
 ## What exists today
 
-Noether is early, but real.
-
 Today it includes:
 
 - local `noet` sidecar and repo-local `.noether/` runtime
@@ -578,7 +576,7 @@ Today it includes:
 - accounting validation for costs and token totals
 - served live dashboard
 - static export dashboards
-- story-shaped CLI reports
+- CLI reports
 - Pi extension integration
 - LiteLLM callback integration
 - TypeScript, Python, and Rust SDKs
