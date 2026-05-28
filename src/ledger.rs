@@ -558,7 +558,7 @@ impl BudgetLedger {
         self.decisions_report_since(None)
     }
 
-    pub fn decisions_report_page(
+    pub fn decisions_report_for_run_page(
         &self,
         limit: usize,
         offset: usize,
@@ -568,15 +568,22 @@ impl BudgetLedger {
         };
         let mut stmt = conn.prepare(
             "
-            SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
-                   action,
-                   estimated_tokens, estimated_cost_usd, explanations_json, metadata_json, entities_json,
-                   selected_budget_id, matched_entity, selection_reason, rejected_budget_id, rejected_budget_reason,
-                   model_check, budget_window_remaining_usd, routing_json, limit_hits_json,
-                   json_extract(metadata_json, '$.agent_run_id')
-            FROM decisions
-            ORDER BY created_at DESC
-            LIMIT ?1 OFFSET ?2
+            WITH run_page AS (
+                SELECT app_run_key, MAX(created_at) AS latest_at
+                FROM decisions
+                GROUP BY app_run_key
+                ORDER BY latest_at DESC
+                LIMIT ?1 OFFSET ?2
+            )
+            SELECT d.created_at, d.outcome, d.decision_id, d.trace_id, d.request_id, d.provider, d.model,
+                   d.action,
+                   d.estimated_tokens, d.estimated_cost_usd, d.explanations_json, d.metadata_json, d.entities_json,
+                   d.selected_budget_id, d.matched_entity, d.selection_reason, d.rejected_budget_id, d.rejected_budget_reason,
+                   d.model_check, d.budget_window_remaining_usd, d.routing_json, d.limit_hits_json,
+                   json_extract(d.metadata_json, '$.agent_run_id')
+            FROM decisions d
+            JOIN run_page p ON d.app_run_key = p.app_run_key
+            ORDER BY p.latest_at DESC, d.created_at DESC
             ",
         )?;
         stmt.query_map(
@@ -603,11 +610,7 @@ impl BudgetLedger {
             runs: if let Some(since) = since.as_deref() {
                 conn.query_row(
                     "
-                    SELECT COUNT(DISTINCT COALESCE(
-                        json_extract(metadata_json, '$.agent_run_id'),
-                        trace_id,
-                        decision_id
-                    ))
+                    SELECT COUNT(DISTINCT app_run_key)
                     FROM decisions
                     WHERE created_at >= ?1
                     ",
@@ -617,11 +620,7 @@ impl BudgetLedger {
             } else {
                 conn.query_row(
                     "
-                SELECT COUNT(DISTINCT COALESCE(
-                    json_extract(metadata_json, '$.agent_run_id'),
-                    trace_id,
-                    decision_id
-                ))
+                SELECT COUNT(DISTINCT app_run_key)
                 FROM decisions
                 ",
                     [],
@@ -892,6 +891,69 @@ impl BudgetLedger {
                 .collect::<Result<_, _>>()
         } else {
             stmt.query_map([], map_row)?.collect::<Result<_, _>>()
+        };
+        rows.map_err(NoetError::from)
+    }
+
+    pub fn historical_authorize_request_count_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<usize, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(0);
+        };
+        let count = if let Some(since) = since {
+            conn.query_row(
+                "SELECT COUNT(*) FROM decisions WHERE created_at >= ?1",
+                [since.to_rfc3339()],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            conn.query_row("SELECT COUNT(*) FROM decisions", [], |row| {
+                row.get::<_, i64>(0)
+            })?
+        };
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn latest_historical_authorize_requests_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sql = "
+            SELECT created_at, decision_id, outcome, metadata_json, entities_json, subject, project,
+                   provider, model, estimated_tokens, estimated_cost_usd, metadata_json
+            FROM (
+                SELECT created_at, decision_id, outcome, metadata_json, entities_json, subject, project,
+                       provider, model, estimated_tokens, estimated_cost_usd
+                FROM decisions
+        "
+        .to_owned();
+        if since.is_some() {
+            sql.push_str(" WHERE created_at >= ?1");
+        }
+        let limit_param = if since.is_some() { "?2" } else { "?1" };
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT {limit_param}) ORDER BY created_at ASC"
+        ));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = if let Some(since) = since {
+            stmt.query_map(params![since.to_rfc3339(), limit as i64], |row| {
+                historical_authorize_request_from_row(row)
+            })?
+            .collect::<Result<_, _>>()
+        } else {
+            stmt.query_map([limit as i64], |row| {
+                historical_authorize_request_from_row(row)
+            })?
+            .collect::<Result<_, _>>()
         };
         rows.map_err(NoetError::from)
     }
@@ -1619,6 +1681,16 @@ impl BudgetLedger {
         let request_id = string_metadata(request, "request_id");
         let routing =
             self.routing_persistence_fields(policy, request, decision, selected_budget_id);
+        let outcome = outcome_text(decision.outcome);
+        let app_run_key = decision_app_run_key(
+            trace_id.as_deref(),
+            request.provider.as_deref(),
+            request.model.as_deref(),
+            outcome,
+            routing.selected_budget_id.as_deref(),
+            &request.metadata,
+            decision.created_at,
+        );
         let routing_report = decision_routing_report(
             routing.selected_budget_id.clone(),
             routing.matched_entity.clone(),
@@ -1638,10 +1710,10 @@ impl BudgetLedger {
                 estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
                 entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
                 rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
-                limit_hits_json, max_tool_calls, max_agent_steps, max_retries, created_at
+                limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )
             ",
             params![
@@ -1655,7 +1727,7 @@ impl BudgetLedger {
                 request.model.as_deref(),
                 request.estimated_tokens.map(|value| value as i64),
                 request.estimated_cost_usd,
-                outcome_text(decision.outcome),
+                outcome,
                 action_text(decision.action),
                 serde_json::to_string(&decision.explanations)?,
                 serde_json::to_string(&request.metadata)?,
@@ -1672,6 +1744,7 @@ impl BudgetLedger {
                 routing.tool_calls.map(|value| value as i64),
                 routing.agent_steps.map(|value| value as i64),
                 routing.retries.map(|value| value as i64),
+                app_run_key,
                 decision.created_at.to_rfc3339(),
             ],
         )?;
@@ -1718,14 +1791,16 @@ impl BudgetLedger {
                 conn.execute(
                     "
                     INSERT INTO reservation_limit_scopes (
-                        reservation_id, rule_id, limit_id, scope_key
-                    ) VALUES (?1, ?2, ?3, ?4)
+                        reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                     ",
                     params![
                         reservation.id.as_str(),
                         spend.rule_id.as_str(),
                         spend.limit_id.as_str(),
-                        spend.scope_key.as_str()
+                        spend.scope_key.as_str(),
+                        reservation.amount_usd,
+                        reservation.created_at.to_rfc3339()
                     ],
                 )?;
             }
@@ -2219,6 +2294,7 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             budget_window_remaining_usd REAL,
             routing_json TEXT,
             limit_hits_json TEXT,
+            app_run_key TEXT,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_decisions_trace ON decisions(trace_id);
@@ -2244,10 +2320,18 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             reservation_id TEXT NOT NULL REFERENCES reservations(id),
             rule_id TEXT NOT NULL,
             limit_id TEXT NOT NULL,
-            scope_key TEXT NOT NULL
+            scope_key TEXT NOT NULL,
+            amount_usd REAL NOT NULL DEFAULT 0,
+            created_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_lookup
             ON reservation_limit_scopes(rule_id, limit_id, scope_key);
+        CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_reservation
+            ON reservation_limit_scopes(reservation_id);
+        CREATE INDEX IF NOT EXISTS idx_reservations_decision
+            ON reservations(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_decisions_created_decision
+            ON decisions(created_at, decision_id);
 
         CREATE TABLE IF NOT EXISTS usage_observations (
             id TEXT PRIMARY KEY,
@@ -2325,6 +2409,18 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
     )?;
     ensure_column(
         conn,
+        "reservation_limit_scopes",
+        "amount_usd",
+        "amount_usd REAL NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "reservation_limit_scopes",
+        "created_at",
+        "created_at TEXT",
+    )?;
+    ensure_column(
+        conn,
         "decisions",
         "selection_reason",
         "selection_reason TEXT",
@@ -2344,6 +2440,7 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
     ensure_column(conn, "decisions", "model_check", "model_check TEXT")?;
     ensure_column(conn, "decisions", "routing_json", "routing_json TEXT")?;
     ensure_column(conn, "decisions", "limit_hits_json", "limit_hits_json TEXT")?;
+    ensure_column(conn, "decisions", "app_run_key", "app_run_key TEXT")?;
     ensure_column(
         conn,
         "decisions",
@@ -2387,6 +2484,76 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         "protected_amount_usd",
         "protected_amount_usd REAL NOT NULL DEFAULT 0",
     )?;
+    backfill_decision_app_run_keys(conn)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_app_run_key_created ON decisions(app_run_key, created_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_reservation ON reservation_limit_scopes(reservation_id)",
+        [],
+    )?;
+    backfill_reservation_limit_scope_rollups(conn)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reservation_limit_scopes_rolling ON reservation_limit_scopes(rule_id, limit_id, scope_key, created_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reservations_decision ON reservations(decision_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_created_decision ON decisions(created_at, decision_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn backfill_reservation_limit_scope_rollups(conn: &Connection) -> Result<(), NoetError> {
+    conn.execute(
+        "
+        UPDATE reservation_limit_scopes
+        SET amount_usd = (
+                SELECT COALESCE(r.amount_usd, 0)
+                FROM reservations r
+                WHERE r.id = reservation_limit_scopes.reservation_id
+            ),
+            created_at = (
+                SELECT r.created_at
+                FROM reservations r
+                WHERE r.id = reservation_limit_scopes.reservation_id
+            )
+        WHERE created_at IS NULL OR amount_usd = 0
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+fn backfill_decision_app_run_keys(conn: &Connection) -> Result<(), NoetError> {
+    conn.execute(
+        "
+        UPDATE decisions
+        SET app_run_key = CASE
+            WHEN json_extract(metadata_json, '$.agent_run_id') IS NOT NULL
+                THEN 'agent-run:' || json_extract(metadata_json, '$.agent_run_id')
+            WHEN trace_id IS NOT NULL
+                THEN 'trace-fallback:' || trace_id
+            ELSE 'untraced:' || outcome || ':' ||
+                COALESCE(selected_budget_id, 'unattributed') || ':' ||
+                COALESCE(
+                    CASE
+                        WHEN provider IS NOT NULL AND model IS NOT NULL THEN provider || '/' || model
+                        WHEN model IS NOT NULL THEN model
+                        WHEN provider IS NOT NULL THEN provider
+                    END,
+                    'unknown'
+                ) || ':' || (CAST(strftime('%s', created_at) AS INTEGER) / 60)
+        END
+        WHERE app_run_key IS NULL OR app_run_key = ''
+        ",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2421,6 +2588,40 @@ fn string_value(
         .get(key)
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
+}
+
+fn decision_app_run_key(
+    trace_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    outcome: &str,
+    selected_budget_id: Option<&str>,
+    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+    created_at: DateTime<Utc>,
+) -> String {
+    if let Some(agent_run_id) = string_value(metadata, "agent_run_id")
+        && !agent_run_id.is_empty()
+    {
+        return format!("agent-run:{agent_run_id}");
+    }
+    if let Some(trace_id) = trace_id
+        && !trace_id.is_empty()
+    {
+        return format!("trace-fallback:{trace_id}");
+    }
+    let model_ref = match (provider, model) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (None, Some(model)) => Some(model.to_owned()),
+        (Some(provider), None) => Some(provider.to_owned()),
+        (None, None) => None,
+    };
+    format!(
+        "untraced:{}:{}:{}:{}",
+        outcome,
+        selected_budget_id.unwrap_or("unattributed"),
+        model_ref.as_deref().unwrap_or("unknown"),
+        created_at.timestamp() / 60
+    )
 }
 
 fn validate_event_payload(event: &TraceEvent) -> Result<(), NoetError> {
@@ -2690,6 +2891,38 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
         binding_limit: limit_hits.as_deref().and_then(binding_limit_hit).cloned(),
         routing,
         limit_hits,
+    })
+}
+
+fn historical_authorize_request_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<HistoricalAuthorizeRequest> {
+    let entities_json: String = row.get(4)?;
+    let metadata_json: String = row.get(11)?;
+    Ok(HistoricalAuthorizeRequest {
+        occurred_at: parse_time(row.get::<_, String>(0)?),
+        decision_id: row.get(1)?,
+        baseline_outcome: parse_decision_outcome(row.get::<_, String>(2)?.as_str()),
+        request: AuthorizeRequest {
+            budget_id: serde_json::from_str::<Value>(&metadata_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("budget_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }),
+            entities: parse_entities_json(entities_json),
+            subject: row.get(5)?,
+            project: row.get(6)?,
+            provider: row.get(7)?,
+            model: row.get(8)?,
+            estimated_tokens: row
+                .get::<_, Option<i64>>(9)?
+                .map(|value| value.max(0) as u64),
+            estimated_cost_usd: row.get(10)?,
+            metadata: serde_json::from_str(&metadata_json).unwrap_or_default(),
+        },
     })
 }
 
@@ -3280,15 +3513,13 @@ fn recent_spend_usd(
     if let Some(conn) = &ledger.conn {
         let value = conn.query_row(
             "
-            SELECT COALESCE(SUM(r.amount_usd), 0)
-            FROM reservations r
-            JOIN reservation_limit_scopes s ON s.reservation_id = r.id
-            JOIN decisions d ON d.decision_id = r.decision_id
-            WHERE s.rule_id = ?1
-              AND s.limit_id = ?2
-              AND s.scope_key = ?3
-              AND d.created_at >= ?4
-              AND d.created_at <= ?5
+            SELECT COALESCE(SUM(amount_usd), 0)
+            FROM reservation_limit_scopes
+            WHERE rule_id = ?1
+              AND limit_id = ?2
+              AND scope_key = ?3
+              AND created_at >= ?4
+              AND created_at <= ?5
             ",
             params![
                 rule_id,
@@ -4298,6 +4529,51 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_rolling_spend_uses_persisted_scope_rollups() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("rolling-rollups.sqlite");
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
+                id: Some("rolling".to_owned()),
+                window: "7d".to_owned(),
+                mode: Some(SpendWindowMode::Rolling),
+                anchor: None,
+                max_usd: 10.0,
+                warn_at_fraction: 1.0,
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        let first = ledger.authorize(Some(&policy), &request(6.0));
+        let second = ledger.authorize(Some(&policy), &request(5.0));
+
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let row = conn
+            .query_row(
+                "
+                SELECT amount_usd, created_at
+                FROM reservation_limit_scopes
+                WHERE reservation_id = ?1
+                ",
+                [first.reservation.as_ref().expect("reservation").id.as_str()],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .expect("scope rollup row");
+        assert_eq!(row.0, 6.0);
+        assert!(row.1.is_some());
+    }
+
+    #[test]
     fn tumbling_spend_window_limit_warns_on_projected_bucket_spend() {
         let mut policy = policy(20.0, 1.0);
         policy.budgets[0].limits = BudgetLimitPolicy {
@@ -4707,6 +4983,63 @@ mod tests {
             trace_routing.selected_budget_id.as_deref(),
             Some("project-budget")
         );
+    }
+
+    #[test]
+    fn decisions_report_for_run_page_limits_runs_not_raw_decisions() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("run-page.sqlite");
+        let policy = policy(100.0, 1.0);
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        for run_index in 0..5 {
+            for _ in 0..3 {
+                let mut request = request(0.01);
+                request.metadata.insert(
+                    "agent_run_id".to_owned(),
+                    Value::String(format!("run-{run_index}")),
+                );
+                ledger.authorize(Some(&policy), &request);
+            }
+        }
+
+        let page = ledger
+            .decisions_report_for_run_page(2, 0)
+            .expect("run page report");
+        let run_ids = page
+            .iter()
+            .filter_map(|decision| decision.agent_run_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            page.len() > 2,
+            "page should include all decisions for selected runs"
+        );
+        assert_eq!(run_ids.len(), 2);
+    }
+
+    #[test]
+    fn decisions_report_for_run_page_groups_untraced_decisions_like_app_runs() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("untraced-run-page.sqlite");
+        let policy = policy(100.0, 1.0);
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        for _ in 0..3 {
+            ledger.authorize(Some(&policy), &request(0.01));
+        }
+
+        let page = ledger
+            .decisions_report_for_run_page(1, 0)
+            .expect("run page report");
+        let totals = ledger.run_totals_report().expect("run totals");
+
+        assert_eq!(
+            page.len(),
+            3,
+            "the first run page should include all rows in the selected untraced run"
+        );
+        assert_eq!(totals.runs, 1);
     }
 
     #[test]

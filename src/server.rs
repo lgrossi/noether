@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -20,6 +20,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::capture::capture;
 use crate::contract::{
@@ -47,6 +48,7 @@ pub struct AppState {
     pub decision_mode: DecisionMode,
     pub ledger: Arc<Mutex<BudgetLedger>>,
     pub report_updates: broadcast::Sender<ReportUpdate>,
+    replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +209,10 @@ fn default_app_runs_limit() -> usize {
     80
 }
 
+const APP_REPLAY_HISTORY_WINDOW_DAYS: i64 = 30;
+const APP_REPLAY_PREVIEW_REQUEST_CAP: usize = 5_000;
+const APP_REPLAY_CHANGED_RUNS_CAP: usize = 100;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct AppRunUsage {
     cost_usd: f64,
@@ -232,7 +238,7 @@ struct AppRuleEvidence {
     models: std::collections::BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct AppReplayResponse {
     baseline: AppRunTotals,
     has_proposed_policy: bool,
@@ -244,7 +250,20 @@ struct AppReplayResponse {
     proposal: Option<AppReplayProposal>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+struct AppReplayScope {
+    mode: String,
+    request_cap: Option<usize>,
+    requests_replayed: usize,
+    total_requests_in_window: usize,
+    has_more_history: bool,
+    changed_runs_cap: usize,
+    changed_runs_returned: usize,
+    changed_runs_total: usize,
+    full_replay_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct AppReplayProposal {
     path: String,
     mode: String,
@@ -258,9 +277,10 @@ struct AppReplayProposal {
     recommendations: Vec<AppReplayRecommendation>,
     spend_delta_usd: f64,
     preview: Vec<AppReplayDiffLine>,
+    scope: AppReplayScope,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct AppReplayRecommendation {
     title: String,
     body: String,
@@ -269,7 +289,7 @@ struct AppReplayRecommendation {
     action: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct AppReplayChangedRun {
     run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,7 +304,30 @@ struct AppReplayChangedRun {
     summary: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+struct AppReplayJobResponse {
+    id: String,
+    status: String,
+    history_window_days: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<AppReplayResponse>,
+}
+
+#[derive(Clone, Debug)]
+struct AppReplayJob {
+    status: String,
+    history_window_days: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+    result: Option<AppReplayResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct AppReplayDiffLine {
     kind: String,
     line: String,
@@ -304,12 +347,19 @@ struct ReloadablePolicyState {
     active: Option<Arc<PolicyFile>>,
     source_path: PathBuf,
     last_observed_source: PolicySourceSnapshot,
+    last_observed_file: Option<PolicyFileSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PolicySourceSnapshot {
     Bytes(Vec<u8>),
     ReadError(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyFileSnapshot {
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 impl PolicyRuntime {
@@ -326,6 +376,7 @@ impl PolicyRuntime {
                     active: Some(Arc::new(policy)),
                     source_path,
                     last_observed_source: PolicySourceSnapshot::Bytes(source_bytes),
+                    last_observed_file: None,
                 },
             ))),
         }
@@ -382,6 +433,7 @@ impl PolicyRuntime {
             PolicyRuntimeState::Reloadable(reloadable) => {
                 fs::write(&reloadable.source_path, source.as_bytes()).await?;
                 reloadable.last_observed_source = PolicySourceSnapshot::Bytes(source.into_bytes());
+                reloadable.last_observed_file = None;
                 reloadable.active = Some(Arc::new(policy.clone()));
                 Ok((Some(reloadable.source_path.clone()), policy))
             }
@@ -391,6 +443,32 @@ impl PolicyRuntime {
 
 impl ReloadablePolicyState {
     async fn refresh(&mut self) {
+        match fs::metadata(&self.source_path).await {
+            Ok(metadata) => {
+                let snapshot = PolicyFileSnapshot {
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                };
+                if self.last_observed_file.as_ref() == Some(&snapshot) {
+                    return;
+                }
+                self.last_observed_file = Some(snapshot);
+            }
+            Err(read_error) => {
+                let snapshot = PolicySourceSnapshot::ReadError(read_error.to_string());
+                if snapshot == self.last_observed_source {
+                    return;
+                }
+                self.last_observed_file = None;
+                self.last_observed_source = snapshot;
+                error!(
+                    policy_path = %self.source_path.display(),
+                    error = %read_error,
+                    "failed to reload noet policy; keeping last good policy"
+                );
+                return;
+            }
+        }
         match fs::read(&self.source_path).await {
             Ok(bytes) => {
                 let snapshot = PolicySourceSnapshot::Bytes(bytes.clone());
@@ -417,6 +495,7 @@ impl ReloadablePolicyState {
                 if snapshot == self.last_observed_source {
                     return;
                 }
+                self.last_observed_file = None;
                 self.last_observed_source = snapshot;
                 error!(
                     policy_path = %self.source_path.display(),
@@ -461,6 +540,7 @@ impl AppState {
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
             report_updates,
+            replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -582,6 +662,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/app/runs", get(app_runs))
         .route("/v1/app/runs/{run_id}", get(app_run_detail))
         .route("/v1/app/replay", get(app_replay))
+        .route("/v1/app/replay/jobs", post(start_app_replay_job))
+        .route("/v1/app/replay/jobs/{job_id}", get(app_replay_job))
         .route("/v1/simulations", get(list_simulations))
         .route("/v1/simulations/{simulation_id}", get(simulation_report))
         .route(
@@ -922,7 +1004,7 @@ async fn app_runs(
     let limit = query.limit.clamp(1, 250);
     let offset = query.offset;
     if app_runs_query_is_unfiltered(&query) {
-        let decisions = ledger.decisions_report_page(limit, offset)?;
+        let decisions = ledger.decisions_report_for_run_page(limit, offset)?;
         let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
         let usage_by_agent_run =
             app_usage_by_agent_run(&ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?);
@@ -996,11 +1078,17 @@ async fn app_run_detail(
 }
 
 async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayResponse>, NoetError> {
-    const HISTORY_WINDOW_DAYS: i64 = 1;
     let history_window_end = chrono::Utc::now();
-    let history_window_start = history_window_end - chrono::Duration::days(HISTORY_WINDOW_DAYS);
+    let history_window_start =
+        history_window_end - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
     let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
     let has_proposed_policy = proposal.is_some();
+    let active_source = state
+        .active_policy_source()
+        .await
+        .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
+        .transpose()?
+        .unwrap_or_default();
     let ledger = state.ledger.lock().await;
     if !has_proposed_policy {
         return Ok(Json(AppReplayResponse {
@@ -1009,24 +1097,35 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
             ),
             has_proposed_policy,
             message: "No proposed policy has been saved for replay yet. Edit Policy first to create a local draft without enforcing it.".to_owned(),
-            history_window_days: HISTORY_WINDOW_DAYS,
+            history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
             history_window_start,
             history_window_end,
             proposal: None,
         }));
     }
-    let decisions = ledger.decisions_report_since(Some(history_window_start))?;
-    let historical_requests =
-        ledger.historical_authorize_requests_since(Some(history_window_start))?;
-    let usage_by_agent_run =
-        app_usage_by_agent_run(&ledger.usage_activity_report_since(Some(history_window_start))?);
-    let baseline_runs = app_agent_runs(&decisions, &usage_by_agent_run);
-    let active_source = state
-        .active_policy_source()
-        .await
-        .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
-        .transpose()?
-        .unwrap_or_default();
+    let (total_requests, historical_requests, usage_by_agent_run, baseline) = {
+        let total_requests =
+            ledger.historical_authorize_request_count_since(Some(history_window_start))?;
+        let historical_requests = ledger.latest_historical_authorize_requests_since(
+            Some(history_window_start),
+            APP_REPLAY_PREVIEW_REQUEST_CAP,
+        )?;
+        let agent_run_ids = historical_requests
+            .iter()
+            .filter_map(|request| string_metadata_value(&request.request, "agent_run_id"))
+            .collect::<Vec<_>>();
+        let usage_by_agent_run =
+            app_usage_by_agent_run(&ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?);
+        let baseline =
+            app_run_totals_from_report(ledger.run_totals_report_since(Some(history_window_start))?);
+        (
+            total_requests,
+            historical_requests,
+            usage_by_agent_run,
+            baseline,
+        )
+    };
+    drop(ledger);
     let replay_proposal = proposal
         .as_ref()
         .map(|proposal| {
@@ -1035,23 +1134,166 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
                 proposal,
                 &historical_requests,
                 &usage_by_agent_run,
+                ReplayScopeOptions {
+                    mode: "preview".to_owned(),
+                    request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
+                    total_requests_in_window: total_requests,
+                    full_replay_available: total_requests > historical_requests.len(),
+                    changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+                },
             )
         })
         .transpose()?;
     Ok(Json(AppReplayResponse {
-        baseline: app_replay_baseline_totals(&baseline_runs),
+        baseline,
         has_proposed_policy,
         message: if has_proposed_policy {
-            "A valid proposed policy is saved locally. Recent authorization requests were re-evaluated against the draft."
+            "A valid proposed policy is saved locally. Preview replay re-evaluated the most recent recorded authorizations in the 30-day window."
         } else {
             "No proposed policy has been saved for replay yet. Edit Policy first to create a local draft without enforcing it."
         }
         .to_owned(),
-        history_window_days: HISTORY_WINDOW_DAYS,
+        history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
         history_window_start,
         history_window_end,
         proposal: replay_proposal,
     }))
+}
+
+async fn start_app_replay_job(
+    State(state): State<AppState>,
+) -> Result<Json<AppReplayJobResponse>, NoetError> {
+    if app_policy_proposal(&state.policy_proposal_path)
+        .await?
+        .is_none()
+    {
+        return Err(NoetError::InvalidPolicy(
+            "full replay requires a saved proposed policy".to_owned(),
+        ));
+    }
+    let id = Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now();
+    {
+        let mut jobs = state.replay_jobs.lock().await;
+        jobs.insert(
+            id.clone(),
+            AppReplayJob {
+                status: "running".to_owned(),
+                history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
+                created_at,
+                completed_at: None,
+                error: None,
+                result: None,
+            },
+        );
+    }
+    let jobs = state.replay_jobs.clone();
+    let replay_state = state.clone();
+    let job_id = id.clone();
+    tokio::spawn(async move {
+        let result = app_replay_full_month_response(replay_state).await;
+        let mut jobs = jobs.lock().await;
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.completed_at = Some(chrono::Utc::now());
+            match result {
+                Ok(result) => {
+                    job.status = "completed".to_owned();
+                    job.result = Some(result);
+                }
+                Err(error) => {
+                    job.status = "failed".to_owned();
+                    job.error = Some(error.to_string());
+                }
+            }
+        }
+    });
+    let jobs = state.replay_jobs.lock().await;
+    let job = jobs
+        .get(&id)
+        .expect("job was inserted before response")
+        .clone();
+    Ok(Json(app_replay_job_response(id, job)))
+}
+
+async fn app_replay_job(
+    State(state): State<AppState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Json<AppReplayJobResponse>, NoetError> {
+    let jobs = state.replay_jobs.lock().await;
+    let job = jobs
+        .get(&job_id)
+        .cloned()
+        .ok_or_else(|| NoetError::NotFound(format!("replay job {job_id}")))?;
+    Ok(Json(app_replay_job_response(job_id, job)))
+}
+
+fn app_replay_job_response(id: String, job: AppReplayJob) -> AppReplayJobResponse {
+    AppReplayJobResponse {
+        id,
+        status: job.status,
+        history_window_days: job.history_window_days,
+        created_at: job.created_at,
+        completed_at: job.completed_at,
+        error: job.error,
+        result: job.result,
+    }
+}
+
+async fn app_replay_full_month_response(state: AppState) -> Result<AppReplayResponse, NoetError> {
+    let history_window_end = chrono::Utc::now();
+    let history_window_start =
+        history_window_end - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+    let proposal = app_policy_proposal(&state.policy_proposal_path)
+        .await?
+        .ok_or_else(|| {
+            NoetError::InvalidPolicy("full replay requires a saved proposed policy".to_owned())
+        })?;
+    let active_source = state
+        .active_policy_source()
+        .await
+        .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
+        .transpose()?
+        .unwrap_or_default();
+    let (total_requests, historical_requests, usage_by_agent_run, baseline) = {
+        let ledger = state.ledger.lock().await;
+        let total_requests =
+            ledger.historical_authorize_request_count_since(Some(history_window_start))?;
+        let historical_requests =
+            ledger.historical_authorize_requests_since(Some(history_window_start))?;
+        let usage_by_agent_run = app_usage_by_agent_run(
+            &ledger.usage_activity_report_since(Some(history_window_start))?,
+        );
+        let baseline =
+            app_run_totals_from_report(ledger.run_totals_report_since(Some(history_window_start))?);
+        (
+            total_requests,
+            historical_requests,
+            usage_by_agent_run,
+            baseline,
+        )
+    };
+    let proposal = app_replay_proposal(
+        &active_source,
+        &proposal,
+        &historical_requests,
+        &usage_by_agent_run,
+        ReplayScopeOptions {
+            mode: "full_month".to_owned(),
+            request_cap: None,
+            total_requests_in_window: total_requests,
+            full_replay_available: false,
+            changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+        },
+    )?;
+    Ok(AppReplayResponse {
+        baseline,
+        has_proposed_policy: true,
+        message: "Full 30-day replay completed against the saved draft policy.".to_owned(),
+        history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
+        history_window_start,
+        history_window_end,
+        proposal: Some(proposal),
+    })
 }
 
 async fn app_policy_proposal(path: &Path) -> Result<Option<AppPolicyProposal>, NoetError> {
@@ -1479,6 +1721,13 @@ fn app_usage_by_agent_run(
     by_agent_run
 }
 
+fn app_agent_run_ids_from_decisions(decisions: &[TraceReportItem]) -> Vec<String> {
+    decisions
+        .iter()
+        .filter_map(|decision| decision.agent_run_id.clone())
+        .collect()
+}
+
 fn app_run_timeline(
     ledger: &BudgetLedger,
     run: &AppRunRow,
@@ -1571,6 +1820,7 @@ fn app_replay_proposal(
     proposal: &AppPolicyProposal,
     historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
     usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+    scope_options: ReplayScopeOptions,
 ) -> Result<AppReplayProposal, NoetError> {
     let active_lines = active_source
         .lines()
@@ -1598,9 +1848,11 @@ fn app_replay_proposal(
     let removed_lines = active_lines.difference(&proposal_lines).count() as u64;
     let changed_lines = added_lines + removed_lines;
     let proposed_policy = crate::policy::parse_policy_bytes(proposal.source.as_bytes())?;
-    let (proposed, changed_runs, spend_delta_usd) =
+    let (proposed, mut changed_runs, spend_delta_usd, changed_runs_total) =
         replay_historical_requests(&proposed_policy, historical_requests, usage_by_agent_run)?;
     let recommendations = app_replay_recommendations(&changed_runs, spend_delta_usd);
+    changed_runs.truncate(scope_options.changed_runs_cap);
+    let changed_runs_returned = changed_runs.len();
     let (mode, explanation) = if changed_lines == 0 {
         (
             "current_policy_backtest",
@@ -1625,7 +1877,26 @@ fn app_replay_proposal(
         recommendations,
         spend_delta_usd,
         preview,
+        scope: AppReplayScope {
+            mode: scope_options.mode,
+            request_cap: scope_options.request_cap,
+            requests_replayed: historical_requests.len(),
+            total_requests_in_window: scope_options.total_requests_in_window,
+            has_more_history: scope_options.total_requests_in_window > historical_requests.len(),
+            changed_runs_cap: scope_options.changed_runs_cap,
+            changed_runs_returned,
+            changed_runs_total,
+            full_replay_available: scope_options.full_replay_available,
+        },
     })
+}
+
+struct ReplayScopeOptions {
+    mode: String,
+    request_cap: Option<usize>,
+    total_requests_in_window: usize,
+    full_replay_available: bool,
+    changed_runs_cap: usize,
 }
 
 fn app_replay_recommendations(
@@ -1707,7 +1978,7 @@ fn replay_historical_requests(
     proposed_policy: &PolicyFile,
     historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
     usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
-) -> Result<(AppRunTotals, Vec<AppReplayChangedRun>, f64), NoetError> {
+) -> Result<(AppRunTotals, Vec<AppReplayChangedRun>, f64, usize), NoetError> {
     let mut replay_ledger = BudgetLedger::default();
     let mut runs = std::collections::BTreeMap::<String, ReplayRunAggregate>::new();
 
@@ -1806,7 +2077,13 @@ fn replay_historical_requests(
         }
     }
     changed_runs.sort_by(|left, right| right.cost_usd.total_cmp(&left.cost_usd));
-    Ok((totals, changed_runs, proposed_spend - baseline_spend))
+    let changed_runs_total = changed_runs.len();
+    Ok((
+        totals,
+        changed_runs,
+        proposed_spend - baseline_spend,
+        changed_runs_total,
+    ))
 }
 
 fn decision_outcome_label(outcome: DecisionOutcome) -> &'static str {
@@ -1836,13 +2113,6 @@ fn replay_change_summary(request: &AuthorizeRequest) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ")
-}
-
-fn app_agent_run_ids_from_decisions(decisions: &[TraceReportItem]) -> Vec<String> {
-    decisions
-        .iter()
-        .filter_map(|decision| decision.agent_run_id.clone())
-        .collect()
 }
 
 fn app_run_totals_from_rows(runs: &[AppRunRow]) -> AppRunTotals {
@@ -1876,16 +2146,6 @@ fn app_run_totals_from_report(report: crate::ledger::RunTotalsReport) -> AppRunT
         spend_usd: report.spend_usd,
         tokens: report.tokens,
     }
-}
-
-fn app_replay_baseline_totals(runs: &[AppRunRow]) -> AppRunTotals {
-    let mut totals = app_run_totals_from_rows(runs);
-    totals.spend_usd = runs
-        .iter()
-        .filter(|run| run.decision != "deny")
-        .map(|run| run.cost_usd.unwrap_or(0.0))
-        .sum();
-    totals
 }
 
 fn app_decision_label(kind: &str) -> String {
@@ -4164,6 +4424,135 @@ budgets:
         assert_eq!(replay["proposal"]["spend_delta_usd"], -1.25);
     }
 
+    #[test]
+    fn noether_app_replay_caps_changed_run_examples() {
+        let proposal_source =
+            serde_yaml::to_string(&require_project_policy()).expect("policy yaml");
+        let proposal = AppPolicyProposal {
+            path: "policy.proposed.yaml".to_owned(),
+            source: proposal_source,
+        };
+        let historical_requests = (0..150)
+            .map(|index| {
+                let mut request = report_request(
+                    &format!("trace-cap-{index}"),
+                    &format!("request-cap-{index}"),
+                    "gpt-4.1",
+                    0.01,
+                );
+                request.project = None;
+                request.entities = Vec::new();
+                crate::ledger::HistoricalAuthorizeRequest {
+                    occurred_at: chrono::Utc::now(),
+                    decision_id: format!("decision-cap-{index}"),
+                    baseline_outcome: DecisionOutcome::Allow,
+                    request,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let replay = app_replay_proposal(
+            "",
+            &proposal,
+            &historical_requests,
+            &std::collections::BTreeMap::new(),
+            ReplayScopeOptions {
+                mode: "preview".to_owned(),
+                request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
+                total_requests_in_window: 150,
+                full_replay_available: true,
+                changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+            },
+        )
+        .expect("replay proposal");
+
+        assert_eq!(replay.changed_runs.len(), APP_REPLAY_CHANGED_RUNS_CAP);
+        assert_eq!(replay.scope.changed_runs_total, 150);
+        assert_eq!(
+            replay.scope.changed_runs_returned,
+            APP_REPLAY_CHANGED_RUNS_CAP
+        );
+        assert_eq!(replay.scope.mode, "preview");
+        assert!(replay.scope.full_replay_available);
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_job_completes_full_month_replay() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&require_project_policy()).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request = report_request("trace-job", "request-job", "gpt-4.1", 0.01);
+            request.project = None;
+            request.entities = Vec::new();
+            ledger.try_authorize(None, &request).expect("authorize");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+
+        let mut completed = None;
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v1/app/replay/jobs/{job_id}"))
+                        .body(Body::empty())
+                        .expect("job status request"),
+                )
+                .await
+                .expect("job status response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("job status body");
+            let status: serde_json::Value = serde_json::from_slice(&body).expect("job status json");
+            if status["status"] == "completed" {
+                completed = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let completed = completed.expect("job completed");
+        assert_eq!(completed["result"]["history_window_days"], 30);
+        assert_eq!(
+            completed["result"]["proposal"]["scope"]["mode"],
+            "full_month"
+        );
+        assert_eq!(
+            completed["result"]["proposal"]["scope"]["request_cap"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            completed["result"]["proposal"]["changed_runs"][0]["to"],
+            "deny"
+        );
+    }
+
     #[tokio::test]
     async fn noether_app_replay_keeps_unchanged_history_empty() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -4239,9 +4628,20 @@ budgets:
             source: source.clone(),
         };
 
-        let replay =
-            app_replay_proposal(&source, &proposal, &[], &std::collections::BTreeMap::new())
-                .expect("replay proposal");
+        let replay = app_replay_proposal(
+            &source,
+            &proposal,
+            &[],
+            &std::collections::BTreeMap::new(),
+            ReplayScopeOptions {
+                mode: "preview".to_owned(),
+                request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
+                total_requests_in_window: 0,
+                full_replay_available: false,
+                changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
+            },
+        )
+        .expect("replay proposal");
 
         assert_eq!(replay.mode, "current_policy_backtest");
         assert!(!replay.can_enforce);
@@ -4274,7 +4674,7 @@ budgets:
         let replay: serde_json::Value =
             serde_json::from_slice(&body).expect("replay response json");
 
-        assert_eq!(replay["history_window_days"], 1);
+        assert_eq!(replay["history_window_days"], 30);
         assert!(replay["history_window_start"].as_str().is_some());
         assert!(replay["history_window_end"].as_str().is_some());
     }
@@ -4299,7 +4699,7 @@ budgets:
             },
         ];
 
-        let (totals, changed_runs, spend_delta) = replay_historical_requests(
+        let (totals, changed_runs, spend_delta, _) = replay_historical_requests(
             &policy,
             &historical_requests,
             &std::collections::BTreeMap::new(),
@@ -4331,7 +4731,7 @@ budgets:
             request,
         }];
 
-        let (totals, changed_runs, spend_delta) = replay_historical_requests(
+        let (totals, changed_runs, spend_delta, _) = replay_historical_requests(
             &policy,
             &historical_requests,
             &std::collections::BTreeMap::new(),
