@@ -182,8 +182,8 @@ project, agent, decision, or rule; open a run to see the policy reason and accou
 
 ### Replay: what would change.
 
-Replay compares current and proposed policy against the same recorded history. It is the killer
-demo: try a stricter rule, inspect changed decisions, then adopt only if the tradeoff is right.
+Replay compares current and proposed policy against the same recorded history. Try a stricter rule,
+inspect changed decisions, then adopt only if the tradeoff is right.
 
 <p align="center">
   <img src="./docs/design_handoff_noether/screenshots/08-replay-with-diff.png" alt="Noether replay screen comparing current and proposed policy outcomes." width="100%">
@@ -232,7 +232,7 @@ Noether is useful because it puts policy at the center:
 | Dashboards show cost but not why it happened. | Reports connect policy decisions, reservations, usage, tool events, and replay. |
 | Policy rollout is guesswork. | Scenarios and simulations show what would change before enforcement. |
 
-## Killer workflows
+## Common use cases
 
 ### 1. Block un-attributed AI work before it spends money
 
