@@ -9,7 +9,8 @@ use std::time::Instant;
 use chrono::{DateTime, Duration, Utc};
 use native_tls::TlsConnector;
 use postgres::{
-    Client as PostgresClient, NoTls, Row as PostgresRow, types::ToSql as PostgresToSql,
+    Client as PostgresClient, NoTls, Row as PostgresRow, Transaction as PostgresTransaction,
+    types::ToSql as PostgresToSql,
 };
 use postgres_native_tls::MakeTlsConnector as PostgresTls;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -151,6 +152,483 @@ struct SimulationUsageObservationRow {
     source: &'static str,
     metadata_json: String,
     created_at: String,
+}
+
+fn insert_simulation_decisions_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationDecisionRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let decision_ids = rows
+        .iter()
+        .map(|row| row.decision_id.clone())
+        .collect::<Vec<_>>();
+    let trace_ids = rows
+        .iter()
+        .map(|row| row.trace_id.clone())
+        .collect::<Vec<_>>();
+    let session_ids = rows
+        .iter()
+        .map(|row| row.session_id.clone())
+        .collect::<Vec<_>>();
+    let request_ids = rows
+        .iter()
+        .map(|row| row.request_id.clone())
+        .collect::<Vec<_>>();
+    let subjects = rows
+        .iter()
+        .map(|row| row.subject.clone())
+        .collect::<Vec<_>>();
+    let projects = rows
+        .iter()
+        .map(|row| row.project.clone())
+        .collect::<Vec<_>>();
+    let providers = rows
+        .iter()
+        .map(|row| row.provider.clone())
+        .collect::<Vec<_>>();
+    let models = rows.iter().map(|row| row.model.clone()).collect::<Vec<_>>();
+    let estimated_tokens = rows
+        .iter()
+        .map(|row| row.estimated_tokens)
+        .collect::<Vec<_>>();
+    let estimated_costs = rows
+        .iter()
+        .map(|row| row.estimated_cost_usd)
+        .collect::<Vec<_>>();
+    let outcomes = rows
+        .iter()
+        .map(|row| row.outcome.to_owned())
+        .collect::<Vec<_>>();
+    let actions = rows
+        .iter()
+        .map(|row| row.action.to_owned())
+        .collect::<Vec<_>>();
+    let explanations = rows
+        .iter()
+        .map(|row| row.explanations_json.clone())
+        .collect::<Vec<_>>();
+    let metadata = rows
+        .iter()
+        .map(|row| row.metadata_json.clone())
+        .collect::<Vec<_>>();
+    let entities = rows
+        .iter()
+        .map(|row| row.entities_json.clone())
+        .collect::<Vec<_>>();
+    let selected_budget_ids = rows
+        .iter()
+        .map(|row| row.selected_budget_id.clone())
+        .collect::<Vec<_>>();
+    let matched_entities = rows
+        .iter()
+        .map(|row| row.matched_entity.clone())
+        .collect::<Vec<_>>();
+    let selection_reasons = rows
+        .iter()
+        .map(|row| row.selection_reason.clone())
+        .collect::<Vec<_>>();
+    let rejected_budget_ids = rows
+        .iter()
+        .map(|row| row.rejected_budget_id.clone())
+        .collect::<Vec<_>>();
+    let rejected_budget_reasons = rows
+        .iter()
+        .map(|row| row.rejected_budget_reason.clone())
+        .collect::<Vec<_>>();
+    let model_checks = rows
+        .iter()
+        .map(|row| row.model_check.clone())
+        .collect::<Vec<_>>();
+    let budget_remaining = rows
+        .iter()
+        .map(|row| row.budget_window_remaining_usd)
+        .collect::<Vec<_>>();
+    let routing_json = rows
+        .iter()
+        .map(|row| row.routing_json.clone())
+        .collect::<Vec<_>>();
+    let limit_hits_json = rows
+        .iter()
+        .map(|row| row.limit_hits_json.clone())
+        .collect::<Vec<_>>();
+    let max_tool_calls = rows
+        .iter()
+        .map(|row| row.max_tool_calls)
+        .collect::<Vec<_>>();
+    let max_agent_steps = rows
+        .iter()
+        .map(|row| row.max_agent_steps)
+        .collect::<Vec<_>>();
+    let max_retries = rows.iter().map(|row| row.max_retries).collect::<Vec<_>>();
+    let app_run_keys = rows
+        .iter()
+        .map(|row| row.app_run_key.clone())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+
+    tx.execute(
+        "
+        INSERT INTO decisions (
+            decision_id, trace_id, session_id, request_id, subject, project, provider, model,
+            estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
+            entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+            rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
+            limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+            $8::text[], $9::bigint[], $10::double precision[], $11::text[], $12::text[],
+            $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[],
+            $19::text[], $20::text[], $21::text[], $22::double precision[], $23::text[],
+            $24::text[], $25::bigint[], $26::bigint[], $27::bigint[], $28::text[], $29::text[]
+        )
+        ",
+        &[
+            &decision_ids,
+            &trace_ids,
+            &session_ids,
+            &request_ids,
+            &subjects,
+            &projects,
+            &providers,
+            &models,
+            &estimated_tokens,
+            &estimated_costs,
+            &outcomes,
+            &actions,
+            &explanations,
+            &metadata,
+            &entities,
+            &selected_budget_ids,
+            &matched_entities,
+            &selection_reasons,
+            &rejected_budget_ids,
+            &rejected_budget_reasons,
+            &model_checks,
+            &budget_remaining,
+            &routing_json,
+            &limit_hits_json,
+            &max_tool_calls,
+            &max_agent_steps,
+            &max_retries,
+            &app_run_keys,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_reservations_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationReservationRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let decision_ids = rows
+        .iter()
+        .map(|row| row.decision_id.clone())
+        .collect::<Vec<_>>();
+    let amounts = rows.iter().map(|row| row.amount_usd).collect::<Vec<_>>();
+    let estimated_amounts = rows
+        .iter()
+        .map(|row| row.estimated_amount_usd)
+        .collect::<Vec<_>>();
+    let actual_amounts = rows
+        .iter()
+        .map(|row| row.actual_amount_usd)
+        .collect::<Vec<_>>();
+    let currencies = rows
+        .iter()
+        .map(|row| row.currency.clone())
+        .collect::<Vec<_>>();
+    let statuses = rows
+        .iter()
+        .map(|row| row.status.to_owned())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    let expires_at = rows
+        .iter()
+        .map(|row| row.expires_at.clone())
+        .collect::<Vec<_>>();
+    let finalized_at = rows
+        .iter()
+        .map(|row| row.finalized_at.clone())
+        .collect::<Vec<_>>();
+    let budget_rule_ids = rows
+        .iter()
+        .map(|row| row.budget_rule_ids_json.clone())
+        .collect::<Vec<_>>();
+    let limit_window_spends = rows
+        .iter()
+        .map(|row| row.limit_window_spends_json.clone())
+        .collect::<Vec<_>>();
+    let allocation_spends = rows
+        .iter()
+        .map(|row| row.allocation_spends_json.clone())
+        .collect::<Vec<_>>();
+
+    tx.execute(
+        "
+        INSERT INTO reservations (
+            id, decision_id, amount_usd, estimated_amount_usd, actual_amount_usd, currency, status,
+            created_at, expires_at, finalized_at, budget_rule_ids_json, limit_window_spends_json,
+            allocation_spends_json
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::double precision[], $4::double precision[],
+            $5::double precision[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+            $11::text[], $12::text[], $13::text[]
+        )
+        ",
+        &[
+            &ids,
+            &decision_ids,
+            &amounts,
+            &estimated_amounts,
+            &actual_amounts,
+            &currencies,
+            &statuses,
+            &created_at,
+            &expires_at,
+            &finalized_at,
+            &budget_rule_ids,
+            &limit_window_spends,
+            &allocation_spends,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_reservation_scopes_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationReservationScopeRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let reservation_ids = rows
+        .iter()
+        .map(|row| row.reservation_id.clone())
+        .collect::<Vec<_>>();
+    let rule_ids = rows
+        .iter()
+        .map(|row| row.rule_id.clone())
+        .collect::<Vec<_>>();
+    let limit_ids = rows
+        .iter()
+        .map(|row| row.limit_id.clone())
+        .collect::<Vec<_>>();
+    let scope_keys = rows
+        .iter()
+        .map(|row| row.scope_key.clone())
+        .collect::<Vec<_>>();
+    let amounts = rows.iter().map(|row| row.amount_usd).collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO reservation_limit_scopes (
+            reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[], $6::text[]
+        )
+        ",
+        &[
+            &reservation_ids,
+            &rule_ids,
+            &limit_ids,
+            &scope_keys,
+            &amounts,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_usage_observations_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationUsageObservationRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let reservation_ids = rows
+        .iter()
+        .map(|row| row.reservation_id.clone())
+        .collect::<Vec<_>>();
+    let trace_ids = rows
+        .iter()
+        .map(|row| row.trace_id.clone())
+        .collect::<Vec<_>>();
+    let providers = rows
+        .iter()
+        .map(|row| row.provider.clone())
+        .collect::<Vec<_>>();
+    let models = rows.iter().map(|row| row.model.clone()).collect::<Vec<_>>();
+    let input_tokens = rows.iter().map(|row| row.input_tokens).collect::<Vec<_>>();
+    let output_tokens = rows.iter().map(|row| row.output_tokens).collect::<Vec<_>>();
+    let total_tokens = rows.iter().map(|row| row.total_tokens).collect::<Vec<_>>();
+    let costs = rows.iter().map(|row| row.cost_usd).collect::<Vec<_>>();
+    let latency = rows.iter().map(|row| row.latency_ms).collect::<Vec<_>>();
+    let stop_reasons = rows
+        .iter()
+        .map(|row| row.stop_reason.clone())
+        .collect::<Vec<_>>();
+    let sources = rows
+        .iter()
+        .map(|row| row.source.to_owned())
+        .collect::<Vec<_>>();
+    let metadata = rows
+        .iter()
+        .map(|row| row.metadata_json.clone())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO usage_observations (
+            id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
+            total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[],
+            $7::bigint[], $8::bigint[], $9::double precision[], $10::bigint[], $11::text[],
+            $12::text[], $13::text[], $14::text[]
+        )
+        ",
+        &[
+            &ids,
+            &reservation_ids,
+            &trace_ids,
+            &providers,
+            &models,
+            &input_tokens,
+            &output_tokens,
+            &total_tokens,
+            &costs,
+            &latency,
+            &stop_reasons,
+            &sources,
+            &metadata,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_simulation_limit_windows_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    windows: &HashMap<(String, String, String), WindowState>,
+) -> Result<(), NoetError> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let rule_ids = windows
+        .keys()
+        .map(|(rule_id, _, _)| rule_id.clone())
+        .collect::<Vec<_>>();
+    let limit_ids = windows
+        .keys()
+        .map(|(_, limit_id, _)| limit_id.clone())
+        .collect::<Vec<_>>();
+    let scope_keys = windows
+        .keys()
+        .map(|(_, _, scope_key)| scope_key.clone())
+        .collect::<Vec<_>>();
+    let started_at = windows
+        .values()
+        .map(|window| window.started_at.to_rfc3339())
+        .collect::<Vec<_>>();
+    let used_usd = windows
+        .values()
+        .map(|window| window.used_usd)
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[])
+        ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+            started_at = EXCLUDED.started_at,
+            used_usd = EXCLUDED.used_usd
+        ",
+        &[&rule_ids, &limit_ids, &scope_keys, &started_at, &used_usd],
+    )?;
+    Ok(())
+}
+
+fn upsert_simulation_allocation_buckets_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    buckets: &HashMap<(String, String), AllocationBucketState>,
+) -> Result<(), NoetError> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let rule_ids = buckets
+        .keys()
+        .map(|(rule_id, _)| rule_id.clone())
+        .collect::<Vec<_>>();
+    let entity_keys = buckets
+        .keys()
+        .map(|(_, entity_key)| entity_key.clone())
+        .collect::<Vec<_>>();
+    let started_at = buckets
+        .values()
+        .map(|bucket| bucket.started_at.to_rfc3339())
+        .collect::<Vec<_>>();
+    let protected_amounts = buckets
+        .values()
+        .map(|bucket| bucket.protected_amount_usd)
+        .collect::<Vec<_>>();
+    let current_grants = buckets
+        .values()
+        .map(|bucket| bucket.current_grant_usd)
+        .collect::<Vec<_>>();
+    let carryovers = buckets
+        .values()
+        .map(|bucket| bucket.carryover_usd)
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO budget_allocation_buckets (
+            rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::double precision[], $5::double precision[],
+            $6::double precision[]
+        )
+        ON CONFLICT(rule_id, entity_key) DO UPDATE SET
+            started_at = EXCLUDED.started_at,
+            protected_amount_usd = EXCLUDED.protected_amount_usd,
+            current_grant_usd = EXCLUDED.current_grant_usd,
+            carryover_usd = EXCLUDED.carryover_usd
+        ",
+        &[
+            &rule_ids,
+            &entity_keys,
+            &started_at,
+            &protected_amounts,
+            &current_grants,
+            &carryovers,
+        ],
+    )?;
+    Ok(())
 }
 
 impl LedgerPersistenceSnapshot {
@@ -1651,134 +2129,12 @@ impl BudgetLedger {
         let mut pg = pg_conn.0.lock().expect("postgres mutex");
         let mut tx = pg.transaction()?;
 
-        for row in &batch.decisions {
-            tx.execute(
-                "
-                INSERT INTO decisions (
-                    decision_id, trace_id, session_id, request_id, subject, project, provider, model,
-                    estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
-                    entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
-                    rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
-                    limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                    $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
-                )
-                ",
-                &[
-                    &row.decision_id.as_str(), &row.trace_id.as_deref(), &row.session_id.as_deref(),
-                    &row.request_id.as_deref(), &row.subject.as_deref(), &row.project.as_deref(),
-                    &row.provider.as_deref(), &row.model.as_deref(), &row.estimated_tokens,
-                    &row.estimated_cost_usd, &row.outcome, &row.action, &row.explanations_json,
-                    &row.metadata_json, &row.entities_json, &row.selected_budget_id.as_deref(),
-                    &row.matched_entity.as_deref(), &row.selection_reason.as_deref(),
-                    &row.rejected_budget_id.as_deref(), &row.rejected_budget_reason.as_deref(),
-                    &row.model_check.as_deref(), &row.budget_window_remaining_usd,
-                    &row.routing_json, &row.limit_hits_json, &row.max_tool_calls,
-                    &row.max_agent_steps, &row.max_retries, &row.app_run_key, &row.created_at,
-                ],
-            )?;
-        }
-
-        for row in &batch.reservations {
-            tx.execute(
-                "
-                INSERT INTO reservations (
-                    id, decision_id, amount_usd, estimated_amount_usd, actual_amount_usd,
-                    currency, status, created_at, expires_at, finalized_at, budget_rule_ids_json,
-                    limit_window_spends_json, allocation_spends_json
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ",
-                &[
-                    &row.id.as_str(),
-                    &row.decision_id.as_str(),
-                    &row.amount_usd,
-                    &row.estimated_amount_usd,
-                    &row.actual_amount_usd,
-                    &row.currency.as_str(),
-                    &row.status,
-                    &row.created_at,
-                    &row.expires_at,
-                    &row.finalized_at.as_deref(),
-                    &row.budget_rule_ids_json,
-                    &row.limit_window_spends_json,
-                    &row.allocation_spends_json,
-                ],
-            )?;
-        }
-
-        for row in &batch.reservation_scopes {
-            tx.execute(
-                "
-                INSERT INTO reservation_limit_scopes (
-                    reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6)
-                ",
-                &[
-                    &row.reservation_id.as_str(),
-                    &row.rule_id.as_str(),
-                    &row.limit_id.as_str(),
-                    &row.scope_key.as_str(),
-                    &row.amount_usd,
-                    &row.created_at,
-                ],
-            )?;
-        }
-
-        for row in &batch.usage_observations {
-            tx.execute(
-                "
-                INSERT INTO usage_observations (
-                    id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
-                    total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                ",
-                &[
-                    &row.id.as_str(), &row.reservation_id.as_str(), &row.trace_id.as_deref(),
-                    &row.provider.as_deref(), &row.model.as_deref(), &row.input_tokens,
-                    &row.output_tokens, &row.total_tokens, &row.cost_usd, &row.latency_ms,
-                    &row.stop_reason.as_deref(), &row.source, &row.metadata_json, &row.created_at,
-                ],
-            )?;
-        }
-
-        for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
-            tx.execute(
-                "
-                INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
-                    started_at = EXCLUDED.started_at,
-                    used_usd = EXCLUDED.used_usd
-                ",
-                &[
-                    rule_id,
-                    limit_id,
-                    scope_key,
-                    &window.started_at.to_rfc3339(),
-                    &window.used_usd,
-                ],
-            )?;
-        }
-        for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
-            tx.execute(
-                "
-                INSERT INTO budget_allocation_buckets (
-                    rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
-                ) VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT(rule_id, entity_key) DO UPDATE SET
-                    started_at = EXCLUDED.started_at,
-                    protected_amount_usd = EXCLUDED.protected_amount_usd,
-                    current_grant_usd = EXCLUDED.current_grant_usd,
-                    carryover_usd = EXCLUDED.carryover_usd
-                ",
-                &[
-                    rule_id, entity_key, &bucket.started_at.to_rfc3339(),
-                    &bucket.protected_amount_usd, &bucket.current_grant_usd, &bucket.carryover_usd,
-                ],
-            )?;
-        }
-
+        insert_simulation_decisions_postgres(&mut tx, &batch.decisions)?;
+        insert_simulation_reservations_postgres(&mut tx, &batch.reservations)?;
+        insert_simulation_reservation_scopes_postgres(&mut tx, &batch.reservation_scopes)?;
+        insert_simulation_usage_observations_postgres(&mut tx, &batch.usage_observations)?;
+        upsert_simulation_limit_windows_postgres(&mut tx, &self.limit_windows)?;
+        upsert_simulation_allocation_buckets_postgres(&mut tx, &self.allocation_buckets)?;
         tx.commit()?;
         Ok(())
     }
