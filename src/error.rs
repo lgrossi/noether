@@ -27,6 +27,9 @@ pub enum NoetError {
     #[error("PostgreSQL error: {0}")]
     Postgres(#[from] postgres::Error),
 
+    #[error("PostgreSQL TLS error: {0}")]
+    PostgresTls(#[from] native_tls::Error),
+
     #[error("invalid upstream method: {0}")]
     Method(String),
 
@@ -53,7 +56,8 @@ impl IntoResponse for NoetError {
             | Self::Url(_)
             | Self::Method(_)
             | Self::Sqlite(_)
-            | Self::Postgres(_) => StatusCode::BAD_GATEWAY,
+            | Self::Postgres(_)
+            | Self::PostgresTls(_) => StatusCode::BAD_GATEWAY,
         };
 
         (status, json!({ "error": self.to_string() }).to_string()).into_response()

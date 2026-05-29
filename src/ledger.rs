@@ -7,9 +7,11 @@ use std::sync::{
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
+use native_tls::TlsConnector;
 use postgres::{
     Client as PostgresClient, NoTls, Row as PostgresRow, types::ToSql as PostgresToSql,
 };
+use postgres_native_tls::MakeTlsConnector as PostgresTls;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -706,17 +708,48 @@ async fn apply_postgres_connection_options(
     Ok(())
 }
 
-async fn connect_async_postgres_connection(
+fn postgres_url_requires_tls(database_url: &str) -> bool {
+    url::Url::parse(database_url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
+                .map(|(_, value)| value.to_ascii_lowercase())
+        })
+        .map(|sslmode| matches!(sslmode.as_str(), "require" | "verify-ca" | "verify-full"))
+        .unwrap_or(false)
+}
+
+async fn connect_async_postgres_client(
     database_url: &str,
-    options: &AsyncPostgresLedgerOptions,
-    initialize_schema: bool,
-) -> Result<Arc<tokio::sync::Mutex<AsyncPostgresConnection>>, NoetError> {
+) -> Result<AsyncPostgresClient, NoetError> {
+    if postgres_url_requires_tls(database_url) {
+        let connector = TlsConnector::new()?;
+        let connector = PostgresTls::new(connector);
+        let (client, connection) = tokio_postgres::connect(database_url, connector).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(error = %error, "postgres connection failed");
+            }
+        });
+        return Ok(client);
+    }
+
     let (client, connection) = tokio_postgres::connect(database_url, AsyncNoTls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             tracing::error!(error = %error, "postgres connection failed");
         }
     });
+    Ok(client)
+}
+
+async fn connect_async_postgres_connection(
+    database_url: &str,
+    options: &AsyncPostgresLedgerOptions,
+    initialize_schema: bool,
+) -> Result<Arc<tokio::sync::Mutex<AsyncPostgresConnection>>, NoetError> {
+    let client = connect_async_postgres_client(database_url).await?;
     apply_postgres_connection_options(&client, options).await?;
     if initialize_schema {
         init_postgres_schema_async(&client).await?;
@@ -795,19 +828,14 @@ impl AsyncPostgresLedger {
     ) -> Result<Self, NoetError> {
         let pool_size = options.pool_size.max(1);
         let mut connections = Vec::with_capacity(pool_size);
-        let (client, connection) = tokio_postgres::connect(database_url, AsyncNoTls).await?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(error = %error, "postgres connection failed");
-            }
-        });
+        let client = connect_async_postgres_client(database_url).await?;
         apply_postgres_connection_options(&client, &options).await?;
         init_postgres_schema_async(&client).await?;
         let statements = prepare_async_postgres_statements(&client).await?;
         let mut ledger = BudgetLedger::default();
         load_limit_windows_async(&client, &mut ledger).await?;
         load_allocation_buckets_async(&client, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&client, &mut ledger).await?;
+        load_rolling_spend_buckets_async(&client, &mut ledger, None, Utc::now()).await?;
         load_active_reservations_async(&client, &mut ledger, false).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
@@ -871,7 +899,7 @@ impl AsyncPostgresLedger {
             .await?;
         load_limit_windows_async(&tx, &mut ledger).await?;
         load_allocation_buckets_async(&tx, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
+        load_rolling_spend_buckets_async(&tx, &mut ledger, policy.as_deref(), now).await?;
         load_active_reservations_async(&tx, &mut ledger, self.finalize_tx.is_some()).await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
@@ -908,7 +936,6 @@ impl AsyncPostgresLedger {
                 .await?;
             load_limit_windows_async(&tx, &mut ledger).await?;
             load_allocation_buckets_async(&tx, &mut ledger).await?;
-            load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
             load_active_reservations_async(&tx, &mut ledger, preserve_local_finalized).await?;
             if !ledger.reservations.contains_key(&reservation_id) {
                 load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
@@ -1048,7 +1075,13 @@ impl BudgetLedger {
     }
 
     pub fn open_postgres(database_url: &str) -> Result<Self, NoetError> {
-        let mut pg_conn = PostgresClient::connect(database_url, NoTls)?;
+        let mut pg_conn = if postgres_url_requires_tls(database_url) {
+            let connector = TlsConnector::new()?;
+            let connector = PostgresTls::new(connector);
+            PostgresClient::connect(database_url, connector)?
+        } else {
+            PostgresClient::connect(database_url, NoTls)?
+        };
         init_postgres_schema(&mut pg_conn)?;
         let mut ledger = Self::default();
         ledger.pg_conn = Some(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn))));
@@ -4853,14 +4886,23 @@ async fn load_allocation_buckets_async(
 async fn load_rolling_spend_buckets_async(
     conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
+    policy: Option<&PolicyFile>,
+    now: DateTime<Utc>,
 ) -> Result<(), NoetError> {
+    let Some(duration) = policy.and_then(biggest_policy_rolling_spend_window_duration) else {
+        ledger.rolling_spend_buckets.clear();
+        return Ok(());
+    };
+    let since = rolling_bucket_start(now - duration).to_rfc3339();
+    let until = rolling_bucket_start(now).to_rfc3339();
     let rows = conn
         .query(
             "
             SELECT rule_id, limit_id, scope_key, bucket_start, amount_usd
             FROM rolling_spend_buckets
+            WHERE bucket_start >= $1 AND bucket_start <= $2
             ",
-            &[],
+            &[&since, &until],
         )
         .await?;
     ledger.rolling_spend_buckets = rows
@@ -6684,6 +6726,16 @@ fn biggest_spend_window_duration(rule: &BudgetRule) -> Option<Duration> {
     rule.limits
         .spend
         .iter()
+        .filter_map(|limit| crate::policy::parse_limit_window(&limit.window))
+        .max_by_key(|window| window.num_seconds())
+}
+
+fn biggest_policy_rolling_spend_window_duration(policy: &PolicyFile) -> Option<Duration> {
+    policy
+        .budgets
+        .iter()
+        .flat_map(|rule| &rule.limits.spend)
+        .filter(|limit| matches!(limit.mode, Some(SpendWindowMode::Rolling)))
         .filter_map(|limit| crate::policy::parse_limit_window(&limit.window))
         .max_by_key(|window| window.num_seconds())
 }

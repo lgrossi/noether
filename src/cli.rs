@@ -279,7 +279,11 @@ pub async fn run() -> Result<(), NoetError> {
     match cli.command {
         Command::Serve(args) => {
             let policy_path = args.policy.clone();
-            let postgres_options = postgres_options_from_serve_args(&args)?;
+            let postgres_options = if args.database_url.is_some() {
+                postgres_options_from_serve_args(&args)?
+            } else {
+                AsyncPostgresLedgerOptions::default()
+            };
             let policy = match policy_path.as_ref() {
                 Some(path) => Some(load_policy(path).await?),
                 None => None,
