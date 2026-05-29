@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -14,7 +14,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_postgres::{Client as AsyncPostgresClient, NoTls as AsyncNoTls, Statement};
+use tokio_postgres::{
+    Client as AsyncPostgresClient, GenericClient, NoTls as AsyncNoTls, Statement,
+};
 use uuid::Uuid;
 
 use crate::contract::{
@@ -36,6 +38,8 @@ pub struct BudgetLedger {
     // TODO(psql): replace this process-local cadence stub with durable per-user advisory state.
     advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
     reservations: HashMap<String, StoredReservation>,
+    last_selected_budget_id: Option<String>,
+    last_limit_hits: Vec<DecisionLimitHitReport>,
     events: Vec<TraceEvent>,
     conn: Option<Connection>,
     pg_conn: Option<Arc<SyncPostgresClient>>,
@@ -48,6 +52,8 @@ struct LedgerPersistenceSnapshot {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     reservations: HashMap<String, StoredReservation>,
+    selected_budget_id: Option<String>,
+    limit_hits: Vec<DecisionLimitHitReport>,
 }
 
 impl LedgerPersistenceSnapshot {
@@ -62,7 +68,8 @@ impl LedgerPersistenceSnapshot {
             .as_ref()
             .and_then(|reservation| self.reservations.get(&reservation.id))
             .and_then(|stored| stored.budget_rule_ids.first())
-            .cloned();
+            .cloned()
+            .or_else(|| self.selected_budget_id.clone());
 
         let mut fields = RoutingPersistenceFields {
             selected_budget_id: selected_budget_id.clone(),
@@ -77,6 +84,28 @@ impl LedgerPersistenceSnapshot {
             {
                 fields.matched_entity =
                     matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
+                let ledger = BudgetLedger {
+                    limit_windows: self.limit_windows.clone(),
+                    allocation_buckets: self.allocation_buckets.clone(),
+                    reservations: self.reservations.clone(),
+                    last_selected_budget_id: self.selected_budget_id.clone(),
+                    last_limit_hits: self.limit_hits.clone(),
+                    events: Vec::new(),
+                    conn: None,
+                    pg_conn: None,
+                };
+                if let Some(projection) =
+                    biggest_spend_window_projection(&ledger, rule, request, 0.0, decision.created_at)
+                {
+                    fields.budget_window_remaining_usd =
+                        Some((projection.max_usd - projection.projected_spend_usd).max(0.0));
+                    fields.budget_window_mode = Some(match projection.limit_mode {
+                        SpendWindowMode::Rolling => "rolling".to_owned(),
+                        SpendWindowMode::Tumbling => "tumbling".to_owned(),
+                    });
+                    fields.budget_window_started_at = projection.window_started_at;
+                    fields.budget_window_ends_at = projection.window_ends_at;
+                }
                 fields.tool_calls = rule.limits.tool_calls;
                 fields.agent_steps = rule.limits.agent_steps;
                 fields.retries = rule.limits.retries;
@@ -424,11 +453,11 @@ pub struct AsyncPostgresLedger {
     pool: Arc<AsyncPostgresPool>,
     ledger: Arc<tokio::sync::Mutex<BudgetLedger>>,
     finalize_tx: Option<mpsc::Sender<AsyncFinalizeWrite>>,
+    async_finalize_failures: Arc<AtomicU64>,
     stage_timing: bool,
 }
 
 struct AsyncPostgresStatements {
-    authorize_fast: Statement,
     finalize_with_usage_fast: Statement,
     finalize_without_usage_fast: Statement,
 }
@@ -642,7 +671,6 @@ async fn prepare_async_postgres_statements(
     client: &AsyncPostgresClient,
 ) -> Result<AsyncPostgresStatements, NoetError> {
     Ok(AsyncPostgresStatements {
-        authorize_fast: client.prepare(ASYNC_AUTHORIZE_FAST_SQL).await?,
         finalize_with_usage_fast: client.prepare(ASYNC_FINALIZE_WITH_USAGE_FAST_SQL).await?,
         finalize_without_usage_fast: client
             .prepare(ASYNC_FINALIZE_WITHOUT_USAGE_FAST_SQL)
@@ -700,30 +728,48 @@ fn normalized_synchronous_commit(value: &str) -> Result<&'static str, NoetError>
 
 async fn run_async_postgres_finalize_worker(
     connection: Arc<tokio::sync::Mutex<AsyncPostgresConnection>>,
+    failures: Arc<AtomicU64>,
     mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
 ) {
     while let Some(write) = rx.recv().await {
-        let connection = connection.lock().await;
-        match persist_finalization_async(
-            &connection.client,
-            &connection.statements,
-            &write.reservation,
-            &write.payload,
-            &write.snapshot,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) =
-                    persist_limit_windows_async(&connection.client, &write.snapshot).await
-                {
-                    tracing::error!(error = %error, "postgres async finalize limit-window persistence failed");
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            let connection = connection.lock().await;
+            let result = async {
+                let persisted_limit_window = persist_finalization_async(
+                    &connection.client,
+                    &connection.statements,
+                    &write.reservation,
+                    &write.payload,
+                    &write.snapshot,
+                )
+                .await?;
+                if !persisted_limit_window {
+                    persist_limit_windows_async(&connection.client, &write.snapshot).await?;
+                }
+                Ok::<_, NoetError>(())
+            }
+            .await;
+            drop(connection);
+            match result {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        attempt,
+                        "postgres async finalize persistence attempt failed"
+                    );
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(25 * attempt)).await;
                 }
             }
-            Err(error) => {
-                tracing::error!(error = %error, "postgres async finalize persistence failed");
-            }
+        }
+        if let Some(error) = last_error {
+            failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(error = %error, "postgres async finalize persistence failed permanently");
         }
     }
 }
@@ -764,11 +810,16 @@ impl AsyncPostgresLedger {
             connections,
             next: AtomicUsize::new(0),
         });
+        let async_finalize_failures = Arc::new(AtomicU64::new(0));
         let finalize_tx = if options.async_finalize {
             let finalize_connection =
                 connect_async_postgres_connection(database_url, &options, false).await?;
             let (tx, rx) = mpsc::channel(options.finalize_queue_capacity);
-            tokio::spawn(run_async_postgres_finalize_worker(finalize_connection, rx));
+            tokio::spawn(run_async_postgres_finalize_worker(
+                finalize_connection,
+                async_finalize_failures.clone(),
+                rx,
+            ));
             Some(tx)
         } else {
             None
@@ -777,8 +828,13 @@ impl AsyncPostgresLedger {
             pool,
             ledger: Arc::new(tokio::sync::Mutex::new(ledger)),
             finalize_tx,
+            async_finalize_failures,
             stage_timing: options.stage_timing,
         })
+    }
+
+    pub fn async_finalize_failures(&self) -> u64 {
+        self.async_finalize_failures.load(Ordering::Relaxed)
     }
 
     pub async fn try_authorize(
@@ -796,25 +852,21 @@ impl AsyncPostgresLedger {
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
         let started = Instant::now();
-        let (decision, snapshot) = {
-            let mut ledger = self.ledger.lock().await;
-            let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
-            let snapshot = ledger.persistence_snapshot();
-            (decision, snapshot)
-        };
+        let mut ledger = self.ledger.lock().await;
+        let connection = self.pool.connection();
+        let mut connection = connection.lock().await;
+        let tx = connection.client.transaction().await?;
+        tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
+            .await?;
+        load_limit_windows_async(&tx, &mut ledger).await?;
+        load_allocation_buckets_async(&tx, &mut ledger).await?;
+        load_active_reservations_async(&tx, &mut ledger).await?;
+        let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
+        let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
         let db_started = Instant::now();
-        let connection = self.pool.connection();
-        let connection = connection.lock().await;
-        persist_decision_async(
-            &connection.client,
-            &connection.statements,
-            &snapshot,
-            policy.as_deref(),
-            &request,
-            &decision,
-        )
-        .await?;
+        persist_decision_async(&tx, &snapshot, policy.as_deref(), &request, &decision).await?;
+        tx.commit().await?;
         if self.stage_timing {
             tracing::debug!(
                 decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
@@ -930,6 +982,8 @@ impl BudgetLedger {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
             reservations: self.reservations.clone(),
+            selected_budget_id: self.last_selected_budget_id.clone(),
+            limit_hits: self.last_limit_hits.clone(),
         }
     }
 
@@ -1046,6 +1100,8 @@ impl BudgetLedger {
         } else {
             Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
         };
+        self.last_selected_budget_id = selected_budget_id.clone();
+        self.last_limit_hits = limit_hits.clone();
         if reservation.is_some() {
             self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
@@ -1278,7 +1334,7 @@ impl BudgetLedger {
             return Ok(UsageReport {
                 total_cost_usd: rows.iter().map(|row| row.total_cost_usd).sum(),
                 rows,
-                protected_adoption: None,
+                protected_adoption: protected_adoption_report_postgres(pg_conn)?,
             });
         }
         let Some(conn) = &self.conn else {
@@ -4633,7 +4689,7 @@ async fn init_postgres_schema_async(conn: &AsyncPostgresClient) -> Result<(), No
 }
 
 async fn load_limit_windows_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
 ) -> Result<(), NoetError> {
     let rows = conn
@@ -4661,7 +4717,7 @@ async fn load_limit_windows_async(
 }
 
 async fn load_allocation_buckets_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
 ) -> Result<(), NoetError> {
     let rows = conn
@@ -4694,7 +4750,7 @@ async fn load_allocation_buckets_async(
 }
 
 async fn load_active_reservations_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
 ) -> Result<(), NoetError> {
     let rows = conn
@@ -4742,7 +4798,7 @@ async fn load_active_reservations_async(
 }
 
 async fn persist_limit_windows_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     snapshot: &LedgerPersistenceSnapshot,
 ) -> Result<(), NoetError> {
     for ((rule_id, limit_id, scope_key), window) in &snapshot.limit_windows {
@@ -4768,7 +4824,7 @@ async fn persist_limit_windows_async(
 }
 
 async fn persist_allocation_buckets_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     snapshot: &LedgerPersistenceSnapshot,
 ) -> Result<(), NoetError> {
     for ((rule_id, entity_key), bucket) in &snapshot.allocation_buckets {
@@ -4798,8 +4854,7 @@ async fn persist_allocation_buckets_async(
 }
 
 async fn persist_decision_async(
-    conn: &AsyncPostgresClient,
-    statements: &AsyncPostgresStatements,
+    conn: &(impl GenericClient + Sync),
     snapshot: &LedgerPersistenceSnapshot,
     policy: Option<&PolicyFile>,
     request: &AuthorizeRequest,
@@ -4836,7 +4891,7 @@ async fn persist_decision_async(
     let metadata_json = serde_json::to_string(&request.metadata)?;
     let entities_json = serde_json::to_string(&request.entities)?;
     let routing_json = serde_json::to_string(&routing_report)?;
-    let empty_limit_hits_json = "[]".to_owned();
+    let limit_hits_json = serde_json::to_string(&snapshot.limit_hits)?;
     let max_tool_calls = routing.tool_calls.map(|value| value as i64);
     let max_agent_steps = routing.agent_steps.map(|value| value as i64);
     let max_retries = routing.retries.map(|value| value as i64);
@@ -4860,7 +4915,7 @@ async fn persist_decision_async(
                     let window_started_at = window.started_at.to_rfc3339();
                     let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
                     conn.execute(
-                        &statements.authorize_fast,
+                        ASYNC_AUTHORIZE_FAST_SQL,
                         &[
                             &decision.decision_id.as_str(),
                             &trace_id.as_deref(),
@@ -4885,7 +4940,7 @@ async fn persist_decision_async(
                             &routing.model_check.as_deref(),
                             &routing.budget_window_remaining_usd,
                             &routing_json,
-                            &empty_limit_hits_json,
+                            &limit_hits_json,
                             &max_tool_calls,
                             &max_agent_steps,
                             &max_retries,
@@ -4955,7 +5010,7 @@ async fn persist_decision_async(
             &routing.model_check.as_deref(),
             &routing.budget_window_remaining_usd,
             &routing_json,
-            &empty_limit_hits_json,
+            &limit_hits_json,
             &max_tool_calls,
             &max_agent_steps,
             &max_retries,
@@ -5463,6 +5518,65 @@ fn protected_adoption_report(
             })
         })?
         .collect::<Result<_, _>>()?;
+    if entities.is_empty() {
+        return Ok(None);
+    }
+
+    let mut low_adopters = Vec::new();
+    let mut high_adopters = Vec::new();
+    for entity in &entities {
+        let usage_fraction = if entity.protected_amount_usd <= 0.0 {
+            0.0
+        } else {
+            entity.used_current_grant_usd / entity.protected_amount_usd
+        };
+        if usage_fraction <= 0.2 {
+            low_adopters.push(entity.clone());
+        }
+        if usage_fraction >= 0.8 {
+            high_adopters.push(entity.clone());
+        }
+    }
+
+    Ok(Some(ProtectedAdoptionReport {
+        unused_protected_opportunity_usd: entities
+            .iter()
+            .map(|entity| entity.current_grant_usd)
+            .sum(),
+        carryover_liability_usd: entities.iter().map(|entity| entity.carryover_usd).sum(),
+        low_adopters,
+        high_adopters,
+    }))
+}
+
+fn protected_adoption_report_postgres(
+    pg_conn: &SyncPostgresClient,
+) -> Result<Option<ProtectedAdoptionReport>, NoetError> {
+    let rows = pg_conn.0.lock().expect("postgres mutex").query(
+        "
+        SELECT rule_id, entity_key, protected_amount_usd, current_grant_usd, carryover_usd
+        FROM budget_allocation_buckets
+        WHERE protected_amount_usd > 0
+        ORDER BY rule_id, entity_key
+        ",
+        &[],
+    )?;
+    let entities = rows
+        .into_iter()
+        .map(|row| {
+            let protected_amount_usd: f64 = row.get(2);
+            let current_grant_usd: f64 = row.get(3);
+            let carryover_usd: f64 = row.get(4);
+            ProtectedAdoptionEntityReport {
+                budget_id: row.get(0),
+                entity_key: row.get(1),
+                protected_amount_usd,
+                current_grant_usd,
+                carryover_usd,
+                used_current_grant_usd: (protected_amount_usd - current_grant_usd).max(0.0),
+            }
+        })
+        .collect::<Vec<_>>();
     if entities.is_empty() {
         return Ok(None);
     }

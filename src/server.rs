@@ -121,6 +121,7 @@ struct HealthResponse {
     upstream_configured: bool,
     route_count: usize,
     ledger_backend: &'static str,
+    postgres_async_finalize_failures: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -602,6 +603,13 @@ impl AppState {
         self.ledger_backend.name()
     }
 
+    pub fn postgres_async_finalize_failures(&self) -> Option<u64> {
+        match &self.ledger_backend {
+            LedgerBackend::Postgres { ledger, .. } => Some(ledger.async_finalize_failures()),
+            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => None,
+        }
+    }
+
     pub async fn authorize_request(
         &self,
         policy: Option<Arc<PolicyFile>>,
@@ -847,6 +855,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         upstream_configured: state.upstream.is_some(),
         route_count: state.routes.len(),
         ledger_backend: state.ledger_backend_name(),
+        postgres_async_finalize_failures: state.postgres_async_finalize_failures(),
     })
 }
 
