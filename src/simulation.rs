@@ -14,6 +14,7 @@ use crate::contract::{
 use crate::error::NoetError;
 use crate::ledger::{
     AsyncPostgresLedgerOptions, BudgetLedger, SimulationLedgerBatch, TraceReportItem, UsageReport,
+    connect_async_postgres_client,
 };
 use crate::policy::{PolicyFile, validate_policy};
 
@@ -958,14 +959,9 @@ fn write_strategy_artifacts(
 }
 
 async fn create_postgres_schema(database_url: &str, schema: &str) -> Result<(), NoetError> {
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+    let client = connect_async_postgres_client(database_url)
         .await
         .map_err(|err| NoetError::InvalidConfig(format!("PostgreSQL connection failed: {err}")))?;
-    let connection_task = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::debug!(error = %err, "postgres schema creation connection ended");
-        }
-    });
     client
         .execute(
             &format!(
@@ -979,7 +975,6 @@ async fn create_postgres_schema(database_url: &str, schema: &str) -> Result<(), 
             NoetError::InvalidConfig(format!("PostgreSQL schema creation failed: {err}"))
         })?;
     drop(client);
-    connection_task.abort();
     Ok(())
 }
 
@@ -1835,14 +1830,9 @@ strategies:
         let Some(schema) = postgres_schema_from_report_url(report_url) else {
             return;
         };
-        let Ok((admin, connection)) =
-            tokio_postgres::connect(database_url, tokio_postgres::NoTls).await
-        else {
+        let Ok(admin) = connect_async_postgres_client(database_url).await else {
             return;
         };
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
         let _ = admin
             .batch_execute(&format!(
                 r#"

@@ -1291,7 +1291,7 @@ fn postgres_url_requires_tls(database_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn connect_async_postgres_client(
+pub(crate) async fn connect_async_postgres_client(
     database_url: &str,
 ) -> Result<AsyncPostgresClient, NoetError> {
     if postgres_url_requires_tls(database_url) {
