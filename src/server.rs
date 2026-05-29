@@ -23,7 +23,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, PostgresBackend};
 use crate::capture::capture;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, DecisionMode, DecisionOutcome, FinalizeReservation,
@@ -693,6 +693,12 @@ pub async fn build_postgres_state(
     let client = backend.postgres_pool().get().await?;
     client.query_one("SELECT 1", &[]).await?;
     drop(client);
+    // Bootstrap the schema (idempotent — safe to call on every startup).
+    let pg_backend = match &backend {
+        Backend::Postgres(b) => b,
+        Backend::Sqlite(_) => unreachable!("postgres_from_url always returns Postgres"),
+    };
+    PostgresBackend::init_schema(pg_backend).await?;
     let backend = Arc::new(backend);
     let mut state = AppState::with_policy_runtime(fixture_dir, None, policy_runtime, decision_mode);
     state.simulation_dir = simulation_dir;
