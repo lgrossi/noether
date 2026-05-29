@@ -1108,6 +1108,7 @@ impl BudgetLedger {
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
+        ledger.load_advisory_cadence_sqlite()?;
         Ok(ledger)
     }
 
@@ -1180,6 +1181,8 @@ impl BudgetLedger {
     ) -> Result<AuthorizeDecision, NoetError> {
         if self.pg_conn.is_some() {
             self.load_advisory_cadence_postgres()?;
+        } else if self.conn.is_some() {
+            self.load_advisory_cadence_sqlite()?;
         }
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
@@ -3407,6 +3410,7 @@ impl BudgetLedger {
                 )?;
             }
         }
+        persist_advisory_cadence_sqlite(conn, &self.pending_advisory_cadence)?;
         self.pending_advisory_cadence.clear();
         Ok(())
     }
@@ -4227,6 +4231,28 @@ impl BudgetLedger {
         Ok(())
     }
 
+    fn load_advisory_cadence_sqlite(&mut self) -> Result<(), NoetError> {
+        let Some(conn) = &self.conn else {
+            return Ok(());
+        };
+        let mut stmt = conn.prepare(
+            "
+            SELECT user_key, advisory_key, scope_key, last_shown_at
+            FROM advisory_delivery_state
+            ",
+        )?;
+        let rows: Vec<((String, String, String), DateTime<Utc>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?),
+                    parse_time(row.get::<_, String>(3)?),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        self.advisory_cadence = rows.into_iter().collect();
+        Ok(())
+    }
+
     fn load_advisory_cadence_postgres(&mut self) -> Result<(), NoetError> {
         let Some(pg_conn) = &self.pg_conn else {
             return Ok(());
@@ -4487,6 +4513,14 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             current_grant_usd REAL NOT NULL,
             carryover_usd REAL NOT NULL,
             PRIMARY KEY (rule_id, entity_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS advisory_delivery_state (
+            user_key TEXT NOT NULL,
+            advisory_key TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            last_shown_at TEXT NOT NULL,
+            PRIMARY KEY (user_key, advisory_key, scope_key)
         );
         ",
     )?;
@@ -5455,6 +5489,30 @@ fn persist_advisory_cadence_postgres(
                 &advisory_key.as_str(),
                 &scope_key.as_str(),
                 &shown_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_advisory_cadence_sqlite(
+    conn: &Connection,
+    pending: &HashMap<(String, String, String), DateTime<Utc>>,
+) -> Result<(), NoetError> {
+    for ((user_key, advisory_key, scope_key), shown_at) in pending {
+        conn.execute(
+            "
+            INSERT INTO advisory_delivery_state (
+                user_key, advisory_key, scope_key, last_shown_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(user_key, advisory_key, scope_key) DO UPDATE SET
+                last_shown_at = excluded.last_shown_at
+            ",
+            params![
+                user_key.as_str(),
+                advisory_key.as_str(),
+                scope_key.as_str(),
+                shown_at.to_rfc3339()
             ],
         )?;
     }
@@ -8215,6 +8273,47 @@ mod tests {
 
         assert_eq!(first.outcome, DecisionOutcome::Warn);
         assert_eq!(second.outcome, DecisionOutcome::Warn);
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&second).as_deref(),
+            Some("hide")
+        );
+    }
+
+    #[test]
+    fn sqlite_ledger_persists_advisory_cadence_across_reopen() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("advisory-cadence.sqlite");
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
+                max_tokens: 100,
+                action: PolicyAction::Warn,
+            }),
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut request = request(0.01);
+        request.subject = Some("user:alice".to_owned());
+        request.estimated_tokens = Some(101);
+
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let first = ledger
+            .try_authorize(Some(&policy), &request)
+            .expect("first authorize");
+        drop(ledger);
+
+        let mut reopened = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
+        let second = reopened
+            .try_authorize(Some(&policy), &request)
+            .expect("second authorize");
+
         assert_eq!(
             first_message_hint_recommendation(&first).as_deref(),
             Some("show")
