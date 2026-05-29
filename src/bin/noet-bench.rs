@@ -126,14 +126,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-        // Seed via the AppState backend (PG-safe).
-        // We construct a temporary per-bench AppState-less ledger via the
-        // router's authorize endpoint — but the simplest approach is to call
-        // seed_ledger_via_backend which needs BudgetLedger. Because BudgetLedger
-        // is SQLite-only we seed via repeated HTTP calls through the live router.
+        // Seed via repeated HTTP calls through the in-process router.
+        // BudgetLedger is SQLite-only so we cannot seed PG via the ledger API
+        // directly — the router's authorize/finalize/event endpoints are backend-agnostic.
         state.policy_proposal_path = proposal_path.clone();
         let seed_app = build_router(state.clone());
-        seed_pg_via_http(seed_app.clone(), &policy, pg_rows).await?;
+        seed_pg_via_http(seed_app.clone(), pg_rows).await?;
 
         let app = build_router(state);
         (app, None)
@@ -218,9 +216,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Seed the PG database by issuing real HTTP authorize+finalize+event calls
 /// through the in-process router. Slower than bulk SQL but backend-agnostic.
+/// The policy is already loaded into the AppState, so no separate policy arg
+/// is needed here — the router enforces it on every authorize call.
 async fn seed_pg_via_http(
     app: axum::Router,
-    policy: &noether::policy::PolicyFile,
     rows: usize,
 ) -> Result<(), Box<dyn Error>> {
     let base_time = Utc::now() - ChronoDuration::seconds(rows as i64);
@@ -241,7 +240,6 @@ async fn seed_pg_via_http(
             .and_then(|r| r.get("id"))
             .and_then(Value::as_str)
         {
-            let _ = policy; // policy is enforced server-side
             let finalize = finalize_payload(index, &trace_id, &request_id, &agent_run_id);
             let body = serde_json::to_vec(&finalize)?;
             let uri = format!("/v1/reservations/{reservation_id}/finalize");
