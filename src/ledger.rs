@@ -811,7 +811,7 @@ impl AsyncPostgresLedger {
         load_limit_windows_async(&client, &mut ledger).await?;
         load_allocation_buckets_async(&client, &mut ledger).await?;
         load_rolling_spend_buckets_async(&client, &mut ledger).await?;
-        load_active_reservations_async(&client, &mut ledger).await?;
+        load_active_reservations_async(&client, &mut ledger, false).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
             statements: Arc::new(statements),
@@ -875,7 +875,7 @@ impl AsyncPostgresLedger {
         load_limit_windows_async(&tx, &mut ledger).await?;
         load_allocation_buckets_async(&tx, &mut ledger).await?;
         load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
-        load_active_reservations_async(&tx, &mut ledger).await?;
+        load_active_reservations_async(&tx, &mut ledger, self.finalize_tx.is_some()).await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
@@ -900,6 +900,7 @@ impl AsyncPostgresLedger {
     ) -> Result<Reservation, NoetError> {
         let started = Instant::now();
         let finalize_tx = self.finalize_tx.as_ref().cloned();
+        let preserve_local_finalized = finalize_tx.is_some();
         let (reservation, write, decision_elapsed) = {
             let mut ledger = self.ledger.lock().await;
             let connection = self.pool.connection();
@@ -911,7 +912,7 @@ impl AsyncPostgresLedger {
             load_limit_windows_async(&tx, &mut ledger).await?;
             load_allocation_buckets_async(&tx, &mut ledger).await?;
             load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
-            load_active_reservations_async(&tx, &mut ledger).await?;
+            load_active_reservations_async(&tx, &mut ledger, preserve_local_finalized).await?;
             if !ledger.reservations.contains_key(&reservation_id) {
                 load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
             }
@@ -3549,18 +3550,44 @@ impl BudgetLedger {
         &self,
         trace_id: &str,
     ) -> Result<Option<Vec<TraceReportItem>>, NoetError> {
-        let Some(conn) = &self.conn else {
-            return Ok(None);
-        };
-        let config = conn
-            .query_row(
+        let config = if let Some(pg_conn) = &self.pg_conn {
+            pg_conn
+                .0
+                .lock()
+                .expect("postgres mutex")
+                .query_opt(
+                    "
+                    SELECT created_at, max_tool_calls, max_agent_steps, max_retries
+                    FROM decisions
+                    WHERE trace_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    ",
+                    &[&trace_id],
+                )?
+                .map(|row| {
+                    (
+                        parse_time(row.get::<_, String>(0)),
+                        row.get::<_, Option<i64>>(1)
+                            .map(|value| value.max(0) as u64),
+                        row.get::<_, Option<i64>>(2)
+                            .map(|value| value.max(0) as u64),
+                        row.get::<_, Option<i64>>(3)
+                            .map(|value| value.max(0) as u64),
+                    )
+                })
+        } else {
+            let Some(conn) = &self.conn else {
+                return Ok(None);
+            };
+            conn.query_row(
                 "
-                SELECT created_at, max_tool_calls, max_agent_steps, max_retries
-                FROM decisions
-                WHERE trace_id = ?1
-                ORDER BY created_at DESC
-                LIMIT 1
-                ",
+                    SELECT created_at, max_tool_calls, max_agent_steps, max_retries
+                    FROM decisions
+                    WHERE trace_id = ?1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    ",
                 [trace_id],
                 |row| {
                     Ok((
@@ -3574,7 +3601,8 @@ impl BudgetLedger {
                     ))
                 },
             )
-            .optional()?;
+            .optional()?
+        };
         let Some((occurred_at, max_tool_calls, max_agent_steps, max_retries)) = config else {
             return Ok(None);
         };
@@ -4848,13 +4876,18 @@ async fn load_reservation_async(
 async fn load_active_reservations_async(
     conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
+    preserve_local_finalized: bool,
 ) -> Result<(), NoetError> {
-    let local_finalized = ledger
-        .reservations
-        .iter()
-        .filter(|(_, stored)| stored.reservation.status != ReservationStatus::Active)
-        .map(|(id, stored)| (id.clone(), stored.clone()))
-        .collect::<Vec<_>>();
+    let local_finalized = preserve_local_finalized
+        .then(|| {
+            ledger
+                .reservations
+                .iter()
+                .filter(|(_, stored)| stored.reservation.status != ReservationStatus::Active)
+                .map(|(id, stored)| (id.clone(), stored.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let rows = conn
         .query(
             "
@@ -5248,10 +5281,7 @@ async fn persist_finalization_async(
                 spend.scope_key.clone(),
             );
             let Some(window) = snapshot.limit_windows.get(&window_key) else {
-                return Err(NoetError::InvalidConfig(format!(
-                    "missing limit window state for {}:{}:{}",
-                    spend.rule_id, spend.limit_id, spend.scope_key
-                )));
+                return Ok(false);
             };
             let window_started_at = window.started_at.to_rfc3339();
             if let Some(usage) = &payload.usage {
