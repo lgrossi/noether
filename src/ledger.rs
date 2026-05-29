@@ -1367,8 +1367,9 @@ async fn run_async_postgres_finalize_worker(
     mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
 ) {
     while let Some(write) = rx.recv().await {
-        let mut last_error = None;
-        for attempt in 1..=3 {
+        let mut attempt = 0_u64;
+        loop {
+            attempt += 1;
             let mut connection = connection.lock().await;
             let statements = connection.statements.clone();
             let result = async {
@@ -1387,23 +1388,20 @@ async fn run_async_postgres_finalize_worker(
                         .lock()
                         .await
                         .remove(&write.reservation.id);
-                    last_error = None;
                     break;
                 }
                 Err(error) => {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    let retry_delay_ms = (25 * attempt).min(1_000);
                     tracing::warn!(
                         error = %error,
                         attempt,
-                        "postgres async finalize persistence attempt failed"
+                        retry_delay_ms,
+                        "postgres async finalize persistence attempt failed; retrying"
                     );
-                    last_error = Some(error);
-                    tokio::time::sleep(std::time::Duration::from_millis(25 * attempt)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 }
             }
-        }
-        if let Some(error) = last_error {
-            failures.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %error, "postgres async finalize persistence failed permanently");
         }
     }
 }
