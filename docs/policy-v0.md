@@ -118,6 +118,10 @@ The v0 evaluator is an in-memory fixed-window budget:
 - `allocation.standard: protected_adoption_pool` parses policy-only adoption-governance inputs:
   `by` (`user` or `team`), `protected_amount_usd`, `window` (`monthly`), and
   `carryover.{percent,cap_usd}`;
+- `limits.tool_calls`, `limits.agent_steps`, and `limits.retries` are lifecycle-derived controls.
+  They are report-only unless a specific integration exposes a pre-action/pre-step control point.
+  See [Policy capability matrix](./policy-capability-matrix.md) for hard-enforceable versus
+  report-only behavior by integration class;
 - omitted `models.allow` means all provider/model pairs are allowed;
 - `project` and `subject` request fields are still treated as entity sources when explicit
   `project:*` or `user:*` entities are absent;

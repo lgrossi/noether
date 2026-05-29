@@ -7,6 +7,20 @@ This directory holds Noether's north-star product and architecture notes.
 - [Roadmap](./roadmap.md): near-term slices that keep the project pointed at the product thesis.
 - [Team deployment](./team-deployment.md): shared-server path, storage evolution, trust boundary,
   and local-first compatibility notes.
+- [Company readiness](./company-readiness.md): current company-pilot stance, non-negotiables, and
+  implementation slices.
+- [Company pilot deployment](./deployment/company-pilot.md): supported single-process deployment
+  shape, durable paths, sensitive routes, and validation checklist.
+- [IAP and reverse-proxy security recipe](./deployment/iap-reverse-proxy.md): how to secure Noether
+  behind an existing company security layer without adding built-in auth.
+- [Audited self-approval](./audited-self-approval.md): self-driven approval semantics and central
+  override audit signals.
+- [Integration gap plan](./integration-gap-plan.md): grounded posture for governed, wrapper-gated,
+  tool-governed, and observed integrations.
+- [Policy capability matrix](./policy-capability-matrix.md): hard-enforceable versus report-only
+  policy controls by integration class.
+- [Pi and LiteLLM production smoke checklist](./testing/pi-litellm-production-smoke.md): real-tool
+  validation evidence required before company-pilot claims.
 - [Integration readiness plan](./integration-readiness-plan.md): OpenAPI, SDK, and harness/gateway
   integration sequence for the decision-sidecar product boundary.
 - [Integration capability matrix](./integration-capability-matrix.md): supported authorization,
