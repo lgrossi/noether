@@ -21,8 +21,8 @@ pub enum NoetError {
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("database error: {0}")]
+    Database(String),
 
     #[error("invalid upstream method: {0}")]
     Method(String),
@@ -37,6 +37,12 @@ pub enum NoetError {
     NotFound(String),
 }
 
+impl From<rusqlite::Error> for NoetError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e.to_string())
+    }
+}
+
 impl IntoResponse for NoetError {
     fn into_response(self) -> Response {
         error!(error = %self, "request failed");
@@ -45,7 +51,7 @@ impl IntoResponse for NoetError {
                 StatusCode::BAD_REQUEST
             }
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Io(_) | Self::Upstream(_) | Self::Url(_) | Self::Method(_) | Self::Sqlite(_) => {
+            Self::Io(_) | Self::Upstream(_) | Self::Url(_) | Self::Method(_) | Self::Database(_) => {
                 StatusCode::BAD_GATEWAY
             }
         };
