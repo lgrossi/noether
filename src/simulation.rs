@@ -859,7 +859,7 @@ fn run_sqlite_strategy(
 async fn run_postgres_strategy(
     context: SimulationStrategyContext,
     database_url: String,
-    _options: AsyncPostgresLedgerOptions,
+    options: AsyncPostgresLedgerOptions,
 ) -> Result<SimulationStrategyReport, NoetError> {
     let total_started = std::time::Instant::now();
     let init_started = std::time::Instant::now();
@@ -909,7 +909,7 @@ async fn run_postgres_strategy(
         let replay_ms = elapsed_ms(replay_started);
 
         let persist_started = std::time::Instant::now();
-        ledger.persist_simulation_batch_to_postgres(&scoped_url, &batch)?;
+        ledger.persist_simulation_batch_to_postgres_with_options(&scoped_url, &batch, &options)?;
         let persist_ms = elapsed_ms(persist_started);
 
         let report_started = std::time::Instant::now();
@@ -979,6 +979,9 @@ async fn create_postgres_schema(database_url: &str, schema: &str) -> Result<(), 
 }
 
 fn simulation_postgres_schema(strategy_slug: &str) -> String {
+    const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
+    const SCHEMA_PREFIX: &str = "noet_sim";
+
     let normalized = strategy_slug
         .chars()
         .map(|ch| {
@@ -989,11 +992,17 @@ fn simulation_postgres_schema(strategy_slug: &str) -> String {
             }
         })
         .collect::<String>();
-    format!(
-        "noet_sim_{}_{}",
-        normalized.trim_matches('_'),
-        Uuid::new_v4().as_simple()
-    )
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let max_slug_len = POSTGRES_IDENTIFIER_MAX_BYTES - SCHEMA_PREFIX.len() - suffix.len() - 2;
+    let mut slug = normalized.trim_matches('_').to_owned();
+    if slug.len() > max_slug_len {
+        slug.truncate(max_slug_len);
+        slug = slug.trim_matches('_').to_owned();
+    }
+    if slug.is_empty() {
+        slug = "strategy".to_owned();
+    }
+    format!("{SCHEMA_PREFIX}_{slug}_{suffix}")
 }
 
 fn postgres_url_with_search_path(database_url: &str, schema: &str) -> String {
@@ -1431,6 +1440,16 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         compare_strategies(&simulation, tempdir.path())
             .expect("checked-in simulation comparison succeeds")
+    }
+
+    #[test]
+    fn postgres_simulation_schema_preserves_unique_suffix_with_long_strategy_ids() {
+        let schema = simulation_postgres_schema(&"very-long-strategy-id-".repeat(8));
+
+        assert!(schema.len() <= 63);
+        let suffix = schema.rsplit('_').next().expect("uuid suffix");
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

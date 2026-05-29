@@ -540,26 +540,18 @@ fn upsert_simulation_limit_windows_postgres(
     if windows.is_empty() {
         return Ok(());
     }
-    let rule_ids = windows
-        .keys()
-        .map(|(rule_id, _, _)| rule_id.clone())
-        .collect::<Vec<_>>();
-    let limit_ids = windows
-        .keys()
-        .map(|(_, limit_id, _)| limit_id.clone())
-        .collect::<Vec<_>>();
-    let scope_keys = windows
-        .keys()
-        .map(|(_, _, scope_key)| scope_key.clone())
-        .collect::<Vec<_>>();
-    let started_at = windows
-        .values()
-        .map(|window| window.started_at.to_rfc3339())
-        .collect::<Vec<_>>();
-    let used_usd = windows
-        .values()
-        .map(|window| window.used_usd)
-        .collect::<Vec<_>>();
+    let mut rule_ids = Vec::with_capacity(windows.len());
+    let mut limit_ids = Vec::with_capacity(windows.len());
+    let mut scope_keys = Vec::with_capacity(windows.len());
+    let mut started_at = Vec::with_capacity(windows.len());
+    let mut used_usd = Vec::with_capacity(windows.len());
+    for ((rule_id, limit_id, scope_key), window) in windows {
+        rule_ids.push(rule_id.clone());
+        limit_ids.push(limit_id.clone());
+        scope_keys.push(scope_key.clone());
+        started_at.push(window.started_at.to_rfc3339());
+        used_usd.push(window.used_usd);
+    }
     tx.execute(
         "
         INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
@@ -573,6 +565,39 @@ fn upsert_simulation_limit_windows_postgres(
     Ok(())
 }
 
+fn upsert_simulation_rolling_spend_buckets_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    buckets: &HashMap<(String, String, String, DateTime<Utc>), f64>,
+) -> Result<(), NoetError> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let mut rule_ids = Vec::with_capacity(buckets.len());
+    let mut limit_ids = Vec::with_capacity(buckets.len());
+    let mut scope_keys = Vec::with_capacity(buckets.len());
+    let mut bucket_starts = Vec::with_capacity(buckets.len());
+    let mut amounts = Vec::with_capacity(buckets.len());
+    for ((rule_id, limit_id, scope_key, bucket_start), amount) in buckets {
+        rule_ids.push(rule_id.clone());
+        limit_ids.push(limit_id.clone());
+        scope_keys.push(scope_key.clone());
+        bucket_starts.push(bucket_start.to_rfc3339());
+        amounts.push(*amount);
+    }
+    tx.execute(
+        "
+        INSERT INTO rolling_spend_buckets (rule_id, limit_id, scope_key, bucket_start, amount_usd)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[]
+        )
+        ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
+            amount_usd = EXCLUDED.amount_usd
+        ",
+        &[&rule_ids, &limit_ids, &scope_keys, &bucket_starts, &amounts],
+    )?;
+    Ok(())
+}
+
 fn upsert_simulation_allocation_buckets_postgres(
     tx: &mut PostgresTransaction<'_>,
     buckets: &HashMap<(String, String), AllocationBucketState>,
@@ -580,30 +605,20 @@ fn upsert_simulation_allocation_buckets_postgres(
     if buckets.is_empty() {
         return Ok(());
     }
-    let rule_ids = buckets
-        .keys()
-        .map(|(rule_id, _)| rule_id.clone())
-        .collect::<Vec<_>>();
-    let entity_keys = buckets
-        .keys()
-        .map(|(_, entity_key)| entity_key.clone())
-        .collect::<Vec<_>>();
-    let started_at = buckets
-        .values()
-        .map(|bucket| bucket.started_at.to_rfc3339())
-        .collect::<Vec<_>>();
-    let protected_amounts = buckets
-        .values()
-        .map(|bucket| bucket.protected_amount_usd)
-        .collect::<Vec<_>>();
-    let current_grants = buckets
-        .values()
-        .map(|bucket| bucket.current_grant_usd)
-        .collect::<Vec<_>>();
-    let carryovers = buckets
-        .values()
-        .map(|bucket| bucket.carryover_usd)
-        .collect::<Vec<_>>();
+    let mut rule_ids = Vec::with_capacity(buckets.len());
+    let mut entity_keys = Vec::with_capacity(buckets.len());
+    let mut started_at = Vec::with_capacity(buckets.len());
+    let mut protected_amounts = Vec::with_capacity(buckets.len());
+    let mut current_grants = Vec::with_capacity(buckets.len());
+    let mut carryovers = Vec::with_capacity(buckets.len());
+    for ((rule_id, entity_key), bucket) in buckets {
+        rule_ids.push(rule_id.clone());
+        entity_keys.push(entity_key.clone());
+        started_at.push(bucket.started_at.to_rfc3339());
+        protected_amounts.push(bucket.protected_amount_usd);
+        current_grants.push(bucket.current_grant_usd);
+        carryovers.push(bucket.carryover_usd);
+    }
     tx.execute(
         "
         INSERT INTO budget_allocation_buckets (
@@ -1888,6 +1903,13 @@ impl BudgetLedger {
                 entry.used_usd += seed.amount_usd;
             }
             SpendWindowMode::Rolling => {
+                let bucket_key = (
+                    seed.rule_id.clone(),
+                    seed.limit_id.clone(),
+                    seed.scope_key.clone(),
+                    rolling_bucket_start(seed.seeded_at),
+                );
+                *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += seed.amount_usd;
                 let id = format!(
                     "replay-seed-{}-{}-{}-{}",
                     seed.rule_id,
@@ -2122,18 +2144,36 @@ impl BudgetLedger {
         database_url: &str,
         batch: &SimulationLedgerBatch,
     ) -> Result<(), NoetError> {
+        self.persist_simulation_batch_to_postgres_with_options(
+            database_url,
+            batch,
+            &AsyncPostgresLedgerOptions::strict(),
+        )
+    }
+
+    pub fn persist_simulation_batch_to_postgres_with_options(
+        &self,
+        database_url: &str,
+        batch: &SimulationLedgerBatch,
+        options: &AsyncPostgresLedgerOptions,
+    ) -> Result<(), NoetError> {
         let target = Self::open_postgres(database_url)?;
         let LedgerStore::Postgres(pg_conn) = &target.store else {
             return Ok(());
         };
         let mut pg = pg_conn.0.lock().expect("postgres mutex");
         let mut tx = pg.transaction()?;
+        if let Some(value) = options.synchronous_commit.as_deref() {
+            let value = normalized_synchronous_commit(value)?;
+            tx.batch_execute(&format!("SET LOCAL synchronous_commit TO {value}"))?;
+        }
 
         insert_simulation_decisions_postgres(&mut tx, &batch.decisions)?;
         insert_simulation_reservations_postgres(&mut tx, &batch.reservations)?;
         insert_simulation_reservation_scopes_postgres(&mut tx, &batch.reservation_scopes)?;
         insert_simulation_usage_observations_postgres(&mut tx, &batch.usage_observations)?;
         upsert_simulation_limit_windows_postgres(&mut tx, &self.limit_windows)?;
+        upsert_simulation_rolling_spend_buckets_postgres(&mut tx, &self.rolling_spend_buckets)?;
         upsert_simulation_allocation_buckets_postgres(&mut tx, &self.allocation_buckets)?;
         tx.commit()?;
         Ok(())
@@ -3840,6 +3880,14 @@ impl BudgetLedger {
                     };
                     self.limit_window(rule, &limit_id, window, &scope_key, now)
                         .used_usd += amount_usd;
+                } else if matches!(limit.mode, Some(SpendWindowMode::Rolling)) {
+                    let bucket_key = (
+                        rule.id.clone(),
+                        limit_id.clone(),
+                        scope_key.clone(),
+                        rolling_bucket_start(now),
+                    );
+                    *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += amount_usd;
                 }
                 limit_window_spends.push(LimitWindowReservationSpend {
                     rule_id: rule.id.clone(),
@@ -3910,6 +3958,14 @@ impl BudgetLedger {
                     };
                     self.limit_window(rule, &limit_id, window, &scope_key, now)
                         .used_usd += amount_usd;
+                } else if matches!(limit.mode, Some(SpendWindowMode::Rolling)) {
+                    let bucket_key = (
+                        rule.id.clone(),
+                        limit_id.clone(),
+                        scope_key.clone(),
+                        rolling_bucket_start(now),
+                    );
+                    *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += amount_usd;
                 }
                 limit_window_spends.push(LimitWindowReservationSpend {
                     rule_id: rule.id.clone(),
@@ -9135,6 +9191,88 @@ mod tests {
         );
 
         drop(reopened);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .expect("drop test schema");
+    }
+
+    #[test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    fn postgres_simulation_batch_persists_rolling_spend_buckets() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_test_{}", Uuid::new_v4().simple());
+        let mut admin =
+            PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
+                id: Some("rolling".to_owned()),
+                window: "7d".to_owned(),
+                mode: Some(SpendWindowMode::Rolling),
+                anchor: None,
+                max_usd: 10.0,
+                warn_at_fractions: vec![1.0],
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::default();
+        let mut batch = SimulationLedgerBatch::default();
+        let first_request = request(6.0);
+        let first = ledger
+            .try_authorize(Some(&policy), &first_request)
+            .expect("first authorize");
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        ledger
+            .capture_simulation_decision(&mut batch, Some(&policy), &first_request, &first)
+            .expect("capture decision");
+
+        ledger
+            .persist_simulation_batch_to_postgres_with_options(
+                &scoped_url,
+                &batch,
+                &AsyncPostgresLedgerOptions::strict(),
+            )
+            .expect("persist simulation batch");
+
+        let mut persisted =
+            PostgresClient::connect(&scoped_url, NoTls).expect("postgres scoped connection");
+        let bucket_amount = persisted
+            .query_one(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = 'dev-budget'
+                  AND limit_id = 'rolling'
+                  AND scope_key = 'project:noether'
+                ",
+                &[],
+            )
+            .expect("rolling bucket row")
+            .get::<_, f64>(0);
+        assert_eq!(bucket_amount, 6.0);
+
+        let mut reopened = BudgetLedger::open_postgres(&scoped_url).expect("reopen postgres");
+        let second = reopened
+            .try_authorize(Some(&policy), &request(5.0))
+            .expect("second authorize");
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+
+        drop(reopened);
+        drop(persisted);
         admin
             .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
             .expect("drop test schema");
