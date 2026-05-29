@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -464,6 +464,7 @@ pub struct AsyncPostgresLedger {
     pool: Arc<AsyncPostgresPool>,
     ledger: Arc<tokio::sync::Mutex<BudgetLedger>>,
     finalize_tx: Option<mpsc::Sender<AsyncFinalizeWrite>>,
+    pending_async_finalizations: Arc<tokio::sync::Mutex<HashSet<String>>>,
     async_finalize_failures: Arc<AtomicU64>,
     stage_timing: bool,
 }
@@ -776,6 +777,7 @@ fn normalized_synchronous_commit(value: &str) -> Result<&'static str, NoetError>
 
 async fn run_async_postgres_finalize_worker(
     connection: Arc<tokio::sync::Mutex<AsyncPostgresConnection>>,
+    pending_finalizations: Arc<tokio::sync::Mutex<HashSet<String>>>,
     failures: Arc<AtomicU64>,
     mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
 ) {
@@ -796,6 +798,10 @@ async fn run_async_postgres_finalize_worker(
             drop(connection);
             match result {
                 Ok(()) => {
+                    pending_finalizations
+                        .lock()
+                        .await
+                        .remove(&write.reservation.id);
                     last_error = None;
                     break;
                 }
@@ -836,7 +842,7 @@ impl AsyncPostgresLedger {
         load_limit_windows_async(&client, &mut ledger).await?;
         load_allocation_buckets_async(&client, &mut ledger).await?;
         load_rolling_spend_buckets_async(&client, &mut ledger, None, Utc::now()).await?;
-        load_active_reservations_async(&client, &mut ledger, false).await?;
+        load_active_reservations_async(&client, &mut ledger, None).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
             statements: Arc::new(statements),
@@ -849,6 +855,7 @@ impl AsyncPostgresLedger {
             connections,
             next: AtomicUsize::new(0),
         });
+        let pending_async_finalizations = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let async_finalize_failures = Arc::new(AtomicU64::new(0));
         let finalize_tx = if options.async_finalize {
             let finalize_connection =
@@ -856,6 +863,7 @@ impl AsyncPostgresLedger {
             let (tx, rx) = mpsc::channel(options.finalize_queue_capacity);
             tokio::spawn(run_async_postgres_finalize_worker(
                 finalize_connection,
+                pending_async_finalizations.clone(),
                 async_finalize_failures.clone(),
                 rx,
             ));
@@ -867,6 +875,7 @@ impl AsyncPostgresLedger {
             pool,
             ledger: Arc::new(tokio::sync::Mutex::new(ledger)),
             finalize_tx,
+            pending_async_finalizations,
             async_finalize_failures,
             stage_timing: options.stage_timing,
         })
@@ -897,10 +906,15 @@ impl AsyncPostgresLedger {
         let tx = connection.client.transaction().await?;
         tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
             .await?;
+        let pending_finalizations = if self.finalize_tx.is_some() {
+            Some(self.pending_async_finalizations.lock().await.clone())
+        } else {
+            None
+        };
         load_limit_windows_async(&tx, &mut ledger).await?;
         load_allocation_buckets_async(&tx, &mut ledger).await?;
         load_rolling_spend_buckets_async(&tx, &mut ledger, policy.as_deref(), now).await?;
-        load_active_reservations_async(&tx, &mut ledger, self.finalize_tx.is_some()).await?;
+        load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
@@ -925,7 +939,6 @@ impl AsyncPostgresLedger {
     ) -> Result<Reservation, NoetError> {
         let started = Instant::now();
         let finalize_tx = self.finalize_tx.as_ref().cloned();
-        let preserve_local_finalized = finalize_tx.is_some();
         let (reservation, write, decision_elapsed) = {
             let mut ledger = self.ledger.lock().await;
             let connection = self.pool.connection();
@@ -934,9 +947,15 @@ impl AsyncPostgresLedger {
             let tx = connection.client.transaction().await?;
             tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
                 .await?;
+            let pending_finalizations = if finalize_tx.is_some() {
+                Some(self.pending_async_finalizations.lock().await.clone())
+            } else {
+                None
+            };
             load_limit_windows_async(&tx, &mut ledger).await?;
             load_allocation_buckets_async(&tx, &mut ledger).await?;
-            load_active_reservations_async(&tx, &mut ledger, preserve_local_finalized).await?;
+            load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref())
+                .await?;
             if !ledger.reservations.contains_key(&reservation_id) {
                 load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
             }
@@ -977,6 +996,10 @@ impl AsyncPostgresLedger {
         if let Some(finalize_tx) = finalize_tx {
             match finalize_tx.try_send(write) {
                 Ok(()) => {
+                    self.pending_async_finalizations
+                        .lock()
+                        .await
+                        .insert(reservation.id.clone());
                     if self.stage_timing {
                         tracing::debug!(
                             decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
@@ -4948,14 +4971,17 @@ async fn load_reservation_async(
 async fn load_active_reservations_async(
     conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
-    preserve_local_finalized: bool,
+    pending_finalizations: Option<&HashSet<String>>,
 ) -> Result<(), NoetError> {
-    let local_finalized = preserve_local_finalized
-        .then(|| {
+    let local_finalized = pending_finalizations
+        .map(|pending_finalizations| {
             ledger
                 .reservations
                 .iter()
-                .filter(|(_, stored)| stored.reservation.status != ReservationStatus::Active)
+                .filter(|(id, stored)| {
+                    pending_finalizations.contains(*id)
+                        && stored.reservation.status != ReservationStatus::Active
+                })
                 .map(|(id, stored)| (id.clone(), stored.clone()))
                 .collect::<Vec<_>>()
         })

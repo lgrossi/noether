@@ -660,26 +660,33 @@ impl AppState {
         self.policy.update_source(source).await
     }
 
-    async fn read_ledger<T: Send>(
+    async fn read_ledger<T: Send + 'static>(
         &self,
-        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send,
+        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
     ) -> Result<T, NoetError> {
         match &self.ledger_backend {
             LedgerBackend::SQLite { path } => {
-                let ledger = BudgetLedger::open_sqlite(path)?;
-                read(&ledger)
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let ledger = BudgetLedger::open_sqlite(&path)?;
+                    read(&ledger)
+                })
+                .await
+                .map_err(|error| {
+                    NoetError::InvalidConfig(format!("sqlite read task panicked: {error}"))
+                })?
             }
-            LedgerBackend::Postgres { database_url, .. } => std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let ledger = BudgetLedger::open_postgres(database_url)?;
-                        read(&ledger)
-                    })
-                    .join()
-                    .map_err(|_| {
-                        NoetError::InvalidConfig("postgres read task panicked".to_owned())
-                    })?
-            }),
+            LedgerBackend::Postgres { database_url, .. } => {
+                let database_url = database_url.clone();
+                tokio::task::spawn_blocking(move || {
+                    let ledger = BudgetLedger::open_postgres(&database_url)?;
+                    read(&ledger)
+                })
+                .await
+                .map_err(|error| {
+                    NoetError::InvalidConfig(format!("postgres read task panicked: {error}"))
+                })?
+            }
             LedgerBackend::InMemory => {
                 let ledger = self.ledger.lock().await;
                 read(&ledger)
@@ -970,7 +977,7 @@ async fn report_trace(
     AxumPath(trace_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             Ok(Json(serde_json::to_value(reporting::trace_report(
                 ledger, &trace_id,
             )?)?))
@@ -983,7 +990,7 @@ async fn report_observations(
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             Ok(Json(serde_json::to_value(reporting::observations_report(
                 ledger,
                 query.kind.as_deref(),
@@ -1154,7 +1161,7 @@ async fn app_runs(
     let limit = query.limit.clamp(1, 250);
     let offset = query.offset;
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             if app_runs_query_is_unfiltered(&query) {
                 let decisions = ledger.decisions_report_for_run_page(limit, offset)?;
                 let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
@@ -1218,7 +1225,7 @@ async fn app_run_detail(
     AxumPath(run_id): AxumPath<String>,
 ) -> Result<Json<AppRunRow>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let decisions = reporting::decisions_report(ledger)?;
             let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
             let mut run = app_agent_runs(&decisions, &usage_by_agent_run)
@@ -1253,7 +1260,7 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         .unwrap_or_default();
     if !has_proposed_policy {
         let baseline = state
-            .read_ledger(|ledger| {
+            .read_ledger(move |ledger| {
                 Ok(app_run_totals_from_report(
                     ledger.run_totals_report_since(Some(history_window_start))?,
                 ))
@@ -1270,7 +1277,7 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         }));
     }
     let (total_requests, historical_requests, usage_by_agent_run, baseline, spend_seeds) = state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let total_requests =
                 ledger.historical_authorize_request_count_since(Some(history_window_start))?;
             let historical_requests = ledger.latest_historical_authorize_requests_since(
@@ -1435,7 +1442,7 @@ async fn app_replay_full_month_response(state: AppState) -> Result<AppReplayResp
         .transpose()?
         .unwrap_or_default();
     let (total_requests, historical_requests, usage_by_agent_run, baseline) = state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let total_requests =
                 ledger.historical_authorize_request_count_since(Some(history_window_start))?;
             let historical_requests =

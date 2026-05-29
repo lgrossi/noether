@@ -82,32 +82,27 @@ struct ServeArgs {
     postgres_profile: String,
 
     /// Number of async PostgreSQL connections to use for hot-path writes.
-    #[arg(long, env = "NOET_POSTGRES_POOL_SIZE", default_value_t = 4)]
-    postgres_pool_size: usize,
+    #[arg(long)]
+    postgres_pool_size: Option<usize>,
 
     /// Override whether PostgreSQL finalization persistence is queued after updating in-memory state.
     #[arg(
         long,
-        env = "NOET_POSTGRES_ASYNC_FINALIZE",
         num_args = 0..=1,
         default_missing_value = "true"
     )]
     postgres_async_finalize: Option<bool>,
 
     /// Bounded queue size for async PostgreSQL finalize persistence.
-    #[arg(
-        long,
-        env = "NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY",
-        default_value_t = 1024
-    )]
-    postgres_finalize_queue_capacity: usize,
+    #[arg(long, long)]
+    postgres_finalize_queue_capacity: Option<usize>,
 
     /// Per-connection PostgreSQL synchronous_commit setting: on, off, local, remote_write, remote_apply.
-    #[arg(long, env = "NOET_POSTGRES_SYNCHRONOUS_COMMIT")]
+    #[arg(long)]
     postgres_synchronous_commit: Option<String>,
 
     /// Emit debug logs with PostgreSQL hot-path stage timings.
-    #[arg(long, env = "NOET_POSTGRES_STAGE_TIMING", default_value_t = false)]
+    #[arg(long)]
     postgres_stage_timing: bool,
 
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
@@ -320,11 +315,35 @@ fn postgres_options_from_serve_args(
     args: &ServeArgs,
 ) -> Result<AsyncPostgresLedgerOptions, NoetError> {
     let mut options = AsyncPostgresLedgerOptions::from_profile(&args.postgres_profile)?;
-    options.pool_size = args.postgres_pool_size.max(1);
+    if let Some(pool_size) = parse_env_usize_option("NOET_POSTGRES_POOL_SIZE")? {
+        options.pool_size = pool_size.max(1);
+    }
+    if let Some(async_finalize) = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE")? {
+        options.async_finalize = async_finalize;
+    }
+    if let Some(finalize_queue_capacity) =
+        parse_env_usize_option("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")?
+    {
+        options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+    }
+    if let Some(synchronous_commit) = std::env::var("NOET_POSTGRES_SYNCHRONOUS_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        options.synchronous_commit = Some(synchronous_commit);
+    }
+    if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING")? {
+        options.stage_timing = stage_timing;
+    }
+    if let Some(pool_size) = args.postgres_pool_size {
+        options.pool_size = pool_size.max(1);
+    }
     if let Some(async_finalize) = args.postgres_async_finalize {
         options.async_finalize = async_finalize;
     }
-    options.finalize_queue_capacity = args.postgres_finalize_queue_capacity.max(1);
+    if let Some(finalize_queue_capacity) = args.postgres_finalize_queue_capacity {
+        options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+    }
     if let Some(synchronous_commit) = args.postgres_synchronous_commit.clone() {
         options.synchronous_commit = Some(synchronous_commit);
     }
@@ -332,6 +351,34 @@ fn postgres_options_from_serve_args(
         options.stage_timing = true;
     }
     Ok(options)
+}
+
+fn parse_env_usize_option(name: &str) -> Result<Option<usize>, NoetError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value.trim().parse::<usize>().map(Some).map_err(|error| {
+        NoetError::InvalidConfig(format!("invalid {name} value {value:?}: {error}"))
+    })
+}
+
+fn parse_env_bool_option(name: &str) -> Result<Option<bool>, NoetError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(NoetError::InvalidConfig(format!(
+            "invalid {name} value {value:?}; expected true/false"
+        ))),
+    }
 }
 
 async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
