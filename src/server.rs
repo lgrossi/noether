@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -28,7 +29,7 @@ use crate::contract::{
     Reservation, SpendWindowMode, TraceEvent,
 };
 use crate::error::NoetError;
-use crate::ledger::{BudgetLedger, ReplaySpendSeed, TraceReportItem};
+use crate::ledger::{BudgetLedger, ConnMutex, ReplaySpendSeed, TraceReportItem, persist_event, validate_event_payload};
 use crate::noether_app;
 use crate::openapi;
 use crate::policy::PolicyFile;
@@ -47,6 +48,8 @@ pub struct AppState {
     pub policy: PolicyRuntime,
     pub decision_mode: DecisionMode,
     pub ledger: Arc<Mutex<BudgetLedger>>,
+    pub conn: Arc<ConnMutex>,
+    pub event_count: Arc<AtomicU64>,
     pub db_path: Option<PathBuf>,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
@@ -541,6 +544,8 @@ impl AppState {
             policy,
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
+            conn: Arc::new(std::sync::Mutex::new(None)),
+            event_count: Arc::new(AtomicU64::new(0)),
             db_path: None,
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -617,6 +622,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     }
     let bind = config.bind;
     let ledger = BudgetLedger::open_sqlite(&config.db_path)?;
+    let handler_conn = rusqlite::Connection::open(&config.db_path)?;
     let policy_proposal_path = config
         .simulation_dir
         .parent()
@@ -640,6 +646,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     state.routes = config.routes;
     state.db_path = Some(config.db_path.clone());
     state.ledger = Arc::new(Mutex::new(ledger));
+    state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
     let app = build_router(state);
 
     info!(bind = %bind, "starting noet capture server");
@@ -769,11 +776,21 @@ async fn record_event(
     State(state): State<AppState>,
     Json(event): Json<TraceEvent>,
 ) -> Result<impl IntoResponse, NoetError> {
+    validate_event_payload(&event)?;
     let trace_id = event.trace_id.clone();
-    let ledger = Arc::clone(&state.ledger);
-    tokio::task::spawn_blocking(move || ledger.blocking_lock().record_event(event))
-        .await
-        .expect("ledger task panicked")?;
+    let conn = Arc::clone(&state.conn);
+    let event_count = Arc::clone(&state.event_count);
+    tokio::task::spawn_blocking(move || -> Result<(), NoetError> {
+        let conn_guard = conn.lock().expect("conn mutex poisoned");
+        if let Some(c) = conn_guard.as_ref() {
+            persist_event(c, &event)?;
+        }
+        drop(conn_guard);
+        event_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .await
+    .expect("event task panicked")?;
     publish_report_update(&state, "event", trace_id);
     Ok((
         StatusCode::ACCEPTED,
@@ -5203,8 +5220,11 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let handler_conn =
+            rusqlite::Connection::open(&db_path).expect("handler sqlite connection");
         let mut state = test_state(Some(strict_policy()));
         state.ledger = Arc::new(Mutex::new(ledger));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
         let app = build_router(state);
 
         let authorize_response = app

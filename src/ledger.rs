@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -19,12 +20,12 @@ use crate::policy::{
     matching_policy_explanations, specificity_order,
 };
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct BudgetLedger {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     reservations: HashMap<String, StoredReservation>,
-    events: Vec<TraceEvent>,
+    events_count: AtomicU64,
     conn: Option<Connection>,
 }
 
@@ -605,12 +606,12 @@ impl BudgetLedger {
     pub fn record_event(&mut self, event: TraceEvent) -> Result<(), NoetError> {
         validate_event_payload(&event)?;
         self.persist_event(&event)?;
-        self.events.push(event);
+        self.events_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn event_count(&self) -> usize {
-        self.events.len()
+        self.events_count.load(Ordering::Relaxed) as usize
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {
@@ -2422,7 +2423,7 @@ fn persist_finalization(
     Ok(())
 }
 
-fn persist_event(conn: &Connection, event: &TraceEvent) -> Result<(), NoetError> {
+pub(crate) fn persist_event(conn: &Connection, event: &TraceEvent) -> Result<(), NoetError> {
     let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
     let source = event
         .payload
@@ -2867,7 +2868,7 @@ fn decision_app_run_key(
     )
 }
 
-fn validate_event_payload(event: &TraceEvent) -> Result<(), NoetError> {
+pub(crate) fn validate_event_payload(event: &TraceEvent) -> Result<(), NoetError> {
     match event.kind.as_str() {
         "usage.observed" => {
             serde_json::from_value::<UsageObservation>(event.payload.clone())?;
