@@ -42,9 +42,9 @@ The tests cover:
 Postgres parity runs only when `NOET_TEST_POSTGRES_URL` is set. Otherwise the same tests run SQLite and print a skip line for the Postgres half.
 
 This branch also replaces `BudgetLedger` backend dispatch based on optional
-connection presence with an explicit selected-store marker. SQLite and Postgres
-remain supported; the ledger no longer chooses behavior by asking whether
-`conn` or `pg_conn` happens to be populated.
+connection presence with a typed selected-store enum. SQLite and Postgres
+remain supported; the ledger now owns exactly one active store variant instead
+of carrying parallel optional connections.
 
 ## Current recommendation
 
