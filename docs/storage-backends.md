@@ -37,6 +37,33 @@ benchmarks show that even a minimal durable indexed PostgreSQL write has a
 roughly 0.5 ms p50 floor, so PostgreSQL authorization is expected to be slower
 than embedded SQLite.
 
+### PostgreSQL hot-path tuning
+
+The PostgreSQL backend has Postgres-only tuning knobs. They do not change SQLite
+behavior.
+
+| Setting | CLI flag | Default | Notes |
+| --- | --- | --- | --- |
+| Profile | `--postgres-profile` / `NOET_POSTGRES_PROFILE` | `strict` | `strict` keeps durable finalize and the database default commit mode. `performance` enables async finalize and `synchronous_commit=off`. |
+| Connection pool size | `--postgres-pool-size` / `NOET_POSTGRES_POOL_SIZE` | `4` | Uses prepared statements per connection for hot-path writes. |
+| Async finalize | `--postgres-async-finalize` / `NOET_POSTGRES_ASYNC_FINALIZE` | `false` | Returns finalize responses after in-memory finalization and queues PostgreSQL persistence. Authorization remains synchronous. |
+| Finalize queue capacity | `--postgres-finalize-queue-capacity` / `NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY` | `1024` | If the queue is full or closed, finalize falls back to synchronous persistence. |
+| Synchronous commit | `--postgres-synchronous-commit` / `NOET_POSTGRES_SYNCHRONOUS_COMMIT` | database default | Accepts `on`, `off`, `local`, `remote_write`, or `remote_apply`; `off` can reduce tail latency but can lose the latest commits on database crash. |
+| Stage timing | `--postgres-stage-timing` / `NOET_POSTGRES_STAGE_TIMING` | `false` | Emits debug logs for in-memory and database stages. |
+
+Use `strict` for audit-grade budget enforcement. Use `performance` only when the
+deployment accepts bounded crash-window drift for lower latency:
+
+```bash
+NOET_POSTGRES_PROFILE=performance
+```
+
+Performance mode keeps authorization synchronous, but `synchronous_commit=off`
+means a database crash can lose writes acknowledged shortly before the crash.
+Async finalize is also a latency mode, not a stronger durability mode: finalize
+accounting can lag behind the user-facing response and can fall back to
+synchronous persistence if the queue is full.
+
 ## Compatibility model
 
 The backends are selectable implementation modes, not a SQLite-to-PostgreSQL

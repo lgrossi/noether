@@ -1,12 +1,19 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
-use postgres::{Client as PostgresClient, NoTls, Row as PostgresRow, types::ToSql as PostgresToSql};
+use postgres::{
+    Client as PostgresClient, NoTls, Row as PostgresRow, types::ToSql as PostgresToSql,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_postgres::{Client as AsyncPostgresClient, NoTls as AsyncNoTls, Statement};
 use uuid::Uuid;
 
@@ -414,15 +421,113 @@ pub struct DecisionLimitHitReport {
 
 #[derive(Clone)]
 pub struct AsyncPostgresLedger {
-    client: Arc<tokio::sync::Mutex<AsyncPostgresClient>>,
-    statements: Arc<AsyncPostgresStatements>,
+    pool: Arc<AsyncPostgresPool>,
     ledger: Arc<tokio::sync::Mutex<BudgetLedger>>,
+    finalize_tx: Option<mpsc::Sender<AsyncFinalizeWrite>>,
+    stage_timing: bool,
 }
 
 struct AsyncPostgresStatements {
     authorize_fast: Statement,
     finalize_with_usage_fast: Statement,
     finalize_without_usage_fast: Statement,
+}
+
+struct AsyncPostgresConnection {
+    client: AsyncPostgresClient,
+    statements: AsyncPostgresStatements,
+}
+
+struct AsyncPostgresPool {
+    connections: Vec<Arc<tokio::sync::Mutex<AsyncPostgresConnection>>>,
+    next: AtomicUsize,
+}
+
+impl AsyncPostgresPool {
+    fn connection(&self) -> Arc<tokio::sync::Mutex<AsyncPostgresConnection>> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
+        self.connections[index].clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AsyncPostgresLedgerOptions {
+    pub pool_size: usize,
+    pub async_finalize: bool,
+    pub finalize_queue_capacity: usize,
+    pub synchronous_commit: Option<String>,
+    pub stage_timing: bool,
+}
+
+impl Default for AsyncPostgresLedgerOptions {
+    fn default() -> Self {
+        let mut options = std::env::var("NOET_POSTGRES_PROFILE")
+            .ok()
+            .and_then(|profile| Self::from_profile(&profile).ok())
+            .unwrap_or_else(Self::strict);
+        if let Some(pool_size) = std::env::var("NOET_POSTGRES_POOL_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            options.pool_size = pool_size.max(1);
+        }
+        if let Some(async_finalize) = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE") {
+            options.async_finalize = async_finalize;
+        }
+        if let Some(finalize_queue_capacity) =
+            std::env::var("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        {
+            options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+        }
+        if let Some(synchronous_commit) = std::env::var("NOET_POSTGRES_SYNCHRONOUS_COMMIT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            options.synchronous_commit = Some(synchronous_commit);
+        }
+        if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING") {
+            options.stage_timing = stage_timing;
+        }
+        options
+    }
+}
+
+impl AsyncPostgresLedgerOptions {
+    pub fn strict() -> Self {
+        Self {
+            pool_size: 4,
+            async_finalize: false,
+            finalize_queue_capacity: 1024,
+            synchronous_commit: None,
+            stage_timing: false,
+        }
+    }
+
+    pub fn performance() -> Self {
+        Self {
+            async_finalize: true,
+            synchronous_commit: Some("off".to_owned()),
+            ..Self::strict()
+        }
+    }
+
+    pub fn from_profile(profile: &str) -> Result<Self, NoetError> {
+        match profile.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Self::strict()),
+            "performance" => Ok(Self::performance()),
+            other => Err(NoetError::InvalidConfig(format!(
+                "invalid Postgres profile {other:?}; expected strict or performance"
+            ))),
+        }
+    }
+}
+
+struct AsyncFinalizeWrite {
+    reservation: Reservation,
+    payload: FinalizeReservation,
+    snapshot: LedgerPersistenceSnapshot,
 }
 
 const ASYNC_AUTHORIZE_FAST_SQL: &str = "
@@ -524,30 +629,155 @@ WITH updated AS (
 SELECT 1 FROM updated, upsert_window
 ";
 
+fn parse_env_bool_option(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+async fn prepare_async_postgres_statements(
+    client: &AsyncPostgresClient,
+) -> Result<AsyncPostgresStatements, NoetError> {
+    Ok(AsyncPostgresStatements {
+        authorize_fast: client.prepare(ASYNC_AUTHORIZE_FAST_SQL).await?,
+        finalize_with_usage_fast: client.prepare(ASYNC_FINALIZE_WITH_USAGE_FAST_SQL).await?,
+        finalize_without_usage_fast: client
+            .prepare(ASYNC_FINALIZE_WITHOUT_USAGE_FAST_SQL)
+            .await?,
+    })
+}
+
+async fn apply_postgres_connection_options(
+    client: &AsyncPostgresClient,
+    options: &AsyncPostgresLedgerOptions,
+) -> Result<(), NoetError> {
+    if let Some(value) = options.synchronous_commit.as_deref() {
+        let value = normalized_synchronous_commit(value)?;
+        client
+            .batch_execute(&format!("SET synchronous_commit TO {value}"))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn connect_async_postgres_connection(
+    database_url: &str,
+    options: &AsyncPostgresLedgerOptions,
+    initialize_schema: bool,
+) -> Result<Arc<tokio::sync::Mutex<AsyncPostgresConnection>>, NoetError> {
+    let (client, connection) = tokio_postgres::connect(database_url, AsyncNoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::error!(error = %error, "postgres connection failed");
+        }
+    });
+    apply_postgres_connection_options(&client, options).await?;
+    if initialize_schema {
+        init_postgres_schema_async(&client).await?;
+    }
+    let statements = prepare_async_postgres_statements(&client).await?;
+    Ok(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
+        client,
+        statements,
+    })))
+}
+
+fn normalized_synchronous_commit(value: &str) -> Result<&'static str, NoetError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok("on"),
+        "off" => Ok("off"),
+        "local" => Ok("local"),
+        "remote_write" => Ok("remote_write"),
+        "remote_apply" => Ok("remote_apply"),
+        other => Err(NoetError::InvalidConfig(format!(
+            "invalid NOET_POSTGRES_SYNCHRONOUS_COMMIT value {other:?}; expected on, off, local, remote_write, or remote_apply"
+        ))),
+    }
+}
+
+async fn run_async_postgres_finalize_worker(
+    connection: Arc<tokio::sync::Mutex<AsyncPostgresConnection>>,
+    mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
+) {
+    while let Some(write) = rx.recv().await {
+        let connection = connection.lock().await;
+        match persist_finalization_async(
+            &connection.client,
+            &connection.statements,
+            &write.reservation,
+            &write.payload,
+            &write.snapshot,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    persist_limit_windows_async(&connection.client, &write.snapshot).await
+                {
+                    tracing::error!(error = %error, "postgres async finalize limit-window persistence failed");
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "postgres async finalize persistence failed");
+            }
+        }
+    }
+}
+
 impl AsyncPostgresLedger {
     pub async fn connect(database_url: &str) -> Result<Self, NoetError> {
+        Self::connect_with_options(database_url, AsyncPostgresLedgerOptions::default()).await
+    }
+
+    pub async fn connect_with_options(
+        database_url: &str,
+        options: AsyncPostgresLedgerOptions,
+    ) -> Result<Self, NoetError> {
+        let pool_size = options.pool_size.max(1);
+        let mut connections = Vec::with_capacity(pool_size);
         let (client, connection) = tokio_postgres::connect(database_url, AsyncNoTls).await?;
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(error = %error, "postgres connection failed");
             }
         });
+        apply_postgres_connection_options(&client, &options).await?;
         init_postgres_schema_async(&client).await?;
-        let statements = Arc::new(AsyncPostgresStatements {
-            authorize_fast: client.prepare(ASYNC_AUTHORIZE_FAST_SQL).await?,
-            finalize_with_usage_fast: client.prepare(ASYNC_FINALIZE_WITH_USAGE_FAST_SQL).await?,
-            finalize_without_usage_fast: client
-                .prepare(ASYNC_FINALIZE_WITHOUT_USAGE_FAST_SQL)
-                .await?,
-        });
+        let statements = prepare_async_postgres_statements(&client).await?;
         let mut ledger = BudgetLedger::default();
         load_limit_windows_async(&client, &mut ledger).await?;
         load_allocation_buckets_async(&client, &mut ledger).await?;
         load_active_reservations_async(&client, &mut ledger).await?;
-        Ok(Self {
-            client: Arc::new(tokio::sync::Mutex::new(client)),
+        connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
+            client,
             statements,
+        })));
+        for _ in 1..pool_size {
+            connections
+                .push(connect_async_postgres_connection(database_url, &options, false).await?);
+        }
+        let pool = Arc::new(AsyncPostgresPool {
+            connections,
+            next: AtomicUsize::new(0),
+        });
+        let finalize_tx = if options.async_finalize {
+            let finalize_connection =
+                connect_async_postgres_connection(database_url, &options, false).await?;
+            let (tx, rx) = mpsc::channel(options.finalize_queue_capacity);
+            tokio::spawn(run_async_postgres_finalize_worker(finalize_connection, rx));
+            Some(tx)
+        } else {
+            None
+        };
+        Ok(Self {
+            pool,
             ledger: Arc::new(tokio::sync::Mutex::new(ledger)),
+            finalize_tx,
+            stage_timing: options.stage_timing,
         })
     }
 
@@ -565,22 +795,34 @@ impl AsyncPostgresLedger {
         request: AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
+        let started = Instant::now();
         let (decision, snapshot) = {
             let mut ledger = self.ledger.lock().await;
             let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
             let snapshot = ledger.persistence_snapshot();
             (decision, snapshot)
         };
-        let client = self.client.lock().await;
+        let decision_elapsed = started.elapsed();
+        let db_started = Instant::now();
+        let connection = self.pool.connection();
+        let connection = connection.lock().await;
         persist_decision_async(
-            &client,
-            &self.statements,
+            &connection.client,
+            &connection.statements,
             &snapshot,
             policy.as_deref(),
             &request,
             &decision,
         )
         .await?;
+        if self.stage_timing {
+            tracing::debug!(
+                decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
+                db_ms = db_started.elapsed().as_secs_f64() * 1000.0,
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "postgres authorize stages"
+            );
+        }
         Ok(decision)
     }
 
@@ -589,23 +831,84 @@ impl AsyncPostgresLedger {
         reservation_id: String,
         payload: FinalizeReservation,
     ) -> Result<Reservation, NoetError> {
+        let started = Instant::now();
         let (reservation, snapshot) = {
             let mut ledger = self.ledger.lock().await;
             let reservation = ledger.finalize(&reservation_id, &payload)?;
             let snapshot = ledger.persistence_snapshot();
             (reservation, snapshot)
         };
-        let client = self.client.lock().await;
+        let decision_elapsed = started.elapsed();
+        if let Some(finalize_tx) = &self.finalize_tx {
+            let write = AsyncFinalizeWrite {
+                reservation: reservation.clone(),
+                payload,
+                snapshot,
+            };
+            match finalize_tx.try_send(write) {
+                Ok(()) => {
+                    if self.stage_timing {
+                        tracing::debug!(
+                            decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
+                            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "postgres finalize queued"
+                        );
+                    }
+                    return Ok(reservation);
+                }
+                Err(mpsc::error::TrySendError::Full(write)) => {
+                    tracing::warn!("postgres async finalize queue full; persisting synchronously");
+                    return self
+                        .persist_finalization_write(write, reservation, started, decision_elapsed)
+                        .await;
+                }
+                Err(mpsc::error::TrySendError::Closed(write)) => {
+                    tracing::warn!(
+                        "postgres async finalize queue closed; persisting synchronously"
+                    );
+                    return self
+                        .persist_finalization_write(write, reservation, started, decision_elapsed)
+                        .await;
+                }
+            }
+        }
+        let write = AsyncFinalizeWrite {
+            reservation: reservation.clone(),
+            payload,
+            snapshot,
+        };
+        self.persist_finalization_write(write, reservation, started, decision_elapsed)
+            .await
+    }
+
+    async fn persist_finalization_write(
+        &self,
+        write: AsyncFinalizeWrite,
+        reservation: Reservation,
+        started: Instant,
+        decision_elapsed: std::time::Duration,
+    ) -> Result<Reservation, NoetError> {
+        let db_started = Instant::now();
+        let connection = self.pool.connection();
+        let connection = connection.lock().await;
         let persisted_limit_window = persist_finalization_async(
-            &client,
-            &self.statements,
-            &reservation,
-            &payload,
-            &snapshot,
+            &connection.client,
+            &connection.statements,
+            &write.reservation,
+            &write.payload,
+            &write.snapshot,
         )
         .await?;
         if !persisted_limit_window {
-            persist_limit_windows_async(&client, &snapshot).await?;
+            persist_limit_windows_async(&connection.client, &write.snapshot).await?;
+        }
+        if self.stage_timing {
+            tracing::debug!(
+                decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
+                db_ms = db_started.elapsed().as_secs_f64() * 1000.0,
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "postgres finalize stages"
+            );
         }
         Ok(reservation)
     }
@@ -615,8 +918,9 @@ impl AsyncPostgresLedger {
             let mut ledger = self.ledger.lock().await;
             ledger.record_event(event.clone())?;
         }
-        let client = self.client.lock().await;
-        persist_event_async(&client, &event).await
+        let connection = self.pool.connection();
+        let connection = connection.lock().await;
+        persist_event_async(&connection.client, &event).await
     }
 }
 
@@ -1119,9 +1423,12 @@ impl BudgetLedger {
                     .get::<_, i64>(0)
                     .max(0) as u64
                 } else {
-                    pg.query_one("SELECT COUNT(DISTINCT app_run_key)::BIGINT FROM decisions", &[])?
-                        .get::<_, i64>(0)
-                        .max(0) as u64
+                    pg.query_one(
+                        "SELECT COUNT(DISTINCT app_run_key)::BIGINT FROM decisions",
+                        &[],
+                    )?
+                    .get::<_, i64>(0)
+                    .max(0) as u64
                 },
                 ..RunTotalsReport::default()
             };
@@ -1131,7 +1438,10 @@ impl BudgetLedger {
                     &[&since],
                 )?
             } else {
-                pg.query("SELECT outcome, COUNT(*)::BIGINT FROM decisions GROUP BY outcome", &[])?
+                pg.query(
+                    "SELECT outcome, COUNT(*)::BIGINT FROM decisions GROUP BY outcome",
+                    &[],
+                )?
             };
             for row in outcome_rows {
                 let outcome: String = row.get(0);
@@ -1352,7 +1662,9 @@ impl BudgetLedger {
                 let provider: Option<String> = row.get(2);
                 let model: Option<String> = row.get(3);
                 let limit_hits_json: Option<String> = row.get(4);
-                if let Some(reason) = rule_stat_reason(&explanations_json, limit_hits_json.as_deref()) {
+                if let Some(reason) =
+                    rule_stat_reason(&explanations_json, limit_hits_json.as_deref())
+                {
                     *reasons
                         .entry(rule.clone())
                         .or_default()
@@ -1490,7 +1802,11 @@ impl BudgetLedger {
             }
             sql.push_str(" ORDER BY created_at DESC");
             let rows = if let Some(since) = since {
-                pg_conn.0.lock().expect("postgres mutex").query(&sql, &[&since.to_rfc3339()])?
+                pg_conn
+                    .0
+                    .lock()
+                    .expect("postgres mutex")
+                    .query(&sql, &[&since.to_rfc3339()])?
             } else {
                 pg_conn.0.lock().expect("postgres mutex").query(&sql, &[])?
             };
@@ -1625,10 +1941,11 @@ impl BudgetLedger {
                     &[&since.to_rfc3339()],
                 )?
             } else {
-                pg_conn.0.lock().expect("postgres mutex").query_one(
-                    "SELECT COUNT(*)::BIGINT FROM decisions",
-                    &[],
-                )?
+                pg_conn
+                    .0
+                    .lock()
+                    .expect("postgres mutex")
+                    .query_one("SELECT COUNT(*)::BIGINT FROM decisions", &[])?
             }
             .get(0);
             return Ok(count.max(0) as usize);
@@ -1676,10 +1993,11 @@ impl BudgetLedger {
                 " ORDER BY created_at DESC LIMIT {limit_param}) recent ORDER BY created_at ASC"
             ));
             let rows = if let Some(since) = since {
-                pg_conn.0.lock().expect("postgres mutex").query(
-                    &sql,
-                    &[&since.to_rfc3339(), &(limit as i64)],
-                )?
+                pg_conn
+                    .0
+                    .lock()
+                    .expect("postgres mutex")
+                    .query(&sql, &[&since.to_rfc3339(), &(limit as i64)])?
             } else {
                 pg_conn
                     .0
@@ -1830,7 +2148,11 @@ impl BudgetLedger {
                 .iter()
                 .map(|id| id as &(dyn PostgresToSql + Sync))
                 .collect::<Vec<_>>();
-            let rows = pg_conn.0.lock().expect("postgres mutex").query(&sql, &params)?;
+            let rows = pg_conn
+                .0
+                .lock()
+                .expect("postgres mutex")
+                .query(&sql, &params)?;
             return Ok(rows
                 .iter()
                 .map(usage_activity_record_from_postgres_row)
@@ -2000,7 +2322,10 @@ impl BudgetLedger {
                     .query(&sql, &[&trace_id])?,
                 (None, None) => pg_conn.0.lock().expect("postgres mutex").query(&sql, &[])?,
             };
-            return Ok(rows.into_iter().map(event_report_item_from_postgres_row).collect());
+            return Ok(rows
+                .into_iter()
+                .map(event_report_item_from_postgres_row)
+                .collect());
         }
         let Some(conn) = &self.conn else {
             return Ok(Vec::new());
@@ -4526,64 +4851,65 @@ async fn persist_decision_async(
                     spend.limit_id.clone(),
                     spend.scope_key.clone(),
                 )) {
-                let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
-                let limit_window_spends_json = serde_json::to_string(&stored.limit_window_spends)?;
-                let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
-                let reservation_created_at = reservation.created_at.to_rfc3339();
-                let reservation_expires_at = reservation.expires_at.to_rfc3339();
-                let window_started_at = window.started_at.to_rfc3339();
-                let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
-                conn.execute(
-                    &statements.authorize_fast,
-                    &[
-                        &decision.decision_id.as_str(),
-                        &trace_id.as_deref(),
-                        &session_id.as_deref(),
-                        &request_id.as_deref(),
-                        &request.subject.as_deref(),
-                        &request.project.as_deref(),
-                        &request.provider.as_deref(),
-                        &request.model.as_deref(),
-                        &estimated_tokens,
-                        &request.estimated_cost_usd,
-                        &outcome,
-                        &action_text(decision.action),
-                        &explanations_json,
-                        &metadata_json,
-                        &entities_json,
-                        &routing.selected_budget_id.as_deref(),
-                        &routing.matched_entity.as_deref(),
-                        &routing.selection_reason.as_deref(),
-                        &routing.rejected_budget_id.as_deref(),
-                        &routing.rejected_budget_reason.as_deref(),
-                        &routing.model_check.as_deref(),
-                        &routing.budget_window_remaining_usd,
-                        &routing_json,
-                        &empty_limit_hits_json,
-                        &max_tool_calls,
-                        &max_agent_steps,
-                        &max_retries,
-                        &app_run_key,
-                        &created_at,
-                        &spend.rule_id.as_str(),
-                        &spend.limit_id.as_str(),
-                        &spend.scope_key.as_str(),
-                        &window_started_at,
-                        &window.used_usd,
-                        &reservation.id.as_str(),
-                        &reservation.amount_usd,
-                        &reservation.currency.as_str(),
-                        &reservation_status_text(reservation.status),
-                        &reservation_created_at,
-                        &reservation_expires_at,
-                        &budget_rule_ids_json,
-                        &limit_window_spends_json,
-                        &allocation_spends_json,
-                        &bucket_start,
-                    ],
-                )
-                .await?;
-                return Ok(());
+                    let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
+                    let limit_window_spends_json =
+                        serde_json::to_string(&stored.limit_window_spends)?;
+                    let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
+                    let reservation_created_at = reservation.created_at.to_rfc3339();
+                    let reservation_expires_at = reservation.expires_at.to_rfc3339();
+                    let window_started_at = window.started_at.to_rfc3339();
+                    let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
+                    conn.execute(
+                        &statements.authorize_fast,
+                        &[
+                            &decision.decision_id.as_str(),
+                            &trace_id.as_deref(),
+                            &session_id.as_deref(),
+                            &request_id.as_deref(),
+                            &request.subject.as_deref(),
+                            &request.project.as_deref(),
+                            &request.provider.as_deref(),
+                            &request.model.as_deref(),
+                            &estimated_tokens,
+                            &request.estimated_cost_usd,
+                            &outcome,
+                            &action_text(decision.action),
+                            &explanations_json,
+                            &metadata_json,
+                            &entities_json,
+                            &routing.selected_budget_id.as_deref(),
+                            &routing.matched_entity.as_deref(),
+                            &routing.selection_reason.as_deref(),
+                            &routing.rejected_budget_id.as_deref(),
+                            &routing.rejected_budget_reason.as_deref(),
+                            &routing.model_check.as_deref(),
+                            &routing.budget_window_remaining_usd,
+                            &routing_json,
+                            &empty_limit_hits_json,
+                            &max_tool_calls,
+                            &max_agent_steps,
+                            &max_retries,
+                            &app_run_key,
+                            &created_at,
+                            &spend.rule_id.as_str(),
+                            &spend.limit_id.as_str(),
+                            &spend.scope_key.as_str(),
+                            &window_started_at,
+                            &window.used_usd,
+                            &reservation.id.as_str(),
+                            &reservation.amount_usd,
+                            &reservation.currency.as_str(),
+                            &reservation_status_text(reservation.status),
+                            &reservation_created_at,
+                            &reservation_expires_at,
+                            &budget_rule_ids_json,
+                            &limit_window_spends_json,
+                            &allocation_spends_json,
+                            &bucket_start,
+                        ],
+                    )
+                    .await?;
+                    return Ok(());
                 }
             }
         }
@@ -5486,7 +5812,9 @@ fn historical_authorize_request_from_postgres_row(row: &PostgresRow) -> Historic
             project: row.get(6),
             provider: row.get(7),
             model: row.get(8),
-            estimated_tokens: row.get::<_, Option<i64>>(9).map(|value| value.max(0) as u64),
+            estimated_tokens: row
+                .get::<_, Option<i64>>(9)
+                .map(|value| value.max(0) as u64),
             estimated_cost_usd: row.get(10),
             metadata: serde_json::from_str(&metadata_json).unwrap_or_default(),
         },
@@ -8533,8 +8861,7 @@ mod tests {
     #[test]
     #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
     fn postgres_ledger_persists_decision_reservation_usage_and_events() {
-        let database_url =
-            std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
         let schema = format!("noether_test_{}", Uuid::new_v4().simple());
         let mut admin =
             PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");

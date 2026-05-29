@@ -28,7 +28,9 @@ use crate::contract::{
     Reservation, SpendWindowMode, TraceEvent,
 };
 use crate::error::NoetError;
-use crate::ledger::{AsyncPostgresLedger, BudgetLedger, ReplaySpendSeed, TraceReportItem};
+use crate::ledger::{
+    AsyncPostgresLedger, AsyncPostgresLedgerOptions, BudgetLedger, ReplaySpendSeed, TraceReportItem,
+};
 use crate::noether_app;
 use crate::openapi;
 use crate::policy::PolicyFile;
@@ -55,7 +57,9 @@ pub struct AppState {
 #[derive(Clone)]
 pub enum LedgerBackend {
     InMemory,
-    SQLite { path: PathBuf },
+    SQLite {
+        path: PathBuf,
+    },
     Postgres {
         database_url: String,
         ledger: AsyncPostgresLedger,
@@ -619,12 +623,12 @@ impl AppState {
         payload: FinalizeReservation,
     ) -> Result<Reservation, NoetError> {
         match &self.ledger_backend {
-            LedgerBackend::Postgres { ledger, .. } => ledger.finalize(reservation_id, payload).await,
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => self
-                .ledger
-                .lock()
-                .await
-                .finalize(&reservation_id, &payload),
+            LedgerBackend::Postgres { ledger, .. } => {
+                ledger.finalize(reservation_id, payload).await
+            }
+            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
+                self.ledger.lock().await.finalize(&reservation_id, &payload)
+            }
         }
     }
 
@@ -657,19 +661,17 @@ impl AppState {
                 let ledger = BudgetLedger::open_sqlite(path)?;
                 read(&ledger)
             }
-            LedgerBackend::Postgres { database_url, .. } => {
-                std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| {
-                            let ledger = BudgetLedger::open_postgres(database_url)?;
-                            read(&ledger)
-                        })
-                        .join()
-                        .map_err(|_| {
-                            NoetError::InvalidConfig("postgres read task panicked".to_owned())
-                        })?
-                })
-            }
+            LedgerBackend::Postgres { database_url, .. } => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let ledger = BudgetLedger::open_postgres(database_url)?;
+                        read(&ledger)
+                    })
+                    .join()
+                    .map_err(|_| {
+                        NoetError::InvalidConfig("postgres read task panicked".to_owned())
+                    })?
+            }),
             LedgerBackend::InMemory => {
                 let ledger = self.ledger.lock().await;
                 read(&ledger)
@@ -690,6 +692,7 @@ pub struct ServeConfig {
     pub simulation_dir: PathBuf,
     pub db_path: PathBuf,
     pub database_url: Option<String>,
+    pub postgres_options: AsyncPostgresLedgerOptions,
     pub upstream: Option<url::Url>,
     pub routes: Vec<ProxyRoute>,
     pub policy_path: Option<PathBuf>,
@@ -707,7 +710,13 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     }
     let bind = config.bind;
     let postgres_ledger = match config.database_url.as_deref() {
-        Some(database_url) => Some(AsyncPostgresLedger::connect(database_url).await?),
+        Some(database_url) => Some(
+            AsyncPostgresLedger::connect_with_options(
+                database_url,
+                config.postgres_options.clone(),
+            )
+            .await?,
+        ),
         None => None,
     };
     let ledger = if config.database_url.is_some() {
@@ -5482,7 +5491,9 @@ budgets:
         state.ledger = Arc::new(TokioMutex::new(
             BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
-        state.ledger_backend = LedgerBackend::SQLite { path: db_path.clone() };
+        state.ledger_backend = LedgerBackend::SQLite {
+            path: db_path.clone(),
+        };
         let app = build_router(state);
 
         let response = app
@@ -5513,12 +5524,12 @@ budgets:
     #[tokio::test]
     #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
     async fn postgres_backend_persists_auth_finalize_event_and_reports() {
-        let database_url =
-            std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
         let schema = format!("noether_server_test_{}", uuid::Uuid::new_v4().simple());
-        let (admin, admin_connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
-            .await
-            .expect("postgres admin connection");
+        let (admin, admin_connection) =
+            tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+                .await
+                .expect("postgres admin connection");
         tokio::spawn(async move {
             let _ = admin_connection.await;
         });
@@ -5623,6 +5634,110 @@ budgets:
                 .any(|item| item.kind == "usage.finalized")
         );
         assert!(trace.items.iter().any(|item| item.kind == "tool.observed"));
+
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .await
+            .expect("drop test schema");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    async fn postgres_backend_async_finalize_persists_after_response() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_server_test_{}", uuid::Uuid::new_v4().simple());
+        let (admin, admin_connection) =
+            tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+                .await
+                .expect("postgres admin connection");
+        tokio::spawn(async move {
+            let _ = admin_connection.await;
+        });
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .await
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+        let postgres_ledger = AsyncPostgresLedger::connect_with_options(
+            &scoped_url,
+            AsyncPostgresLedgerOptions {
+                async_finalize: true,
+                ..AsyncPostgresLedgerOptions::default()
+            },
+        )
+        .await
+        .expect("postgres backend");
+        let mut state = AppState::new(
+            PathBuf::from(".noet/test-fixtures"),
+            None,
+            Some(model_locked_policy()),
+            DecisionMode::Enforce,
+        );
+        state.ledger_backend = LedgerBackend::Postgres {
+            database_url: scoped_url,
+            ledger: postgres_ledger,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "trace_id".to_owned(),
+            Value::String("trace-postgres-async-finalize".to_owned()),
+        );
+        let decision = state
+            .authorize_request(
+                state.active_policy().await,
+                AuthorizeRequest {
+                    budget_id: None,
+                    entities: vec!["project:noether".to_owned()],
+                    subject: Some("user:test".to_owned()),
+                    project: Some("noether".to_owned()),
+                    provider: Some("openai-codex".to_owned()),
+                    model: Some("gpt-4.1".to_owned()),
+                    estimated_tokens: Some(100),
+                    estimated_cost_usd: Some(0.25),
+                    metadata: metadata.clone(),
+                },
+            )
+            .await
+            .expect("authorize");
+        state
+            .finalize_reservation(
+                decision.reservation.expect("reservation").id,
+                FinalizeReservation {
+                    reservation_id: None,
+                    outcome: FinalizeOutcome::Success,
+                    usage: Some(UsageObservation {
+                        provider: Some("openai-codex".to_owned()),
+                        model: Some("gpt-4.1".to_owned()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        total_tokens: Some(15),
+                        cost_usd: Some(0.20),
+                        latency_ms: Some(123),
+                        stop_reason: Some("stop".to_owned()),
+                    }),
+                    actual_cost_usd: Some(0.20),
+                    metadata,
+                },
+            )
+            .await
+            .expect("finalize");
+
+        let mut total_cost = 0.0;
+        for _ in 0..50 {
+            total_cost = state
+                .read_ledger(|ledger| ledger.usage_report())
+                .await
+                .expect("usage report")
+                .total_cost_usd;
+            if total_cost == 0.20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(total_cost, 0.20);
 
         admin
             .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))

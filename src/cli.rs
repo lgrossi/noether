@@ -11,7 +11,9 @@ use tokio::fs;
 use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, TraceEvent};
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
-use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
+use crate::ledger::{
+    AsyncPostgresLedgerOptions, BudgetLedger, TraceReport, TraceReportItem, UsageReport,
+};
 use crate::local::{
     DEFAULT_LOCAL_BIND, ensure_local_runtime_layout, read_local_sidecar_owner,
     write_local_sidecar_owner,
@@ -74,6 +76,34 @@ struct ServeArgs {
     /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
     #[arg(long, env = "NOET_DATABASE_URL")]
     database_url: Option<String>,
+
+    /// PostgreSQL durability/latency profile: strict or performance.
+    #[arg(long, env = "NOET_POSTGRES_PROFILE", default_value = "strict")]
+    postgres_profile: String,
+
+    /// Number of async PostgreSQL connections to use for hot-path writes.
+    #[arg(long, env = "NOET_POSTGRES_POOL_SIZE", default_value_t = 4)]
+    postgres_pool_size: usize,
+
+    /// Queue PostgreSQL finalize persistence after updating in-memory state.
+    #[arg(long, env = "NOET_POSTGRES_ASYNC_FINALIZE", default_value_t = false)]
+    postgres_async_finalize: bool,
+
+    /// Bounded queue size for async PostgreSQL finalize persistence.
+    #[arg(
+        long,
+        env = "NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY",
+        default_value_t = 1024
+    )]
+    postgres_finalize_queue_capacity: usize,
+
+    /// Per-connection PostgreSQL synchronous_commit setting: on, off, local, remote_write, remote_apply.
+    #[arg(long, env = "NOET_POSTGRES_SYNCHRONOUS_COMMIT")]
+    postgres_synchronous_commit: Option<String>,
+
+    /// Emit debug logs with PostgreSQL hot-path stage timings.
+    #[arg(long, env = "NOET_POSTGRES_STAGE_TIMING", default_value_t = false)]
+    postgres_stage_timing: bool,
 
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
@@ -244,6 +274,7 @@ pub async fn run() -> Result<(), NoetError> {
     match cli.command {
         Command::Serve(args) => {
             let policy_path = args.policy.clone();
+            let postgres_options = postgres_options_from_serve_args(&args)?;
             let policy = match policy_path.as_ref() {
                 Some(path) => Some(load_policy(path).await?),
                 None => None,
@@ -258,6 +289,7 @@ pub async fn run() -> Result<(), NoetError> {
                 simulation_dir: args.simulation_dir,
                 db_path: args.db_path,
                 database_url: args.database_url,
+                postgres_options,
                 upstream: args.upstream,
                 routes,
                 policy_path,
@@ -273,6 +305,24 @@ pub async fn run() -> Result<(), NoetError> {
         Command::Scenario(command) => run_scenario(command).await,
         Command::Simulate(command) => run_simulate(command).await,
     }
+}
+
+fn postgres_options_from_serve_args(
+    args: &ServeArgs,
+) -> Result<AsyncPostgresLedgerOptions, NoetError> {
+    let mut options = AsyncPostgresLedgerOptions::from_profile(&args.postgres_profile)?;
+    options.pool_size = args.postgres_pool_size.max(1);
+    if args.postgres_async_finalize {
+        options.async_finalize = true;
+    }
+    options.finalize_queue_capacity = args.postgres_finalize_queue_capacity.max(1);
+    if let Some(synchronous_commit) = args.postgres_synchronous_commit.clone() {
+        options.synchronous_commit = Some(synchronous_commit);
+    }
+    if args.postgres_stage_timing {
+        options.stage_timing = true;
+    }
+    Ok(options)
 }
 
 async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
@@ -291,6 +341,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 simulation_dir: layout.simulation_dir,
                 db_path: layout.db_path,
                 database_url: None,
+                postgres_options: AsyncPostgresLedgerOptions::default(),
                 upstream: args.upstream,
                 routes,
                 policy_path: Some(layout.policy_path),
