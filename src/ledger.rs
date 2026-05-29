@@ -272,7 +272,7 @@ struct RoutingPersistenceFields {
     retries: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct UsageReport {
     pub total_cost_usd: f64,
     pub rows: Vec<UsageReportRow>,
@@ -280,7 +280,7 @@ pub struct UsageReport {
     pub protected_adoption: Option<ProtectedAdoptionReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct UsageReportRow {
     pub subject: Option<String>,
     pub project: Option<String>,
@@ -379,7 +379,7 @@ pub struct SpendScopeTotal {
     pub amount_usd: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtectedAdoptionReport {
     pub unused_protected_opportunity_usd: f64,
     pub carryover_liability_usd: f64,
@@ -387,7 +387,7 @@ pub struct ProtectedAdoptionReport {
     pub high_adopters: Vec<ProtectedAdoptionEntityReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtectedAdoptionEntityReport {
     pub budget_id: String,
     pub entity_key: String,
@@ -397,13 +397,13 @@ pub struct ProtectedAdoptionEntityReport {
     pub used_current_grant_usd: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceReport {
     pub trace_id: String,
     pub items: Vec<TraceReportItem>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceReportItem {
     pub occurred_at: DateTime<Utc>,
     pub kind: String,
