@@ -19,6 +19,10 @@ This directory holds Noether's north-star product and architecture notes.
   tool-governed, and observed integrations.
 - [Policy capability matrix](./policy-capability-matrix.md): hard-enforceable versus report-only
   policy controls by integration class.
+- [Operations runbook](./operations-runbook.md): storage-neutral pilot operations for health,
+  backup/restore, retention, latency, and upgrades.
+- [Integration probe contract](./integration-probe-contract.md): local stub/probe evidence expected
+  before weak harness integrations can claim stronger governance.
 - [Pi and LiteLLM production smoke checklist](./testing/pi-litellm-production-smoke.md): real-tool
   validation evidence required before company-pilot claims.
 - [Integration readiness plan](./integration-readiness-plan.md): OpenAPI, SDK, and harness/gateway

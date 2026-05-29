@@ -1,3 +1,4 @@
+pub mod approval_audit;
 pub mod capture;
 pub mod cli;
 pub mod contract;

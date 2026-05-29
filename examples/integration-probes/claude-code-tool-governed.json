@@ -1,0 +1,16 @@
+{
+  "integration": "claude-code",
+  "target_posture": "tool-governed",
+  "probe_mode": "local-stub",
+  "main_model_pre_provider_authorization_documented": false,
+  "tool_pre_action_authorization_documented": true,
+  "deny_prevents_main_model_provider_traffic": false,
+  "deny_prevents_tool_action": true,
+  "usage_finalization": "best_effort_agent_subtask_usage",
+  "honest_claim": "Noether can govern documented Claude Code tool/action hooks; it does not yet govern the main model provider call.",
+  "next_evidence_needed": [
+    "stable main-model pre-call hook",
+    "stable main-model usage/cost hook",
+    "proof that deny prevents main provider traffic"
+  ]
+}

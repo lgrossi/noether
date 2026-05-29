@@ -5,7 +5,8 @@ Local mocks and unit tests are useful, but they are not enough for the readiness
 
 ## Shared setup
 
-Run Noether behind the company boundary using the company-pilot deployment shape:
+Run Noether behind the company boundary using the company-pilot deployment shape. The current command
+uses SQLite; replace the storage flags with the active backend once Postgres support lands:
 
 ```bash
 noet serve \
@@ -24,7 +25,9 @@ Before testing:
 - confirm body/prompt capture is not enabled unless the deployment deliberately accepts that
   retention risk;
 - record the exact Noether commit, integration package version, tool version, policy file, and
-  decision mode.
+  decision mode;
+- record the active storage backend. For SQLite pilots, include the database path. For future
+  Postgres pilots, include the DSN identity without secrets.
 
 ## Pi smoke
 
@@ -108,4 +111,3 @@ Use these verdicts:
   evidence is incomplete.
 - **BLOCK**: deny cannot prevent provider spend in the tested integration path, or Noether receives
   prompt/body content by default.
-

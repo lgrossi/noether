@@ -23,6 +23,10 @@ Noether's company claim must distinguish governed integrations from observed int
 
 ## Work needed for weaker integrations
 
+Local probe fixtures are checked in under
+[`examples/integration-probes`](../examples/integration-probes). They are intentionally stubs: they
+record the claim each integration may make today and the evidence needed before the claim can move.
+
 ### Codex
 
 Goal: move from wrapper-gated to governed, or explicitly keep it wrapper-gated.
@@ -33,6 +37,8 @@ Evidence needed:
 - proof that deny prevents provider traffic before any model request;
 - proof that usage/cost fields are reliable enough for finalization;
 - fallback statement if only `codex exec --json` remains available.
+
+Current stub: [`codex-wrapper-gated.json`](../examples/integration-probes/codex-wrapper-gated.json).
 
 ### Claude Code
 
@@ -45,6 +51,9 @@ Evidence needed:
 - proof that Agent/subagent usage can be attributed without inventing usage;
 - explicit docs for the remaining tool-governed scope if no main-model hook exists.
 
+Current stub:
+[`claude-code-tool-governed.json`](../examples/integration-probes/claude-code-tool-governed.json).
+
 ### OpenCode
 
 Goal: move from observed to governed only if public hooks support it.
@@ -56,8 +65,9 @@ Evidence needed:
 - proof that deny blocks provider traffic;
 - proof that event-only mode does not overclaim enforcement.
 
+Current stub: [`opencode-observed.json`](../examples/integration-probes/opencode-observed.json).
+
 ## Product rule
 
 If a hook cannot prevent spend before provider traffic, Noether should call the integration observed
 or report-only, not governed.
-

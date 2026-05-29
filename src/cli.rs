@@ -2766,7 +2766,7 @@ fn lifecycle_limits_panel(html: &mut String, trace: Option<&TraceReport>) {
         return;
     }
     html.push_str(
-        "<section class=\"panel\"><h2>Lifecycle limits</h2><p class=\"summary\">These are report-only detections emitted from the lifecycle trace. They surface risky patterns even when policy did not block the run.</p><div class=\"entry-list\">",
+        "<section class=\"panel\"><h2>Lifecycle limits (report-only)</h2><p class=\"summary\">These lifecycle signals were detected after the run emitted events. They are audit evidence, not proof that Noether blocked the action before it happened.</p><div class=\"entry-list\">",
     );
     for item in items {
         html.push_str("<article class=\"entry-card\"><div class=\"entry-top\"><div>");
@@ -2777,6 +2777,7 @@ fn lifecycle_limits_panel(html: &mut String, trace: Option<&TraceReport>) {
             escape_html(&item.kind),
             escape_html(&item.summary)
         );
+        meta_pill(html, "report-only");
         meta_pill(html, &item.kind);
         html.push_str("</div></div>");
         details_block(html, "Show exact lifecycle evidence", &item.summary);
@@ -3486,7 +3487,10 @@ mod tests {
 
         let html = render_dashboard(&usage, &[], Some(&trace), &[]);
 
-        assert!(html.contains("Lifecycle limits"));
+        assert!(html.contains("Lifecycle limits (report-only)"));
+        assert!(html.contains("audit evidence"));
+        assert!(html.contains("not proof that Noether blocked"));
+        assert!(html.contains("report-only"));
         assert!(html.contains("limit.report_only.tool_calls"));
     }
 

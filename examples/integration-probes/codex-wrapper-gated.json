@@ -1,0 +1,16 @@
+{
+  "integration": "codex",
+  "target_posture": "wrapper-gated",
+  "probe_mode": "local-stub",
+  "pre_provider_authorization_documented": false,
+  "wrapper_prelaunch_authorization": true,
+  "deny_prevents_provider_traffic": "not_proven_inside_codex",
+  "deny_prevents_process_launch": true,
+  "usage_finalization": "best_effort_from_jsonl",
+  "honest_claim": "Noether can gate the noether-codex wrapper before codex exec starts; it does not yet prove control inside Codex provider transport.",
+  "next_evidence_needed": [
+    "stable Codex provider pre-call hook or plugin API",
+    "local proof that deny prevents Codex provider traffic",
+    "reliable usage/cost event shape"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "integration": "opencode",
+  "target_posture": "observed",
+  "probe_mode": "local-stub",
+  "pre_provider_authorization_documented": false,
+  "tool_event_hooks_documented": true,
+  "deny_prevents_provider_traffic": false,
+  "usage_finalization": "unsupported_until_usage_hook_exists",
+  "honest_claim": "Noether can observe documented OpenCode events/tool hooks; it should not claim provider-spend enforcement yet.",
+  "next_evidence_needed": [
+    "documented provider pre-call hook or middleware",
+    "documented post-provider usage/cost hook",
+    "proof that deny prevents provider traffic"
+  ]
+}

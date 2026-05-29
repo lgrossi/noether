@@ -12,14 +12,14 @@ application platform.
   may call Noether; untrusted clients must not.
 - Blocking central human approvals are not the desired workflow. Approval should be self-driven in
   the harness where possible, then centrally auditable when an override looks unusual.
-- SQLite and single-process operation are acceptable for early company pilots when documented as the
-  supported shape. Multi-writer HA and shared storage can stay future work.
+- SQLite and single-process operation are the current local/pilot default. Postgres is the
+  team/company storage direction once the storage work lands.
 
 ## Non-negotiable readiness work
 
 1. **Company pilot deployment kit**
    - Supported single-process command.
-   - Durable SQLite and artifact path layout.
+   - Current SQLite path layout plus a storage-neutral boundary for Postgres.
    - Validation checklist.
    - Explicit non-goals: built-in auth/RBAC, multi-writer HA, provider routing.
 
@@ -31,7 +31,8 @@ application platform.
 
 3. **Operational runbook**
    - Health checks, backup/restore, retention, logs, hot-path latency, and upgrade notes.
-   - This remains tracked separately from the current task set.
+   - Storage-neutral where possible; current SQLite and future Postgres responsibilities are called
+     out separately.
 
 4. **Pi and LiteLLM production smoke documentation**
    - Real installed-tool validation, not only local mocks.
@@ -62,3 +63,5 @@ application platform.
 - Integration gap plan: [integration-gap-plan.md](./integration-gap-plan.md)
 - Hard-vs-report-only capability matrix:
   [policy-capability-matrix.md](./policy-capability-matrix.md)
+- Operations runbook: [operations-runbook.md](./operations-runbook.md)
+- Integration probe contract: [integration-probe-contract.md](./integration-probe-contract.md)
