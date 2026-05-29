@@ -2266,6 +2266,65 @@ pub(crate) fn try_authorize_at_hot(
     Ok((decision, snapshot))
 }
 
+/// Mutate HotState for a finalize: adjust window spends by the cost delta,
+/// mark the reservation finalized, and return the updated Reservation plus a
+/// Vec of (key, WindowState) pairs that changed (for L2 persistence).
+pub(crate) fn finalize_hot(
+    hot: &mut HotState,
+    reservation_id: &str,
+    payload: &FinalizeReservation,
+) -> Result<(Reservation, Vec<((String, String, String), WindowState)>), NoetError> {
+    payload
+        .validate_accounting()
+        .map_err(NoetError::InvalidConfig)?;
+
+    let stored = hot
+        .reservations
+        .get_mut(reservation_id)
+        .ok_or_else(|| NoetError::NotFound(format!("reservation {reservation_id}")))?;
+
+    if stored.reservation.status == ReservationStatus::Finalized {
+        return Ok((stored.reservation.clone(), Vec::new()));
+    }
+
+    let actual_cost = payload
+        .actual_cost_usd
+        .or_else(|| payload.usage.as_ref().and_then(|usage| usage.cost_usd));
+
+    let mut changed_lw_keys: Vec<(String, String, String)> = Vec::new();
+
+    if let Some(actual_cost) = actual_cost {
+        let delta = actual_cost - stored.estimated_cost_usd;
+        for spend in &stored.limit_window_spends {
+            let key = (
+                spend.rule_id.clone(),
+                spend.limit_id.clone(),
+                spend.scope_key.clone(),
+            );
+            if let Some(window) = hot.limit_windows.get_mut(&key) {
+                window.used_usd = (window.used_usd + delta).max(0.0);
+                changed_lw_keys.push(key);
+            }
+        }
+        stored.reservation.amount_usd = actual_cost;
+    }
+
+    stored.reservation.status = ReservationStatus::Finalized;
+    let reservation = stored.reservation.clone();
+
+    // Build the snapshot Vec for L2 persistence.
+    let lw_snapshot: Vec<((String, String, String), WindowState)> = changed_lw_keys
+        .into_iter()
+        .filter_map(|key| {
+            hot.limit_windows
+                .get(&key)
+                .map(|w| (key, WindowState { started_at: w.started_at, used_usd: w.used_usd }))
+        })
+        .collect();
+
+    Ok((reservation, lw_snapshot))
+}
+
 pub(crate) fn persist_limit_windows(
     conn: &Connection,
     windows: &HashMap<(String, String, String), WindowState>,
@@ -2471,7 +2530,7 @@ pub(crate) fn persist_decision(
     Ok(())
 }
 
-fn persist_finalization(
+pub(crate) fn persist_finalization(
     conn: &Connection,
     reservation: &Reservation,
     payload: &FinalizeReservation,

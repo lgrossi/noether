@@ -31,9 +31,9 @@ use crate::contract::{
 use crate::error::NoetError;
 use crate::ledger::{
     BudgetLedger, ConnMutex, HotState, ReplaySpendSeed, TraceReportItem,
-    persist_allocation_buckets, persist_decision as ledger_persist_decision,
-    persist_event, persist_limit_windows, try_authorize_at_hot, validate_event_payload,
-    RoutingPersistenceFields,
+    finalize_hot, persist_allocation_buckets, persist_decision as ledger_persist_decision,
+    persist_event, persist_finalization, persist_limit_windows, try_authorize_at_hot,
+    validate_event_payload, RoutingPersistenceFields,
 };
 use crate::noether_app;
 use crate::openapi;
@@ -842,12 +842,32 @@ async fn finalize_reservation(
     Json(payload): Json<FinalizeReservation>,
 ) -> Result<Json<Reservation>, NoetError> {
     let trace_id = finalize_trace_id(&payload);
-    let ledger = Arc::clone(&state.ledger);
-    let reservation = tokio::task::spawn_blocking(move || {
-        ledger.blocking_lock().finalize(&id, &payload)
+    let hot = Arc::clone(&state.hot);
+    let conn = Arc::clone(&state.conn);
+    let reservation = tokio::task::spawn_blocking(move || -> Result<Reservation, NoetError> {
+        // L1: acquire HotState, run in-memory finalize, release L1.
+        let (reservation, lw_snapshot) = {
+            let mut hot_guard = hot.lock().expect("hot mutex poisoned");
+            finalize_hot(&mut hot_guard, &id, &payload)?
+            // hot_guard dropped here — L1 released.
+        };
+
+        // L2: acquire conn, persist finalization + changed limit windows, release L2.
+        let conn_guard = conn.lock().expect("conn mutex poisoned");
+        if let Some(c) = conn_guard.as_ref() {
+            persist_finalization(c, &reservation, &payload)?;
+            if !lw_snapshot.is_empty() {
+                let lw_map: std::collections::HashMap<(String, String, String), _> =
+                    lw_snapshot.into_iter().collect();
+                persist_limit_windows(c, &lw_map)?;
+            }
+        }
+        drop(conn_guard); // L2 released.
+
+        Ok(reservation)
     })
     .await
-    .expect("ledger task panicked")?;
+    .expect("finalize task panicked")?;
     publish_report_update(&state, "finalize", trace_id);
     Ok(Json(reservation))
 }
@@ -5724,6 +5744,83 @@ policies: []
         assert!(
             (total_reserved - expected).abs() < 1e-9,
             "double-spend detected: reserved={total_reserved:.6} expected={expected:.6}"
+        );
+
+        // Collect all reservation IDs that were created.
+        let reservation_ids: Vec<String> = results
+            .iter()
+            .filter_map(|(_, decision)| {
+                decision["reservation"]["id"].as_str().map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            reservation_ids.len(),
+            TASK_COUNT,
+            "expected all tasks to produce a reservation"
+        );
+
+        // Finalize all reservations concurrently with actual_cost_usd = COST_PER_TASK
+        // (unchanged). After finalize, all reservations should be Finalized in HotState.
+        let finalize_handles: Vec<tokio::task::JoinHandle<StatusCode>> = reservation_ids
+            .iter()
+            .cloned()
+            .map(|reservation_id| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let body = serde_json::json!({
+                        "actual_cost_usd": COST_PER_TASK
+                    })
+                    .to_string();
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri(format!(
+                                    "/v1/reservations/{reservation_id}/finalize"
+                                ))
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .expect("finalize request"),
+                        )
+                        .await
+                        .expect("finalize response");
+                    response.status()
+                })
+            })
+            .collect();
+
+        for handle in finalize_handles {
+            let status = handle.await.expect("finalize task panicked");
+            assert_eq!(status, StatusCode::OK, "finalize returned non-200");
+        }
+
+        // After finalizing, all hot.reservations should have status = Finalized.
+        let hot_guard = state.hot.lock().expect("hot mutex post-finalize");
+        let finalized_count = hot_guard
+            .reservations
+            .values()
+            .filter(|stored| {
+                stored.reservation.status == crate::contract::ReservationStatus::Finalized
+            })
+            .count();
+        let finalized_amount: f64 = hot_guard
+            .reservations
+            .values()
+            .filter(|stored| {
+                stored.reservation.status == crate::contract::ReservationStatus::Finalized
+            })
+            .map(|stored| stored.reservation.amount_usd)
+            .sum();
+        drop(hot_guard);
+
+        assert_eq!(
+            finalized_count, TASK_COUNT,
+            "not all reservations were finalized: got {finalized_count}"
+        );
+        assert!(
+            (finalized_amount - expected).abs() < 1e-9,
+            "finalized amount mismatch: finalized={finalized_amount:.6} expected={expected:.6}"
         );
     }
 }

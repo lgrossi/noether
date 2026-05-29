@@ -19,6 +19,7 @@ use crate::fixture::{
     CapturedResponse, ResponseSource, capture_body, persist_fixture, request_streamed,
     text_preview,
 };
+use crate::ledger::try_authorize_at_hot;
 use crate::mock::{mock_json, mock_stream};
 use crate::proxy::ProxyRoutes;
 use crate::redaction::{redact_headers, redact_reqwest_headers};
@@ -102,13 +103,78 @@ async fn evaluate_capture_decision(
         return Ok(None);
     };
     let authorize_request = authorize_request_from_capture(request);
-    let decision = state
-        .ledger
-        .lock()
-        .await
-        .try_authorize(Some(policy.as_ref()), &authorize_request)?;
+    let hot = std::sync::Arc::clone(&state.hot);
+    let conn = std::sync::Arc::clone(&state.conn);
+    let decision_mode = state.decision_mode;
+    // Acquire L1 (HotState) inside spawn_blocking to avoid holding across .await.
+    let decision = tokio::task::spawn_blocking(move || -> Result<_, NoetError> {
+        // L1: run authorize in-memory, release L1.
+        let (decision, snapshot) = {
+            let mut hot_guard = hot.lock().expect("hot mutex poisoned");
+            try_authorize_at_hot(
+                &mut hot_guard,
+                Some(policy.as_ref()),
+                &authorize_request,
+                chrono::Utc::now(),
+            )?
+            // hot_guard dropped here — L1 released.
+        };
+
+        // L2: persist snapshot under conn, release L2.
+        if let Some(snap) = snapshot {
+            let conn_guard = conn.lock().expect("conn mutex poisoned");
+            if let Some(c) = conn_guard.as_ref() {
+                crate::ledger::persist_limit_windows(c, &snap.limit_windows)?;
+                crate::ledger::persist_allocation_buckets(c, &snap.allocation_buckets)?;
+
+                let selected_budget_id = snap.selected_budget_id.clone();
+                let matched_entity = snap.stored.matched_entity.clone();
+                let selection_reason = decision
+                    .explanations
+                    .iter()
+                    .find(|e| {
+                        selected_budget_id
+                            .as_deref()
+                            .map(|id| e.rule_id == id)
+                            .unwrap_or(false)
+                    })
+                    .map(|e| e.reason.clone());
+                let routing = crate::ledger::RoutingPersistenceFields {
+                    selected_budget_id,
+                    matched_entity,
+                    selection_reason,
+                    rejected_budget_id: None,
+                    rejected_budget_reason: None,
+                    model_check: None,
+                    budget_window_remaining_usd: None,
+                    budget_window_mode: None,
+                    budget_window_started_at: None,
+                    budget_window_ends_at: None,
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                };
+                let mut reservations = std::collections::HashMap::new();
+                reservations.insert(snap.reservation_id.clone(), snap.stored);
+                crate::ledger::persist_decision(
+                    c,
+                    &authorize_request,
+                    &decision,
+                    &snap.limit_hits,
+                    routing,
+                    &reservations,
+                )?;
+            }
+            drop(conn_guard); // L2 released.
+        }
+
+        Ok(decision)
+    })
+    .await
+    .expect("capture authorize task panicked")?;
+
     Ok(Some(CapturedDecision {
-        mode: state.decision_mode,
+        mode: decision_mode,
         decision,
     }))
 }
