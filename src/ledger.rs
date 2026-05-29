@@ -69,6 +69,90 @@ struct LedgerPersistenceSnapshot {
     limit_hits: Vec<DecisionLimitHitReport>,
 }
 
+#[derive(Default)]
+pub struct SimulationLedgerBatch {
+    decisions: Vec<SimulationDecisionRow>,
+    reservations: Vec<SimulationReservationRow>,
+    reservation_index: HashMap<String, usize>,
+    reservation_scopes: Vec<SimulationReservationScopeRow>,
+    usage_observations: Vec<SimulationUsageObservationRow>,
+}
+
+struct SimulationDecisionRow {
+    decision_id: String,
+    trace_id: Option<String>,
+    session_id: Option<String>,
+    request_id: Option<String>,
+    subject: Option<String>,
+    project: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    estimated_tokens: Option<i64>,
+    estimated_cost_usd: Option<f64>,
+    outcome: &'static str,
+    action: &'static str,
+    explanations_json: String,
+    metadata_json: String,
+    entities_json: String,
+    selected_budget_id: Option<String>,
+    matched_entity: Option<String>,
+    selection_reason: Option<String>,
+    rejected_budget_id: Option<String>,
+    rejected_budget_reason: Option<String>,
+    model_check: Option<String>,
+    budget_window_remaining_usd: Option<f64>,
+    routing_json: String,
+    limit_hits_json: String,
+    max_tool_calls: Option<i64>,
+    max_agent_steps: Option<i64>,
+    max_retries: Option<i64>,
+    app_run_key: String,
+    created_at: String,
+}
+
+struct SimulationReservationRow {
+    id: String,
+    decision_id: String,
+    trace_id: Option<String>,
+    amount_usd: f64,
+    estimated_amount_usd: f64,
+    actual_amount_usd: Option<f64>,
+    currency: String,
+    status: &'static str,
+    created_at: String,
+    expires_at: String,
+    finalized_at: Option<String>,
+    budget_rule_ids_json: String,
+    limit_window_spends_json: String,
+    allocation_spends_json: String,
+}
+
+struct SimulationReservationScopeRow {
+    reservation_id: String,
+    rule_id: String,
+    limit_id: String,
+    scope_key: String,
+    amount_usd: f64,
+    created_at: String,
+}
+
+struct SimulationUsageObservationRow {
+    id: String,
+    reservation_id: String,
+    trace_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    cost_usd: Option<f64>,
+    latency_ms: Option<i64>,
+    stop_reason: Option<String>,
+    source: &'static str,
+    metadata_json: String,
+    created_at: String,
+}
+
 impl LedgerPersistenceSnapshot {
     fn routing_persistence_fields(
         &self,
@@ -1401,6 +1485,302 @@ impl BudgetLedger {
         self.persist_windows()?;
         self.persist_limit_windows()?;
         Ok(reservation)
+    }
+
+    pub fn capture_simulation_decision(
+        &self,
+        batch: &mut SimulationLedgerBatch,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        decision: &AuthorizeDecision,
+    ) -> Result<(), NoetError> {
+        let trace_id = string_metadata(request, "trace_id");
+        let session_id = string_metadata(request, "session_id");
+        let request_id = string_metadata(request, "request_id");
+        let routing = self.routing_persistence_fields(
+            policy,
+            request,
+            decision,
+            self.last_selected_budget_id.as_deref(),
+        );
+        let outcome = outcome_text(decision.outcome);
+        let app_run_key = decision_app_run_key(
+            trace_id.as_deref(),
+            request.provider.as_deref(),
+            request.model.as_deref(),
+            outcome,
+            routing.selected_budget_id.as_deref(),
+            &request.metadata,
+            decision.created_at,
+        );
+        let routing_report = decision_routing_report(
+            routing.selected_budget_id.clone(),
+            routing.matched_entity.clone(),
+            routing.selection_reason.clone(),
+            routing.rejected_budget_id.clone(),
+            routing.rejected_budget_reason.clone(),
+            routing.model_check.clone(),
+            routing.budget_window_remaining_usd,
+            routing.budget_window_mode.clone(),
+            routing.budget_window_started_at,
+            routing.budget_window_ends_at,
+        );
+        batch.decisions.push(SimulationDecisionRow {
+            decision_id: decision.decision_id.clone(),
+            trace_id: trace_id.clone(),
+            session_id,
+            request_id,
+            subject: request.subject.clone(),
+            project: request.project.clone(),
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            estimated_tokens: request.estimated_tokens.map(|value| value as i64),
+            estimated_cost_usd: request.estimated_cost_usd,
+            outcome,
+            action: action_text(decision.action),
+            explanations_json: serde_json::to_string(&decision.explanations)?,
+            metadata_json: serde_json::to_string(&request.metadata)?,
+            entities_json: serde_json::to_string(&request.entities)?,
+            selected_budget_id: routing.selected_budget_id,
+            matched_entity: routing.matched_entity,
+            selection_reason: routing.selection_reason,
+            rejected_budget_id: routing.rejected_budget_id,
+            rejected_budget_reason: routing.rejected_budget_reason,
+            model_check: routing.model_check,
+            budget_window_remaining_usd: routing.budget_window_remaining_usd,
+            routing_json: serde_json::to_string(&routing_report)?,
+            limit_hits_json: serde_json::to_string(&self.last_limit_hits)?,
+            max_tool_calls: routing.tool_calls.map(|value| value as i64),
+            max_agent_steps: routing.agent_steps.map(|value| value as i64),
+            max_retries: routing.retries.map(|value| value as i64),
+            app_run_key,
+            created_at: decision.created_at.to_rfc3339(),
+        });
+
+        if let Some(reservation) = &decision.reservation
+            && let Some(stored) = self.reservations.get(&reservation.id)
+        {
+            batch
+                .reservation_index
+                .insert(reservation.id.clone(), batch.reservations.len());
+            batch.reservations.push(SimulationReservationRow {
+                id: reservation.id.clone(),
+                decision_id: decision.decision_id.clone(),
+                trace_id,
+                amount_usd: reservation.amount_usd,
+                estimated_amount_usd: stored.estimated_cost_usd,
+                actual_amount_usd: None,
+                currency: reservation.currency.clone(),
+                status: reservation_status_text(reservation.status),
+                created_at: reservation.created_at.to_rfc3339(),
+                expires_at: reservation.expires_at.to_rfc3339(),
+                finalized_at: None,
+                budget_rule_ids_json: serde_json::to_string(&stored.budget_rule_ids)?,
+                limit_window_spends_json: serde_json::to_string(&stored.limit_window_spends)?,
+                allocation_spends_json: serde_json::to_string(&stored.allocation_spends)?,
+            });
+            for spend in &stored.limit_window_spends {
+                batch
+                    .reservation_scopes
+                    .push(SimulationReservationScopeRow {
+                        reservation_id: reservation.id.clone(),
+                        rule_id: spend.rule_id.clone(),
+                        limit_id: spend.limit_id.clone(),
+                        scope_key: spend.scope_key.clone(),
+                        amount_usd: reservation.amount_usd,
+                        created_at: reservation.created_at.to_rfc3339(),
+                    });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn capture_simulation_finalization(
+        &self,
+        batch: &mut SimulationLedgerBatch,
+        reservation: &Reservation,
+        payload: &FinalizeReservation,
+    ) -> Result<(), NoetError> {
+        let now = Utc::now().to_rfc3339();
+        let trace_id = batch
+            .reservation_index
+            .get(&reservation.id)
+            .and_then(|index| batch.reservations.get_mut(*index))
+            .and_then(|row| {
+                row.amount_usd = reservation.amount_usd;
+                row.actual_amount_usd = Some(reservation.amount_usd);
+                row.status = reservation_status_text(reservation.status);
+                row.finalized_at = Some(now.clone());
+                row.trace_id.clone()
+            })
+            .or_else(|| string_value(&payload.metadata, "trace_id"));
+
+        if let Some(usage) = &payload.usage {
+            batch
+                .usage_observations
+                .push(SimulationUsageObservationRow {
+                    id: Uuid::new_v4().to_string(),
+                    reservation_id: reservation.id.clone(),
+                    trace_id,
+                    provider: usage.provider.clone(),
+                    model: usage.model.clone(),
+                    input_tokens: usage.input_tokens.map(|value| value as i64),
+                    output_tokens: usage.output_tokens.map(|value| value as i64),
+                    total_tokens: usage.total_tokens.map(|value| value as i64),
+                    cost_usd: usage.cost_usd.or(Some(reservation.amount_usd)),
+                    latency_ms: usage.latency_ms.map(|value| value as i64),
+                    stop_reason: usage.stop_reason.clone(),
+                    source: "reservation.finalize",
+                    metadata_json: serde_json::to_string(&payload.metadata)?,
+                    created_at: now,
+                });
+        }
+        Ok(())
+    }
+
+    pub fn persist_simulation_batch_to_postgres(
+        &self,
+        database_url: &str,
+        batch: &SimulationLedgerBatch,
+    ) -> Result<(), NoetError> {
+        let target = Self::open_postgres(database_url)?;
+        let LedgerStore::Postgres(pg_conn) = &target.store else {
+            return Ok(());
+        };
+        let mut pg = pg_conn.0.lock().expect("postgres mutex");
+        let mut tx = pg.transaction()?;
+
+        for row in &batch.decisions {
+            tx.execute(
+                "
+                INSERT INTO decisions (
+                    decision_id, trace_id, session_id, request_id, subject, project, provider, model,
+                    estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
+                    entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+                    rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
+                    limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                    $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+                )
+                ",
+                &[
+                    &row.decision_id.as_str(), &row.trace_id.as_deref(), &row.session_id.as_deref(),
+                    &row.request_id.as_deref(), &row.subject.as_deref(), &row.project.as_deref(),
+                    &row.provider.as_deref(), &row.model.as_deref(), &row.estimated_tokens,
+                    &row.estimated_cost_usd, &row.outcome, &row.action, &row.explanations_json,
+                    &row.metadata_json, &row.entities_json, &row.selected_budget_id.as_deref(),
+                    &row.matched_entity.as_deref(), &row.selection_reason.as_deref(),
+                    &row.rejected_budget_id.as_deref(), &row.rejected_budget_reason.as_deref(),
+                    &row.model_check.as_deref(), &row.budget_window_remaining_usd,
+                    &row.routing_json, &row.limit_hits_json, &row.max_tool_calls,
+                    &row.max_agent_steps, &row.max_retries, &row.app_run_key, &row.created_at,
+                ],
+            )?;
+        }
+
+        for row in &batch.reservations {
+            tx.execute(
+                "
+                INSERT INTO reservations (
+                    id, decision_id, amount_usd, estimated_amount_usd, actual_amount_usd,
+                    currency, status, created_at, expires_at, finalized_at, budget_rule_ids_json,
+                    limit_window_spends_json, allocation_spends_json
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ",
+                &[
+                    &row.id.as_str(),
+                    &row.decision_id.as_str(),
+                    &row.amount_usd,
+                    &row.estimated_amount_usd,
+                    &row.actual_amount_usd,
+                    &row.currency.as_str(),
+                    &row.status,
+                    &row.created_at,
+                    &row.expires_at,
+                    &row.finalized_at.as_deref(),
+                    &row.budget_rule_ids_json,
+                    &row.limit_window_spends_json,
+                    &row.allocation_spends_json,
+                ],
+            )?;
+        }
+
+        for row in &batch.reservation_scopes {
+            tx.execute(
+                "
+                INSERT INTO reservation_limit_scopes (
+                    reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ",
+                &[
+                    &row.reservation_id.as_str(),
+                    &row.rule_id.as_str(),
+                    &row.limit_id.as_str(),
+                    &row.scope_key.as_str(),
+                    &row.amount_usd,
+                    &row.created_at,
+                ],
+            )?;
+        }
+
+        for row in &batch.usage_observations {
+            tx.execute(
+                "
+                INSERT INTO usage_observations (
+                    id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
+                    total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                ",
+                &[
+                    &row.id.as_str(), &row.reservation_id.as_str(), &row.trace_id.as_deref(),
+                    &row.provider.as_deref(), &row.model.as_deref(), &row.input_tokens,
+                    &row.output_tokens, &row.total_tokens, &row.cost_usd, &row.latency_ms,
+                    &row.stop_reason.as_deref(), &row.source, &row.metadata_json, &row.created_at,
+                ],
+            )?;
+        }
+
+        for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
+            tx.execute(
+                "
+                INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+                    started_at = EXCLUDED.started_at,
+                    used_usd = EXCLUDED.used_usd
+                ",
+                &[
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    &window.started_at.to_rfc3339(),
+                    &window.used_usd,
+                ],
+            )?;
+        }
+        for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
+            tx.execute(
+                "
+                INSERT INTO budget_allocation_buckets (
+                    rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT(rule_id, entity_key) DO UPDATE SET
+                    started_at = EXCLUDED.started_at,
+                    protected_amount_usd = EXCLUDED.protected_amount_usd,
+                    current_grant_usd = EXCLUDED.current_grant_usd,
+                    carryover_usd = EXCLUDED.carryover_usd
+                ",
+                &[
+                    rule_id, entity_key, &bucket.started_at.to_rfc3339(),
+                    &bucket.protected_amount_usd, &bucket.current_grant_usd, &bucket.carryover_usd,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn record_event(&mut self, event: TraceEvent) -> Result<(), NoetError> {

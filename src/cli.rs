@@ -589,6 +589,14 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         "simulation_dashboard\t{}",
         simulation_dashboard_path.display()
     );
+    if let Some(timing) = &report.timing {
+        println!("timing_total_ms\t{:.2}", timing.total_ms);
+        println!(
+            "timing_generate_demand_ms\t{:.2}",
+            timing.generate_demand_ms
+        );
+        println!("timing_strategies_ms\t{:.2}", timing.strategies_ms);
+    }
     for strategy in &report.strategies {
         let strategy_usage_report_path = out_dir.join(&strategy.usage_report_path);
         let strategy_decisions_report_path = out_dir.join(&strategy.decisions_report_path);
@@ -608,6 +616,14 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         println!("strategy\t{}", strategy.id);
         for (key, value) in strategy.database_location().cli_lines(&out_dir) {
             println!("{key}\t{value}");
+        }
+        if let Some(timing) = &strategy.timing {
+            println!("timing_strategy_total_ms\t{:.2}", timing.total_ms);
+            println!("timing_strategy_init_ms\t{:.2}", timing.init_ms);
+            println!("timing_strategy_replay_ms\t{:.2}", timing.replay_ms);
+            println!("timing_strategy_persist_ms\t{:.2}", timing.persist_ms);
+            println!("timing_strategy_report_ms\t{:.2}", timing.report_ms);
+            println!("timing_strategy_artifact_ms\t{:.2}", timing.artifact_ms);
         }
         println!("usage_report\t{}", strategy_usage_report_path.display());
         println!(
