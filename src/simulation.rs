@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,9 @@ use crate::contract::{
     RuleMatch, UsageObservation,
 };
 use crate::error::NoetError;
-use crate::ledger::{AsyncPostgresLedger, AsyncPostgresLedgerOptions, BudgetLedger, UsageReport};
+use crate::ledger::{
+    AsyncPostgresLedger, AsyncPostgresLedgerOptions, BudgetLedger, TraceReportItem, UsageReport,
+};
 use crate::policy::{PolicyFile, validate_policy};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -147,6 +151,16 @@ pub struct SimulationStrategyReport {
     pub decisions_report_path: PathBuf,
 }
 
+impl SimulationStrategyReport {
+    pub fn database_location(&self) -> SimulationDatabaseLocation {
+        self.database
+            .clone()
+            .unwrap_or_else(|| SimulationDatabaseLocation::Sqlite {
+                path: self.db_path.clone(),
+            })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum SimulationDatabaseLocation {
@@ -154,13 +168,105 @@ pub enum SimulationDatabaseLocation {
     Postgres { url: String },
 }
 
-#[derive(Clone, Debug)]
-pub enum SimulationDatabase {
-    Sqlite,
-    Postgres {
-        database_url: String,
-        options: AsyncPostgresLedgerOptions,
-    },
+impl SimulationDatabaseLocation {
+    pub fn cli_lines(&self, out_dir: &Path) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Sqlite { path } => vec![
+                ("db_backend", "sqlite".to_owned()),
+                ("db_path", out_dir.join(path).display().to_string()),
+            ],
+            Self::Postgres { url } => vec![
+                ("db_backend", "postgres".to_owned()),
+                ("db_url", url.clone()),
+            ],
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SimulationDatabase {
+    backend: Arc<dyn SimulationBackend>,
+}
+
+impl std::fmt::Debug for SimulationDatabase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SimulationDatabase")
+            .field("backend", &self.backend.name())
+            .finish()
+    }
+}
+
+impl SimulationDatabase {
+    pub fn sqlite() -> Self {
+        Self {
+            backend: Arc::new(SqliteSimulationBackend),
+        }
+    }
+
+    pub fn postgres(database_url: String, options: AsyncPostgresLedgerOptions) -> Self {
+        Self {
+            backend: Arc::new(PostgresSimulationBackend {
+                database_url,
+                options,
+            }),
+        }
+    }
+}
+
+type SimulationBackendFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SimulationStrategyReport, NoetError>> + Send + 'a>>;
+
+trait SimulationBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn run_strategy<'a>(
+        &'a self,
+        context: SimulationStrategyContext<'a>,
+    ) -> SimulationBackendFuture<'a>;
+}
+
+struct SimulationStrategyContext<'a> {
+    file: &'a SimulationFile,
+    strategy: &'a SimulationStrategy,
+    demand: &'a [SyntheticDemandRequest],
+    out_dir: &'a Path,
+    strategy_dir_relative: PathBuf,
+}
+
+struct SqliteSimulationBackend;
+
+struct PostgresSimulationBackend {
+    database_url: String,
+    options: AsyncPostgresLedgerOptions,
+}
+
+impl SimulationBackend for SqliteSimulationBackend {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn run_strategy<'a>(
+        &'a self,
+        context: SimulationStrategyContext<'a>,
+    ) -> SimulationBackendFuture<'a> {
+        Box::pin(async move { run_sqlite_strategy(context) })
+    }
+}
+
+impl SimulationBackend for PostgresSimulationBackend {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn run_strategy<'a>(
+        &'a self,
+        context: SimulationStrategyContext<'a>,
+    ) -> SimulationBackendFuture<'a> {
+        Box::pin(async move {
+            run_postgres_strategy(context, &self.database_url, self.options.clone()).await
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -568,51 +674,13 @@ pub fn compare_strategies(
     for strategy in &file.strategies {
         let strategy_slug = encode_path_component(&strategy.id, "simulation");
         let strategy_dir_relative = PathBuf::from("strategies").join(&strategy_slug);
-        let strategy_dir = out_dir.join(&strategy_dir_relative);
-        std::fs::create_dir_all(&strategy_dir)?;
-        let db_path = strategy_dir.join("simulation.sqlite");
-        if db_path.exists() {
-            std::fs::remove_file(&db_path)?;
-        }
-
-        let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
-        let mut report = initial_strategy_report(
+        strategies.push(run_sqlite_strategy(SimulationStrategyContext {
+            file,
             strategy,
-            demand.len(),
-            &strategy_dir_relative,
-            SimulationDatabaseLocation::Sqlite {
-                path: strategy_dir_relative.join("simulation.sqlite"),
-            },
-            strategy_dir_relative.join("simulation.sqlite"),
-        );
-        let mut totals = SimulationStrategyTotals::default();
-
-        for request in &demand {
-            let authorize = synthetic_authorize_request(request, &strategy.id);
-            let decision = ledger.try_authorize(Some(&strategy.policy), &authorize)?;
-            if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
-                continue;
-            }
-
-            if let Some(reservation) = &decision.reservation {
-                let finalize = simulation_finalize_payload(request, &strategy.id);
-                let _ = ledger.finalize(&reservation.id, &finalize)?;
-                record_finalized_simulation_usage(&mut totals, request);
-            }
-        }
-
-        let usage = ledger.usage_report()?;
-        let decisions = ledger.decisions_report()?;
-        finish_strategy_report(file, strategy, &mut report, &usage, totals);
-        std::fs::write(
-            out_dir.join(&report.usage_report_path),
-            serde_json::to_vec_pretty(&usage)?,
-        )?;
-        std::fs::write(
-            out_dir.join(&report.decisions_report_path),
-            serde_json::to_vec_pretty(&decisions)?,
-        )?;
-        strategies.push(report);
+            demand: &demand,
+            out_dir,
+            strategy_dir_relative,
+        })?);
     }
 
     Ok(SimulationComparisonReport {
@@ -629,24 +697,8 @@ pub async fn compare_strategies_with_database(
     out_dir: &Path,
     database: SimulationDatabase,
 ) -> Result<SimulationComparisonReport, NoetError> {
-    match database {
-        SimulationDatabase::Sqlite => compare_strategies(file, out_dir),
-        SimulationDatabase::Postgres {
-            database_url,
-            options,
-        } => compare_strategies_postgres(file, out_dir, &database_url, options).await,
-    }
-}
-
-async fn compare_strategies_postgres(
-    file: &SimulationFile,
-    out_dir: &Path,
-    database_url: &str,
-    mut options: AsyncPostgresLedgerOptions,
-) -> Result<SimulationComparisonReport, NoetError> {
     validate_simulation(file)?;
     std::fs::create_dir_all(out_dir)?;
-    options.async_finalize = false;
 
     let demand = generate_synthetic_demand(file)?;
     let strategies_dir = out_dir.join("strategies");
@@ -656,62 +708,18 @@ async fn compare_strategies_postgres(
     for strategy in &file.strategies {
         let strategy_slug = encode_path_component(&strategy.id, "simulation");
         let strategy_dir_relative = PathBuf::from("strategies").join(&strategy_slug);
-        let strategy_dir = out_dir.join(&strategy_dir_relative);
-        std::fs::create_dir_all(&strategy_dir)?;
-
-        let schema = simulation_postgres_schema(&strategy_slug);
-        create_postgres_schema(database_url, &schema).await?;
-        let scoped_url = postgres_url_with_search_path(database_url, &schema);
-        let ledger =
-            AsyncPostgresLedger::connect_with_options(&scoped_url, options.clone()).await?;
-        let mut report = initial_strategy_report(
-            strategy,
-            demand.len(),
-            &strategy_dir_relative,
-            SimulationDatabaseLocation::Postgres {
-                url: redact_database_url(&scoped_url),
-            },
-            strategy_dir_relative.join("postgres"),
+        strategies.push(
+            database
+                .backend
+                .run_strategy(SimulationStrategyContext {
+                    file,
+                    strategy,
+                    demand: &demand,
+                    out_dir,
+                    strategy_dir_relative,
+                })
+                .await?,
         );
-        let policy = Arc::new(strategy.policy.clone());
-        let mut totals = SimulationStrategyTotals::default();
-
-        for request in &demand {
-            let authorize = synthetic_authorize_request(request, &strategy.id);
-            let decision = ledger
-                .try_authorize(Some(Arc::clone(&policy)), authorize)
-                .await?;
-            if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
-                continue;
-            }
-
-            if let Some(reservation) = &decision.reservation {
-                let finalize = simulation_finalize_payload(request, &strategy.id);
-                ledger.finalize(reservation.id.clone(), finalize).await?;
-                record_finalized_simulation_usage(&mut totals, request);
-            }
-        }
-
-        let report_url = scoped_url.clone();
-        let (usage, decisions) = tokio::task::spawn_blocking(move || {
-            let report_ledger = BudgetLedger::open_postgres(&report_url)?;
-            Ok::<_, NoetError>((
-                report_ledger.usage_report()?,
-                report_ledger.decisions_report()?,
-            ))
-        })
-        .await
-        .map_err(|err| NoetError::InvalidConfig(format!("Postgres report task failed: {err}")))??;
-        finish_strategy_report(file, strategy, &mut report, &usage, totals);
-        std::fs::write(
-            out_dir.join(&report.usage_report_path),
-            serde_json::to_vec_pretty(&usage)?,
-        )?;
-        std::fs::write(
-            out_dir.join(&report.decisions_report_path),
-            serde_json::to_vec_pretty(&decisions)?,
-        )?;
-        strategies.push(report);
     }
 
     Ok(SimulationComparisonReport {
@@ -721,6 +729,123 @@ async fn compare_strategies_postgres(
         total_requests: demand.len() as u64,
         strategies,
     })
+}
+
+fn run_sqlite_strategy(
+    context: SimulationStrategyContext<'_>,
+) -> Result<SimulationStrategyReport, NoetError> {
+    let strategy_dir = context.out_dir.join(&context.strategy_dir_relative);
+    std::fs::create_dir_all(&strategy_dir)?;
+    let db_path = strategy_dir.join("simulation.sqlite");
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)?;
+    }
+
+    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let mut report = initial_strategy_report(
+        context.strategy,
+        context.demand.len(),
+        &context.strategy_dir_relative,
+        SimulationDatabaseLocation::Sqlite {
+            path: context.strategy_dir_relative.join("simulation.sqlite"),
+        },
+        context.strategy_dir_relative.join("simulation.sqlite"),
+    );
+    let mut totals = SimulationStrategyTotals::default();
+
+    for request in context.demand {
+        let authorize = synthetic_authorize_request(request, &context.strategy.id);
+        let decision = ledger.try_authorize(Some(&context.strategy.policy), &authorize)?;
+        if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
+            continue;
+        }
+
+        if let Some(reservation) = &decision.reservation {
+            let finalize = simulation_finalize_payload(request, &context.strategy.id);
+            let _ = ledger.finalize(&reservation.id, &finalize)?;
+            record_finalized_simulation_usage(&mut totals, request);
+        }
+    }
+
+    let usage = ledger.usage_report()?;
+    let decisions = ledger.decisions_report()?;
+    finish_strategy_report(context.file, context.strategy, &mut report, &usage, totals);
+    write_strategy_artifacts(context.out_dir, &report, &usage, &decisions)?;
+    Ok(report)
+}
+
+async fn run_postgres_strategy(
+    context: SimulationStrategyContext<'_>,
+    database_url: &str,
+    mut options: AsyncPostgresLedgerOptions,
+) -> Result<SimulationStrategyReport, NoetError> {
+    options.async_finalize = false;
+    let strategy_slug = encode_path_component(&context.strategy.id, "simulation");
+    let strategy_dir = context.out_dir.join(&context.strategy_dir_relative);
+    std::fs::create_dir_all(&strategy_dir)?;
+
+    let schema = simulation_postgres_schema(&strategy_slug);
+    create_postgres_schema(database_url, &schema).await?;
+    let scoped_url = postgres_url_with_search_path(database_url, &schema);
+    let ledger = AsyncPostgresLedger::connect_with_options(&scoped_url, options).await?;
+    let mut report = initial_strategy_report(
+        context.strategy,
+        context.demand.len(),
+        &context.strategy_dir_relative,
+        SimulationDatabaseLocation::Postgres {
+            url: redact_database_url(&scoped_url),
+        },
+        context.strategy_dir_relative.join("postgres"),
+    );
+    let policy = Arc::new(context.strategy.policy.clone());
+    let mut totals = SimulationStrategyTotals::default();
+
+    for request in context.demand {
+        let authorize = synthetic_authorize_request(request, &context.strategy.id);
+        let decision = ledger
+            .try_authorize(Some(Arc::clone(&policy)), authorize)
+            .await?;
+        if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
+            continue;
+        }
+
+        if let Some(reservation) = &decision.reservation {
+            let finalize = simulation_finalize_payload(request, &context.strategy.id);
+            ledger.finalize(reservation.id.clone(), finalize).await?;
+            record_finalized_simulation_usage(&mut totals, request);
+        }
+    }
+
+    let report_url = scoped_url.clone();
+    let (usage, decisions) = tokio::task::spawn_blocking(move || {
+        let report_ledger = BudgetLedger::open_postgres(&report_url)?;
+        Ok::<_, NoetError>((
+            report_ledger.usage_report()?,
+            report_ledger.decisions_report()?,
+        ))
+    })
+    .await
+    .map_err(|err| NoetError::InvalidConfig(format!("Postgres report task failed: {err}")))??;
+    finish_strategy_report(context.file, context.strategy, &mut report, &usage, totals);
+    write_strategy_artifacts(context.out_dir, &report, &usage, &decisions)?;
+    Ok(report)
+}
+
+fn write_strategy_artifacts(
+    out_dir: &Path,
+    report: &SimulationStrategyReport,
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+) -> Result<(), NoetError> {
+    std::fs::write(
+        out_dir.join(&report.usage_report_path),
+        serde_json::to_vec_pretty(usage)?,
+    )?;
+    std::fs::write(
+        out_dir.join(&report.decisions_report_path),
+        serde_json::to_vec_pretty(decisions)?,
+    )?;
+    Ok(())
 }
 
 async fn create_postgres_schema(database_url: &str, schema: &str) -> Result<(), NoetError> {
@@ -1566,10 +1691,10 @@ strategies:
         let report = compare_strategies_with_database(
             &simulation,
             tempdir.path(),
-            SimulationDatabase::Postgres {
-                database_url: database_url.clone(),
-                options: AsyncPostgresLedgerOptions::strict(),
-            },
+            SimulationDatabase::postgres(
+                database_url.clone(),
+                AsyncPostgresLedgerOptions::strict(),
+            ),
         )
         .await
         .expect("postgres simulation comparison succeeds");

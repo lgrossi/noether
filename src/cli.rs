@@ -28,8 +28,7 @@ use crate::scenario::{
 };
 use crate::server::{ServeConfig, serve};
 use crate::simulation::{
-    SimulationDatabase, SimulationDatabaseLocation, SimulationFile, compare_strategies,
-    compare_strategies_with_database, validate_simulation,
+    SimulationDatabase, SimulationFile, compare_strategies_with_database, validate_simulation,
 };
 
 #[derive(Parser)]
@@ -566,23 +565,15 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         .name
         .clone()
         .unwrap_or_else(|| simulation_output_slug(&command.path));
-    let out_dir = command.out_dir.unwrap_or_else(|| {
+    let out_dir = command.out_dir.clone().unwrap_or_else(|| {
         PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path))
     });
-    let report = if let Some(database_url) = command.database_url.clone() {
-        let options = AsyncPostgresLedgerOptions::from_profile(&command.postgres_profile)?;
-        compare_strategies_with_database(
-            &simulation,
-            &out_dir,
-            SimulationDatabase::Postgres {
-                database_url,
-                options,
-            },
-        )
-        .await?
-    } else {
-        compare_strategies(&simulation, &out_dir)?
-    };
+    let report = compare_strategies_with_database(
+        &simulation,
+        &out_dir,
+        simulation_database_from_command(&command)?,
+    )
+    .await?;
     let report_path = out_dir.join("simulation-report.json");
     write_json_file(&report_path, &report).await?;
     let simulation_dashboard_path = out_dir.join("simulation-dashboard.html");
@@ -615,19 +606,8 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         )
         .await?;
         println!("strategy\t{}", strategy.id);
-        match strategy.database.as_ref() {
-            Some(SimulationDatabaseLocation::Sqlite { path }) => {
-                println!("db_backend\tsqlite");
-                println!("db_path\t{}", out_dir.join(path).display());
-            }
-            Some(SimulationDatabaseLocation::Postgres { url }) => {
-                println!("db_backend\tpostgres");
-                println!("db_url\t{url}");
-            }
-            None => {
-                println!("db_backend\tsqlite");
-                println!("db_path\t{}", out_dir.join(&strategy.db_path).display());
-            }
+        for (key, value) in strategy.database_location().cli_lines(&out_dir) {
+            println!("{key}\t{value}");
         }
         println!("usage_report\t{}", strategy_usage_report_path.display());
         println!(
@@ -637,6 +617,19 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         println!("dashboard\t{}", strategy_dashboard_path.display());
     }
     Ok(())
+}
+
+fn simulation_database_from_command(
+    command: &SimulateCommand,
+) -> Result<SimulationDatabase, NoetError> {
+    command
+        .database_url
+        .clone()
+        .map(|database_url| {
+            AsyncPostgresLedgerOptions::from_profile(&command.postgres_profile)
+                .map(|options| SimulationDatabase::postgres(database_url, options))
+        })
+        .unwrap_or_else(|| Ok(SimulationDatabase::sqlite()))
 }
 
 struct ScenarioArtifacts {
