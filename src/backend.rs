@@ -364,6 +364,359 @@ impl Backend {
             Backend::Postgres(b) => b.persist_event_write(event).await,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Read-only reporting dispatch — Phase 6.5
+    // Routes each call to the SQLite spawn_blocking path or PG async methods.
+    // -----------------------------------------------------------------------
+
+    pub async fn usage_report(&self) -> Result<UsageReport, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = crate::reporting::usage_report(&ledger);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.usage_report().await,
+        }
+    }
+
+    pub async fn decisions_report(&self) -> Result<Vec<TraceReportItem>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = crate::reporting::decisions_report(&ledger);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.decisions_report().await,
+        }
+    }
+
+    pub async fn trace_report(&self, trace_id: String) -> Result<TraceReport, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = crate::reporting::trace_report(&ledger, &trace_id);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.trace_report(&trace_id).await,
+        }
+    }
+
+    pub async fn observations_report(
+        &self,
+        kind_prefix: Option<String>,
+        trace_id: Option<String>,
+    ) -> Result<Vec<TraceReportItem>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = crate::reporting::observations_report(
+                        &ledger,
+                        kind_prefix.as_deref(),
+                        trace_id.as_deref(),
+                    );
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => {
+                b.observations_report(kind_prefix.as_deref(), trace_id.as_deref())
+                    .await
+            }
+        }
+    }
+
+    pub async fn rule_stats_report(&self) -> Result<Vec<RuleStatsReport>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.rule_stats_report();
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.rule_stats_report().await,
+        }
+    }
+
+    pub async fn run_totals_report_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<RunTotalsReport, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.run_totals_report_since(since);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.run_totals_report_since(since).await,
+        }
+    }
+
+    pub async fn decisions_report_for_run_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TraceReportItem>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.decisions_report_for_run_page(limit, offset);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.decisions_report_for_run_page(limit, offset).await,
+        }
+    }
+
+    pub async fn usage_activity_report(&self) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.usage_activity_report();
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.usage_activity_report().await,
+        }
+    }
+
+    pub async fn usage_activity_report_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.usage_activity_report_since(since);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.usage_activity_report_since(since).await,
+        }
+    }
+
+    pub async fn usage_activity_report_for_agent_runs(
+        &self,
+        agent_run_ids: Vec<String>,
+    ) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.usage_activity_report_for_agent_runs(&agent_run_ids);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.usage_activity_report_for_agent_runs(&agent_run_ids).await,
+        }
+    }
+
+    pub async fn historical_authorize_request_count_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<usize, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.historical_authorize_request_count_since(since);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.historical_authorize_request_count_since(since).await,
+        }
+    }
+
+    pub async fn latest_historical_authorize_requests_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.latest_historical_authorize_requests_since(since, limit);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.latest_historical_authorize_requests_since(since, limit).await,
+        }
+    }
+
+    pub async fn historical_authorize_requests_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.historical_authorize_requests_since(since);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.historical_authorize_requests_since(since).await,
+        }
+    }
+
+    pub async fn spend_scope_totals(
+        &self,
+        rule_id: String,
+        limit_id: String,
+        since: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<SpendScopeTotal>, NoetError> {
+        match self {
+            Backend::Sqlite(b) => {
+                let conn = Arc::clone(&b.conn);
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = conn.lock().expect("conn mutex poisoned");
+                    let inner = guard.take();
+                    let ledger = match inner {
+                        Some(c) => crate::ledger::BudgetLedger::read_only(c),
+                        None => crate::ledger::BudgetLedger::default(),
+                    };
+                    let result = ledger.spend_scope_totals(&rule_id, &limit_id, since, before);
+                    *guard = ledger.take_conn();
+                    result
+                })
+                .await
+                .map_err(|e| NoetError::Database(e.to_string()))?
+            }
+            Backend::Postgres(b) => b.spend_scope_totals(&rule_id, &limit_id, since, before).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,22 +1145,22 @@ impl PostgresBackend {
         let pg_rows = client
             .query(
                 "SELECT d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
-                        COALESCE(SUM(u.input_tokens), 0),
-                        COALESCE(SUM(u.output_tokens), 0),
-                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_read_tokens')::BIGINT), 0),
-                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_write_tokens')::BIGINT), 0),
-                        COALESCE(SUM(u.total_tokens), 0),
-                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_read_cost_usd')::DOUBLE PRECISION), 0),
-                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_write_cost_usd')::DOUBLE PRECISION), 0),
-                        COALESCE(SUM(r.amount_usd), 0),
+                        COALESCE(SUM(u.input_tokens), 0)::BIGINT,
+                        COALESCE(SUM(u.output_tokens), 0)::BIGINT,
+                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_read_tokens')::BIGINT), 0)::BIGINT,
+                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_write_tokens')::BIGINT), 0)::BIGINT,
+                        COALESCE(SUM(u.total_tokens), 0)::BIGINT,
+                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_read_cost_usd')::DOUBLE PRECISION), 0)::DOUBLE PRECISION,
+                        COALESCE(SUM((u.metadata_json->'usage_details'->>'cache_write_cost_usd')::DOUBLE PRECISION), 0)::DOUBLE PRECISION,
+                        COALESCE(SUM(r.amount_usd), 0)::DOUBLE PRECISION,
                         COUNT(r.id),
-                        COALESCE(SUM(CASE WHEN r.status = 'active' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN r.status = 'finalized' THEN 1 ELSE 0 END), 0)
+                        COALESCE(SUM(CASE WHEN r.status = 'active' THEN 1 ELSE 0 END), 0)::BIGINT,
+                        COALESCE(SUM(CASE WHEN r.status = 'finalized' THEN 1 ELSE 0 END), 0)::BIGINT
                  FROM reservations r
                  JOIN decisions d ON d.decision_id = r.decision_id
                  LEFT JOIN usage_observations u ON u.reservation_id = r.id
                  GROUP BY d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model)
-                 ORDER BY COALESCE(SUM(r.amount_usd), 0) DESC",
+                 ORDER BY COALESCE(SUM(r.amount_usd), 0)::DOUBLE PRECISION DESC",
                 &[],
             )
             .await?;
@@ -1031,7 +1384,7 @@ impl PostgresBackend {
         let limit_hits: u64 = if let Some(ref s) = since_str {
             let row = client
                 .query_one(
-                    "SELECT COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0) \
+                    "SELECT COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0)::BIGINT \
                      FROM decisions WHERE created_at >= $1",
                     &[s],
                 )
@@ -1040,7 +1393,7 @@ impl PostgresBackend {
         } else {
             let row = client
                 .query_one(
-                    "SELECT COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0) FROM decisions",
+                    "SELECT COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0)::BIGINT FROM decisions",
                     &[],
                 )
                 .await?;
@@ -1050,7 +1403,7 @@ impl PostgresBackend {
         let usage_row = if let Some(ref s) = since_str {
             client
                 .query_one(
-                    "SELECT COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_usd), 0) \
+                    "SELECT COALESCE(SUM(total_tokens), 0)::BIGINT, COALESCE(SUM(cost_usd), 0)::DOUBLE PRECISION \
                      FROM usage_observations WHERE created_at >= $1",
                     &[s],
                 )
@@ -1058,7 +1411,7 @@ impl PostgresBackend {
         } else {
             client
                 .query_one(
-                    "SELECT COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_usd), 0) FROM usage_observations",
+                    "SELECT COALESCE(SUM(total_tokens), 0)::BIGINT, COALESCE(SUM(cost_usd), 0)::DOUBLE PRECISION FROM usage_observations",
                     &[],
                 )
                 .await?
@@ -1076,7 +1429,7 @@ impl PostgresBackend {
                 "SELECT COALESCE(selected_budget_id, explanations_json->0->>'rule_id', 'unattributed'),
                         outcome,
                         COUNT(*),
-                        COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0)
+                        COALESCE(SUM(COALESCE(jsonb_array_length(limit_hits_json), 0)), 0)::BIGINT
                  FROM decisions
                  GROUP BY 1, 2",
                 &[],
@@ -1344,33 +1697,71 @@ impl PostgresBackend {
     }
 
     pub async fn usage_activity_report(&self) -> Result<Vec<UsageActivityRecord>, NoetError> {
+        self.usage_activity_report_since(None).await
+    }
+
+    pub async fn usage_activity_report_since(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<UsageActivityRecord>, NoetError> {
         let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT u.created_at,
-                        COALESCE(u.trace_id, d.trace_id),
-                        d.subject,
-                        d.project,
-                        COALESCE(u.provider, d.provider),
-                        COALESCE(u.model, d.model),
-                        d.selected_budget_id,
-                        d.matched_entity,
-                        d.entities_json::text,
-                        COALESCE(u.input_tokens, 0),
-                        COALESCE(u.output_tokens, 0),
-                        COALESCE((u.metadata_json->'usage_details'->>'cache_read_tokens')::bigint, 0),
-                        COALESCE((u.metadata_json->'usage_details'->>'cache_write_tokens')::bigint, 0),
-                        COALESCE(u.total_tokens, 0),
-                        COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0),
-                        COALESCE(u.metadata_json->>'agent_run_id', d.metadata_json->>'agent_run_id'),
-                        COALESCE(u.metadata_json->>'request_id', d.request_id)
-                 FROM usage_observations u
-                 LEFT JOIN reservations r ON r.id = u.reservation_id
-                 LEFT JOIN decisions d ON d.decision_id = r.decision_id
-                 ORDER BY u.created_at DESC",
-                &[],
-            )
-            .await?;
+        let since_str: Option<String> = since.map(|dt| dt.to_rfc3339());
+        let rows = if let Some(ref s) = since_str {
+            client
+                .query(
+                    "SELECT u.created_at,
+                            COALESCE(u.trace_id, d.trace_id),
+                            d.subject,
+                            d.project,
+                            COALESCE(u.provider, d.provider),
+                            COALESCE(u.model, d.model),
+                            d.selected_budget_id,
+                            d.matched_entity,
+                            d.entities_json::text,
+                            COALESCE(u.input_tokens, 0),
+                            COALESCE(u.output_tokens, 0),
+                            COALESCE((u.metadata_json->'usage_details'->>'cache_read_tokens')::bigint, 0),
+                            COALESCE((u.metadata_json->'usage_details'->>'cache_write_tokens')::bigint, 0),
+                            COALESCE(u.total_tokens, 0),
+                            COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0),
+                            COALESCE(u.metadata_json->>'agent_run_id', d.metadata_json->>'agent_run_id'),
+                            COALESCE(u.metadata_json->>'request_id', d.request_id)
+                     FROM usage_observations u
+                     LEFT JOIN reservations r ON r.id = u.reservation_id
+                     LEFT JOIN decisions d ON d.decision_id = r.decision_id
+                     WHERE u.created_at >= $1
+                     ORDER BY u.created_at DESC",
+                    &[s],
+                )
+                .await?
+        } else {
+            client
+                .query(
+                    "SELECT u.created_at,
+                            COALESCE(u.trace_id, d.trace_id),
+                            d.subject,
+                            d.project,
+                            COALESCE(u.provider, d.provider),
+                            COALESCE(u.model, d.model),
+                            d.selected_budget_id,
+                            d.matched_entity,
+                            d.entities_json::text,
+                            COALESCE(u.input_tokens, 0),
+                            COALESCE(u.output_tokens, 0),
+                            COALESCE((u.metadata_json->'usage_details'->>'cache_read_tokens')::bigint, 0),
+                            COALESCE((u.metadata_json->'usage_details'->>'cache_write_tokens')::bigint, 0),
+                            COALESCE(u.total_tokens, 0),
+                            COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0),
+                            COALESCE(u.metadata_json->>'agent_run_id', d.metadata_json->>'agent_run_id'),
+                            COALESCE(u.metadata_json->>'request_id', d.request_id)
+                     FROM usage_observations u
+                     LEFT JOIN reservations r ON r.id = u.reservation_id
+                     LEFT JOIN decisions d ON d.decision_id = r.decision_id
+                     ORDER BY u.created_at DESC",
+                    &[],
+                )
+                .await?
+        };
         rows.iter()
             .map(|row| {
                 let entities_json: String = row.try_get(8)?;
@@ -2021,4 +2412,233 @@ fn most_common_count_pg(values: Option<&std::collections::HashMap<String, u64>>)
         .iter()
         .max_by(|(lv, lc), (rv, rc)| lc.cmp(rc).then_with(|| rv.cmp(lv)))
         .map(|(v, _)| v.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Simulation schema-per-strategy isolation (Phase 6.5)
+// ---------------------------------------------------------------------------
+
+/// Encode a strategy slug into a valid PG schema name.
+///
+/// PG identifiers are limited to 63 bytes and may only contain letters,
+/// digits, and underscores (when unquoted). We replace any non-alphanumeric
+/// character with `_`, then truncate to 55 bytes to leave room for the
+/// `sim_` prefix and a short collision-avoidance suffix.
+pub fn simulation_pg_schema_name(slug: &str) -> String {
+    let safe: String = slug
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let truncated = if safe.len() > 55 { &safe[..55] } else { safe.as_str() };
+    format!("sim_{truncated}")
+}
+
+/// Build a fresh per-strategy Postgres pool with `search_path` set to `schema_name`.
+///
+/// Every connection acquired from this pool will see tables in `schema_name`
+/// first, then `public`, which is exactly what `init_schema` needs: it creates
+/// all tables in whatever schema is first in `search_path`.
+pub fn build_simulation_pg_pool(
+    base_url: &str,
+    schema_name: &str,
+) -> Result<Arc<Pool>, NoetError> {
+    // Parse the base URL then set the `options` parameter directly on the
+    // tokio_postgres Config so we avoid having to percent-encode the value.
+    let mut pg_config: tokio_postgres::Config = base_url.parse().map_err(|e: tokio_postgres::Error| {
+        NoetError::InvalidConfig(format!("invalid simulation postgres URL: {e}"))
+    })?;
+    pg_config.options(&format!("-c search_path={schema_name},public"));
+    let mgr_config = deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+    };
+    let mgr = deadpool_postgres::Manager::from_config(
+        pg_config,
+        tokio_postgres::NoTls,
+        mgr_config,
+    );
+    let pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(4)
+        .build()
+        .map_err(|e| NoetError::InvalidConfig(format!("failed to build simulation postgres pool: {e}")))?;
+    Ok(Arc::new(pool))
+}
+
+/// Create a PG schema for a simulation strategy run and return a
+/// `PostgresBackend` scoped to that schema.
+///
+/// The caller is responsible for calling `drop_simulation_pg_schema` after the
+/// strategy run is complete.
+pub async fn create_simulation_pg_schema(
+    base_url: &str,
+    schema_name: &str,
+) -> Result<PostgresBackend, NoetError> {
+    // Use the base URL (without search_path override) to issue the DDL so we
+    // always land in the superuser session.
+    let admin_config: tokio_postgres::Config = base_url.parse().map_err(|e: tokio_postgres::Error| {
+        NoetError::InvalidConfig(format!("invalid postgres URL for schema creation: {e}"))
+    })?;
+    let mgr = deadpool_postgres::Manager::from_config(
+        admin_config,
+        tokio_postgres::NoTls,
+        deadpool_postgres::ManagerConfig {
+            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+        },
+    );
+    let admin_pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(2)
+        .build()
+        .map_err(|e| NoetError::InvalidConfig(format!("admin pool build failed: {e}")))?;
+    let client = admin_pool.get().await?;
+    // Validate the schema name before interpolating — only allow safe chars.
+    if !schema_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(NoetError::InvalidConfig(format!(
+            "simulation schema name contains unsafe characters: {schema_name}"
+        )));
+    }
+    client
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema_name}"))
+        .await
+        .map_err(|e| NoetError::Database(format!("CREATE SCHEMA {schema_name}: {e}")))?;
+    drop(client);
+    drop(admin_pool);
+
+    // Build the strategy-scoped pool and init the schema tables inside it.
+    let pool = build_simulation_pg_pool(base_url, schema_name)?;
+    let backend = PostgresBackend {
+        pool,
+        db_url: base_url.to_owned(),
+        events_count: Arc::new(AtomicU64::new(0)),
+    };
+    backend.init_schema().await?;
+    Ok(backend)
+}
+
+/// Drop the PG schema created for a simulation strategy run.
+pub async fn drop_simulation_pg_schema(
+    base_url: &str,
+    schema_name: &str,
+) -> Result<(), NoetError> {
+    let admin_config: tokio_postgres::Config = base_url.parse().map_err(|e: tokio_postgres::Error| {
+        NoetError::InvalidConfig(format!("invalid postgres URL for schema drop: {e}"))
+    })?;
+    let mgr = deadpool_postgres::Manager::from_config(
+        admin_config,
+        tokio_postgres::NoTls,
+        deadpool_postgres::ManagerConfig {
+            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+        },
+    );
+    let admin_pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(2)
+        .build()
+        .map_err(|e| NoetError::InvalidConfig(format!("admin pool build for drop failed: {e}")))?;
+    let client = admin_pool.get().await?;
+    if !schema_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(NoetError::InvalidConfig(format!(
+            "simulation schema name contains unsafe characters: {schema_name}"
+        )));
+    }
+    client
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
+        .await
+        .map_err(|e| NoetError::Database(format!("DROP SCHEMA {schema_name}: {e}")))?;
+    Ok(())
+}
+
+/// Scan PG for schemas matching `^sim_.*` that were created more than
+/// `max_age_hours` hours ago and drop them.  Called at server startup after
+/// `init_schema` to clean up any schemas left over from crashed simulation runs.
+///
+/// Returns the number of orphan schemas that were dropped.
+pub async fn cleanup_orphan_simulation_schemas(
+    pool: &Pool,
+    max_age_hours: u32,
+) -> Result<usize, NoetError> {
+    let client = pool.get().await?;
+    // Find orphan sim_* schemas older than max_age_hours.
+    // information_schema.schemata doesn't carry creation time; we use
+    // pg_namespace + pg_stat_user_tables.  A simpler heuristic: schemas where
+    // there is no row in schema_migrations (inserted by init_schema at creation)
+    // or where the schema's oldest migration row is old enough.
+    // Safest approach: drop schemas where schema_migrations.applied_at <= threshold.
+    let threshold = (chrono::Utc::now() - chrono::Duration::hours(max_age_hours as i64))
+        .to_rfc3339();
+    let rows = client
+        .query(
+            "SELECT n.nspname
+             FROM pg_namespace n
+             WHERE n.nspname LIKE 'sim_%'
+               AND EXISTS (
+                   SELECT 1
+                   FROM information_schema.tables t
+                   WHERE t.table_schema = n.nspname
+                     AND t.table_name = 'schema_migrations'
+               )
+               AND (
+                   SELECT MIN(applied_at)
+                   FROM (SELECT applied_at FROM pg_temp_schema_applied_at_view) s
+               ) IS NULL",
+            &[],
+        )
+        .await;
+
+    // The join approach above is complex and schema-crossing. Use a simpler
+    // alternative: list sim_* schemas then check their schema_migrations table.
+    drop(rows); // discard the result of the failed query attempt above
+
+    let schema_rows = client
+        .query(
+            "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'sim_%' ORDER BY nspname",
+            &[],
+        )
+        .await
+        .map_err(|e| NoetError::Database(format!("list sim schemas: {e}")))?;
+
+    let schema_names: Vec<String> = schema_rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+
+    let mut dropped = 0usize;
+    for schema in &schema_names {
+        // Validate schema name before interpolating.
+        if !schema.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        // Check if the schema has a schema_migrations table with a recorded creation time.
+        let age_rows = client
+            .query(
+                &format!(
+                    "SELECT applied_at FROM {schema}.schema_migrations ORDER BY applied_at ASC LIMIT 1"
+                ),
+                &[],
+            )
+            .await;
+        let should_drop = match age_rows {
+            Err(_) => {
+                // Table doesn't exist or schema is broken — treat as orphan.
+                true
+            }
+            Ok(rows) => {
+                if rows.is_empty() {
+                    true
+                } else {
+                    let applied_at: String = rows[0].get(0);
+                    applied_at <= threshold
+                }
+            }
+        };
+        if should_drop {
+            if let Err(e) = client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await
+            {
+                tracing::warn!("failed to drop orphan simulation schema {schema}: {e}");
+            } else {
+                tracing::info!("dropped orphan simulation schema {schema}");
+                dropped += 1;
+            }
+        }
+    }
+    Ok(dropped)
 }

@@ -229,6 +229,11 @@ struct SimulateCommand {
     /// Directory where simulation artifacts are written.
     #[arg(long)]
     out_dir: Option<PathBuf>,
+    /// Optional PostgreSQL URL (postgres://...).  When set, each strategy gets
+    /// its own isolated sim_* schema in the PG instance, created before the
+    /// replay and dropped after results are collected.
+    #[arg(long)]
+    db_url: Option<String>,
 }
 
 pub async fn run() -> Result<(), NoetError> {
@@ -444,7 +449,12 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
     let out_dir = command.out_dir.unwrap_or_else(|| {
         PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path))
     });
-    let report = compare_strategies(&simulation, &out_dir)?;
+    let report = match command.db_url.as_deref() {
+        Some(pg_url) if pg_url.starts_with("postgres") => {
+            crate::simulation::compare_strategies_pg(&simulation, &out_dir, pg_url).await?
+        }
+        _ => compare_strategies(&simulation, &out_dir)?,
+    };
     let report_path = out_dir.join("simulation-report.json");
     write_json_file(&report_path, &report).await?;
     let simulation_dashboard_path = out_dir.join("simulation-dashboard.html");
@@ -4450,6 +4460,7 @@ requests:
         run_simulate(SimulateCommand {
             path: PathBuf::from("examples/simulations/synthetic-company.noet.yaml"),
             out_dir: Some(out_dir.clone()),
+            db_url: None,
         })
         .await
         .expect("simulation run succeeds");

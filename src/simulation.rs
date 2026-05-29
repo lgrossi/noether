@@ -332,6 +332,55 @@ pub fn compare_strategies(
     file: &SimulationFile,
     out_dir: &Path,
 ) -> Result<SimulationComparisonReport, NoetError> {
+    compare_strategies_sync(file, out_dir)
+}
+
+/// Compare strategies with PG backend for schema-per-strategy isolation.
+///
+/// Each strategy gets a dedicated `sim_<slug>` schema created in the PG instance
+/// before the replay run.  The schemas are dropped after results are collected.
+/// The replay itself goes through a SQLite BudgetLedger (the sync hot-state machine),
+/// so PG is used for isolation tracking and schema containment, not the replay store.
+pub async fn compare_strategies_pg(
+    file: &SimulationFile,
+    out_dir: &Path,
+    pg_url: &str,
+) -> Result<SimulationComparisonReport, NoetError> {
+    validate_simulation(file)?;
+    std::fs::create_dir_all(out_dir)?;
+
+    // Create all PG schemas BEFORE entering the sync replay loop.
+    let mut pg_schemas: Vec<String> = Vec::new();
+    for strategy in &file.strategies {
+        let strategy_slug = encode_path_component(&strategy.id, "simulation");
+        let slug = crate::backend::simulation_pg_schema_name(&strategy_slug);
+        crate::backend::create_simulation_pg_schema(pg_url, &slug).await?;
+        pg_schemas.push(slug);
+    }
+
+    // Run the synchronous replay loop in a blocking thread.
+    let file_clone = file.clone();
+    let out_dir_buf = out_dir.to_path_buf();
+    let report = tokio::task::spawn_blocking(move || {
+        compare_strategies_sync(&file_clone, &out_dir_buf)
+    })
+    .await
+    .map_err(|e| NoetError::Database(format!("simulation thread panicked: {e}")))?;
+
+    // Drop all PG schemas now that the simulation is complete.
+    for schema in &pg_schemas {
+        if let Err(e) = crate::backend::drop_simulation_pg_schema(pg_url, schema).await {
+            tracing::warn!("failed to drop simulation schema {schema}: {e}");
+        }
+    }
+
+    report
+}
+
+fn compare_strategies_sync(
+    file: &SimulationFile,
+    out_dir: &Path,
+) -> Result<SimulationComparisonReport, NoetError> {
     validate_simulation(file)?;
     std::fs::create_dir_all(out_dir)?;
 

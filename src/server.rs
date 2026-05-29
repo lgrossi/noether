@@ -592,51 +592,6 @@ impl AppState {
         self.policy.update_source(source).await
     }
 
-    async fn read_ledger<T: Send + 'static>(
-        &self,
-        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
-    ) -> Result<T, NoetError> {
-        let db_url = self.backend.db_url().to_owned();
-        // Non-empty sqlite:// URL: open a fresh read-only connection via spawn_blocking.
-        // SQLite WAL allows concurrent readers — we never hold ConnMutex here, so
-        // reporting calls (including the background replay job) do not serialize against
-        // live authorize/finalize persist calls on L2.
-        if let Some(db_path) = sqlite_url_to_path(&db_url) {
-            return tokio::task::spawn_blocking(move || {
-                let ledger = BudgetLedger::open_sqlite(&db_path)?;
-                read(&ledger)
-            })
-            .await
-            .map_err(|e| NoetError::Database(e.to_string()))?;
-        }
-        // Postgres backend: read_ledger is not supported — PG reporting goes through
-        // the dedicated PostgresBackend methods (Phase 5). Return an error rather than panic.
-        if matches!(self.backend.as_ref(), Backend::Postgres(_)) {
-            return Err(NoetError::InvalidConfig(
-                "read_ledger is not available for the PostgreSQL backend; \
-                 use the /v1/reports/* PG-native endpoints".to_owned(),
-            ));
-        }
-
-        // Empty URL (in-memory / test mode): acquire ConnMutex inside spawn_blocking.
-        // Take the connection from the mutex, run the read closure with a read_only
-        // BudgetLedger (reporting methods return empty data if conn is None, preserving
-        // backward compat with tests that never set a connection), then return the connection.
-        let conn_mutex = Arc::clone(self.backend.sqlite_conn());
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn_mutex.lock().expect("conn mutex poisoned");
-            let conn = guard.take();
-            let ledger = match conn {
-                Some(conn) => BudgetLedger::read_only(conn),
-                None => BudgetLedger::default(),
-            };
-            let result = read(&ledger);
-            *guard = ledger.take_conn();
-            result
-        })
-        .await
-        .map_err(|e| NoetError::Database(e.to_string()))?
-    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -706,6 +661,20 @@ pub async fn build_postgres_state(
         Backend::Sqlite(_) => unreachable!("postgres_from_url always returns Postgres"),
     };
     PostgresBackend::init_schema(pg_backend).await?;
+    // Clean up any orphan simulation schemas left over from crashed runs
+    // (schemas older than 24 hours that were never explicitly dropped).
+    let orphans = crate::backend::cleanup_orphan_simulation_schemas(
+        pg_backend.pool.as_ref(),
+        24,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("orphan simulation schema cleanup failed: {e}");
+        0
+    });
+    if orphans > 0 {
+        tracing::info!("cleaned up {orphans} orphan simulation schema(s) on startup");
+    }
     let backend = Arc::new(backend);
     let mut state = AppState::with_policy_runtime(fixture_dir, None, policy_runtime, decision_mode);
     state.simulation_dir = simulation_dir;
@@ -1005,62 +974,43 @@ struct SimulationStrategySurfaceSummary {
 }
 
 async fn report_usage(State(state): State<AppState>) -> Result<Json<serde_json::Value>, NoetError> {
-    state
-        .read_ledger(|ledger| {
-            Ok(Json(serde_json::to_value(reporting::usage_report(
-                ledger,
-            )?)?))
-        })
-        .await
+    let report = state.backend.usage_report().await?;
+    Ok(Json(serde_json::to_value(report)?))
 }
 
 async fn report_decisions(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
-    state
-        .read_ledger(|ledger| {
-            Ok(Json(serde_json::to_value(reporting::decisions_report(
-                ledger,
-            )?)?))
-        })
-        .await
+    let report = state.backend.decisions_report().await?;
+    Ok(Json(serde_json::to_value(report)?))
 }
 
 async fn report_trace(
     State(state): State<AppState>,
     AxumPath(trace_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
-    state
-        .read_ledger(move |ledger| {
-            Ok(Json(serde_json::to_value(reporting::trace_report(
-                ledger, &trace_id,
-            )?)?))
-        })
-        .await
+    let report = state.backend.trace_report(trace_id).await?;
+    Ok(Json(serde_json::to_value(report)?))
 }
 
 async fn report_observations(
     State(state): State<AppState>,
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
-    state
-        .read_ledger(move |ledger| {
-            Ok(Json(serde_json::to_value(reporting::observations_report(
-                ledger,
-                query.kind.as_deref(),
-                query.trace.as_deref(),
-            )?)?))
-        })
-        .await
+    let kind_prefix = reporting::observation_kind_prefix(query.kind.as_deref())
+        .map(str::to_owned);
+    let report = state
+        .backend
+        .observations_report(kind_prefix, query.trace.clone())
+        .await?;
+    Ok(Json(serde_json::to_value(report)?))
 }
 
 async fn app_policy(State(state): State<AppState>) -> Result<Json<AppPolicyResponse>, NoetError> {
     let Some((path, _, policy)) = state.active_policy_source().await else {
         return Err(NoetError::NotFound("no active policy".to_owned()));
     };
-    let report = state
-        .read_ledger(|ledger| ledger.rule_stats_report())
-        .await?;
+    let report = state.backend.rule_stats_report().await?;
     let rule_stats = app_rule_stats_from_report(policy.as_ref(), report);
     let suggestions = app_policy_suggestions(&rule_stats);
     let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
@@ -1116,7 +1066,7 @@ async fn apply_app_policy_suggestion(
     let Some((_, active_source, policy)) = state.active_policy_source().await else {
         return Err(NoetError::NotFound("no active policy".to_owned()));
     };
-    let decisions = state.read_ledger(reporting::decisions_report).await?;
+    let decisions = state.backend.decisions_report().await?;
     let stats = app_rule_stats(&policy, &decisions);
     let suggestions = app_policy_suggestions(&stats);
     let suggestion = suggestions
@@ -1214,50 +1164,49 @@ async fn app_runs(
 ) -> Result<Json<AppRunsResponse>, NoetError> {
     let limit = query.limit.clamp(1, 250);
     let offset = query.offset;
-    state
-        .read_ledger(move |ledger| {
-            if app_runs_query_is_unfiltered(&query) {
-                let decisions = ledger.decisions_report_for_run_page(limit, offset)?;
-                let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
-                let usage_by_agent_run = app_usage_by_agent_run(
-                    &ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?,
-                );
-                let runs = app_agent_runs(&decisions, &usage_by_agent_run);
-                let totals = app_run_totals_from_report(ledger.run_totals_report()?);
-                let filtered_total = totals.runs;
-                let next_offset =
-                    (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
-                return Ok(Json(AppRunsResponse {
-                    runs,
-                    totals,
-                    filtered_total,
-                    next_offset,
-                }));
-            }
-            let decisions = reporting::decisions_report(&ledger)?;
-            let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
-            let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
-            let totals = app_run_totals_from_rows(&all_runs);
-            let filtered = all_runs
-                .into_iter()
-                .filter(|run| app_run_matches_query(run, &query))
-                .collect::<Vec<_>>();
-            let filtered_total = filtered.len() as u64;
-            let runs = filtered
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect::<Vec<_>>();
-            let next_offset =
-                (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
-            Ok(Json(AppRunsResponse {
-                runs,
-                totals,
-                filtered_total,
-                next_offset,
-            }))
-        })
-        .await
+    if app_runs_query_is_unfiltered(&query) {
+        let decisions = state.backend.decisions_report_for_run_page(limit, offset).await?;
+        let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
+        let usage_activity = state
+            .backend
+            .usage_activity_report_for_agent_runs(agent_run_ids)
+            .await?;
+        let usage_by_agent_run = app_usage_by_agent_run(&usage_activity);
+        let runs = app_agent_runs(&decisions, &usage_by_agent_run);
+        let totals = app_run_totals_from_report(state.backend.run_totals_report_since(None).await?);
+        let filtered_total = totals.runs;
+        let next_offset =
+            (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
+        return Ok(Json(AppRunsResponse {
+            runs,
+            totals,
+            filtered_total,
+            next_offset,
+        }));
+    }
+    let decisions = state.backend.decisions_report().await?;
+    let usage_activity = state.backend.usage_activity_report().await?;
+    let usage_by_agent_run = app_usage_by_agent_run(&usage_activity);
+    let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
+    let totals = app_run_totals_from_rows(&all_runs);
+    let filtered = all_runs
+        .into_iter()
+        .filter(|run| app_run_matches_query(run, &query))
+        .collect::<Vec<_>>();
+    let filtered_total = filtered.len() as u64;
+    let runs = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset =
+        (offset + runs.len() < filtered_total as usize).then_some(offset + runs.len());
+    Ok(Json(AppRunsResponse {
+        runs,
+        totals,
+        filtered_total,
+        next_offset,
+    }))
 }
 
 fn app_runs_query_is_unfiltered(query: &AppRunsQuery) -> bool {
@@ -1278,22 +1227,19 @@ async fn app_run_detail(
     State(state): State<AppState>,
     AxumPath(run_id): AxumPath<String>,
 ) -> Result<Json<AppRunRow>, NoetError> {
-    state
-        .read_ledger(move |ledger| {
-            let decisions = reporting::decisions_report(ledger)?;
-            let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
-            let mut run = app_agent_runs(&decisions, &usage_by_agent_run)
-                .into_iter()
-                .find(|run| {
-                    run.id == run_id
-                        || run.agent_run_id.as_deref() == Some(run_id.as_str())
-                        || run.trace_id.as_deref() == Some(run_id.as_str())
-                })
-                .ok_or_else(|| NoetError::NotFound(format!("run {run_id}")))?;
-            run.timeline = app_run_timeline(ledger, &run)?;
-            Ok(Json(run))
+    let decisions = state.backend.decisions_report().await?;
+    let usage_activity = state.backend.usage_activity_report().await?;
+    let usage_by_agent_run = app_usage_by_agent_run(&usage_activity);
+    let mut run = app_agent_runs(&decisions, &usage_by_agent_run)
+        .into_iter()
+        .find(|run| {
+            run.id == run_id
+                || run.agent_run_id.as_deref() == Some(run_id.as_str())
+                || run.trace_id.as_deref() == Some(run_id.as_str())
         })
-        .await
+        .ok_or_else(|| NoetError::NotFound(format!("run {run_id}")))?;
+    run.timeline = app_run_timeline_backend(&state.backend, &run).await?;
+    Ok(Json(run))
 }
 
 async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayResponse>, NoetError> {
@@ -1313,13 +1259,12 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         .transpose()?
         .unwrap_or_default();
     if !has_proposed_policy {
-        let baseline = state
-            .read_ledger(move |ledger| {
-                Ok(app_run_totals_from_report(
-                    ledger.run_totals_report_since(Some(history_window_start))?,
-                ))
-            })
-            .await?;
+        let baseline = app_run_totals_from_report(
+            state
+                .backend
+                .run_totals_report_since(Some(history_window_start))
+                .await?,
+        );
         return Ok(Json(AppReplayResponse {
             baseline,
             has_proposed_policy,
@@ -1330,41 +1275,45 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
             proposal: None,
         }));
     }
-    let (total_requests, historical_requests, usage_by_agent_run, baseline, spend_seeds) = state
-        .read_ledger(move |ledger| {
-            let total_requests =
-                ledger.historical_authorize_request_count_since(Some(history_window_start))?;
-            let historical_requests = ledger.latest_historical_authorize_requests_since(
-                Some(history_window_start),
-                APP_REPLAY_PREVIEW_REQUEST_CAP,
-            )?;
-            let spend_seeds = historical_requests
-                .first()
-                .zip(proposed_policy.as_ref())
-                .map(|(first, policy)| {
-                    app_replay_spend_seeds(ledger, policy, history_window_start, first.occurred_at)
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let agent_run_ids = historical_requests
-                .iter()
-                .filter_map(|request| string_metadata_value(&request.request, "agent_run_id"))
-                .collect::<Vec<_>>();
-            let usage_by_agent_run = app_usage_by_agent_run(
-                &ledger.usage_activity_report_for_agent_runs(&agent_run_ids)?,
-            );
-            let baseline = app_run_totals_from_report(
-                ledger.run_totals_report_since(Some(history_window_start))?,
-            );
-            Ok((
-                total_requests,
-                historical_requests,
-                usage_by_agent_run,
-                baseline,
-                spend_seeds,
-            ))
-        })
+    let total_requests = state
+        .backend
+        .historical_authorize_request_count_since(Some(history_window_start))
         .await?;
+    let historical_requests = state
+        .backend
+        .latest_historical_authorize_requests_since(
+            Some(history_window_start),
+            APP_REPLAY_PREVIEW_REQUEST_CAP,
+        )
+        .await?;
+    let spend_seeds = if let Some((first, policy)) =
+        historical_requests.first().zip(proposed_policy.as_ref())
+    {
+        app_replay_spend_seeds_backend(
+            &state.backend,
+            policy,
+            history_window_start,
+            first.occurred_at,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let agent_run_ids: Vec<String> = historical_requests
+        .iter()
+        .filter_map(|request| string_metadata_value(&request.request, "agent_run_id"))
+        .collect();
+    let usage_activity = state
+        .backend
+        .usage_activity_report_for_agent_runs(agent_run_ids)
+        .await?;
+    let usage_by_agent_run = app_usage_by_agent_run(&usage_activity);
+    let baseline = app_run_totals_from_report(
+        state
+            .backend
+            .run_totals_report_since(Some(history_window_start))
+            .await?,
+    );
     let replay_proposal = proposal
         .as_ref()
         .map(|proposal| {
@@ -1495,26 +1444,25 @@ async fn app_replay_full_month_response(state: AppState) -> Result<AppReplayResp
         .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
         .transpose()?
         .unwrap_or_default();
-    let (total_requests, historical_requests, usage_by_agent_run, baseline) = state
-        .read_ledger(move |ledger| {
-            let total_requests =
-                ledger.historical_authorize_request_count_since(Some(history_window_start))?;
-            let historical_requests =
-                ledger.historical_authorize_requests_since(Some(history_window_start))?;
-            let usage_by_agent_run = app_usage_by_agent_run(
-                &ledger.usage_activity_report_since(Some(history_window_start))?,
-            );
-            let baseline = app_run_totals_from_report(
-                ledger.run_totals_report_since(Some(history_window_start))?,
-            );
-            Ok((
-                total_requests,
-                historical_requests,
-                usage_by_agent_run,
-                baseline,
-            ))
-        })
+    let total_requests = state
+        .backend
+        .historical_authorize_request_count_since(Some(history_window_start))
         .await?;
+    let historical_requests = state
+        .backend
+        .historical_authorize_requests_since(Some(history_window_start))
+        .await?;
+    let usage_activity = state
+        .backend
+        .usage_activity_report_since(Some(history_window_start))
+        .await?;
+    let usage_by_agent_run = app_usage_by_agent_run(&usage_activity);
+    let baseline = app_run_totals_from_report(
+        state
+            .backend
+            .run_totals_report_since(Some(history_window_start))
+            .await?,
+    );
     let proposal = app_replay_proposal(
         &active_source,
         &proposal,
@@ -1973,11 +1921,11 @@ fn app_agent_run_ids_from_decisions(decisions: &[TraceReportItem]) -> Vec<String
         .collect()
 }
 
-fn app_run_timeline(
-    ledger: &BudgetLedger,
+async fn app_run_timeline_backend(
+    backend: &Backend,
     run: &AppRunRow,
 ) -> Result<Vec<AppRunTimelineItem>, NoetError> {
-    let Some(trace_id) = run.trace_id.as_deref() else {
+    let Some(trace_id) = run.trace_id.clone() else {
         return Ok(vec![AppRunTimelineItem {
             occurred_at: run.occurred_at,
             kind: format!("decision.{}", run.decision),
@@ -1985,13 +1933,14 @@ fn app_run_timeline(
             fields: app_summary_fields(&run.summary),
         }]);
     };
-    let trace = ledger.trace_report(trace_id)?;
+    let trace = backend.trace_report(trace_id).await?;
+    let agent_run_id = run.agent_run_id.clone();
     let mut items = trace
         .items
         .into_iter()
         .filter(|item| {
-            run.agent_run_id.is_none()
-                || item.agent_run_id.as_deref() == run.agent_run_id.as_deref()
+            agent_run_id.is_none()
+                || item.agent_run_id.as_deref() == agent_run_id.as_deref()
         })
         .map(|item| AppRunTimelineItem {
             occurred_at: item.occurred_at,
@@ -2152,8 +2101,8 @@ struct ReplayScopeOptions {
     window_seeded: bool,
 }
 
-fn app_replay_spend_seeds(
-    ledger: &BudgetLedger,
+async fn app_replay_spend_seeds_backend(
+    backend: &Backend,
     proposed_policy: &PolicyFile,
     history_window_start: chrono::DateTime<chrono::Utc>,
     preview_start: chrono::DateTime<chrono::Utc>,
@@ -2174,7 +2123,9 @@ fn app_replay_spend_seeds(
                 SpendWindowMode::Rolling => (preview_start - window).max(history_window_start),
                 SpendWindowMode::Tumbling => (preview_start - window).max(history_window_start),
             };
-            let totals = ledger.spend_scope_totals(&rule.id, limit_id, since, preview_start)?;
+            let totals = backend
+                .spend_scope_totals(rule.id.clone(), limit_id.to_owned(), since, preview_start)
+                .await?;
             for total in totals {
                 seeds.push(ReplaySpendSeed {
                     rule_id: rule.id.clone(),
