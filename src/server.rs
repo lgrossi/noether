@@ -736,12 +736,16 @@ async fn authorize(
     Json(request): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeDecision>, NoetError> {
     let policy = state.active_policy().await;
-    let decision = state
-        .ledger
-        .lock()
-        .await
-        .try_authorize(policy.as_deref(), &request)?;
-    publish_report_update(&state, "authorize", request_trace_id(&request));
+    let trace_id = request_trace_id(&request);
+    let ledger = Arc::clone(&state.ledger);
+    let decision = tokio::task::spawn_blocking(move || {
+        ledger
+            .blocking_lock()
+            .try_authorize(policy.as_deref(), &request)
+    })
+    .await
+    .expect("ledger task panicked")?;
+    publish_report_update(&state, "authorize", trace_id);
     Ok(Json(decision))
 }
 
@@ -750,8 +754,14 @@ async fn finalize_reservation(
     AxumPath(id): AxumPath<String>,
     Json(payload): Json<FinalizeReservation>,
 ) -> Result<Json<Reservation>, NoetError> {
-    let reservation = state.ledger.lock().await.finalize(&id, &payload)?;
-    publish_report_update(&state, "finalize", finalize_trace_id(&payload));
+    let trace_id = finalize_trace_id(&payload);
+    let ledger = Arc::clone(&state.ledger);
+    let reservation = tokio::task::spawn_blocking(move || {
+        ledger.blocking_lock().finalize(&id, &payload)
+    })
+    .await
+    .expect("ledger task panicked")?;
+    publish_report_update(&state, "finalize", trace_id);
     Ok(Json(reservation))
 }
 
@@ -760,7 +770,10 @@ async fn record_event(
     Json(event): Json<TraceEvent>,
 ) -> Result<impl IntoResponse, NoetError> {
     let trace_id = event.trace_id.clone();
-    state.ledger.lock().await.record_event(event)?;
+    let ledger = Arc::clone(&state.ledger);
+    tokio::task::spawn_blocking(move || ledger.blocking_lock().record_event(event))
+        .await
+        .expect("ledger task panicked")?;
     publish_report_update(&state, "event", trace_id);
     Ok((
         StatusCode::ACCEPTED,
