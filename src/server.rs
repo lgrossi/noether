@@ -650,28 +650,7 @@ pub struct ServeConfig {
     pub decision_mode: DecisionMode,
 }
 
-/// Convert a filesystem path to a sqlite:// URL.
-/// Resolves the path to absolute using the current working directory.
-pub fn path_to_sqlite_url(p: &Path) -> String {
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(p)
-    };
-    format!("sqlite://{}", abs.display())
-}
-
-/// Extract the filesystem path from a sqlite:// URL.
-/// Returns None if the URL is empty or does not start with "sqlite://".
-fn sqlite_url_to_path(url: &str) -> Option<PathBuf> {
-    let tail = url.strip_prefix("sqlite://")?;
-    if tail.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(tail))
-}
+pub use crate::backend::{path_to_sqlite_url, sqlite_url_to_path};
 
 /// Build a fully-wired AppState backed by a SQLite database.
 /// This shared factory is used by both `serve()` and `noet-bench` so they
@@ -3138,8 +3117,8 @@ mod tests {
         )
         .expect("write simulation dashboard");
         for strategy in &report.strategies {
-            let strategy_dir = out_dir.join(&strategy.db_path);
-            let strategy_dir = strategy_dir.parent().expect("strategy dir");
+            let strategy_db_path = sqlite_url_to_path(&strategy.db_url).expect("strategy db_url");
+            let strategy_dir = strategy_db_path.parent().expect("strategy dir");
             std::fs::write(
                 strategy_dir.join("noether-dashboard.html"),
                 format!(
@@ -4242,7 +4221,7 @@ mod tests {
             .expect("tampered strategy");
         strategy.usage_report_path = escaped_dir.join("usage-report.json");
         strategy.decisions_report_path = escaped_dir.join("decisions-report.json");
-        strategy.db_path = escaped_dir.join("simulation.sqlite");
+        strategy.db_url = path_to_sqlite_url(&escaped_dir.join("simulation.sqlite"));
         std::fs::write(
             &report_path,
             serde_json::to_vec_pretty(&tampered_report).expect("tampered report json"),

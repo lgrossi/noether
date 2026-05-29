@@ -9,6 +9,7 @@ use crate::contract::{
 use crate::error::NoetError;
 use crate::ledger::BudgetLedger;
 use crate::policy::{PolicyFile, validate_policy};
+use crate::backend::path_to_sqlite_url;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SimulationFile {
@@ -137,7 +138,7 @@ pub struct SimulationStrategyReport {
     pub model_mix: Vec<SimulationModelMixEntry>,
     pub carryover_liability_usd: f64,
     pub exhaustion_day: Option<u32>,
-    pub db_path: PathBuf,
+    pub db_url: String,
     pub usage_report_path: PathBuf,
     pub decisions_report_path: PathBuf,
 }
@@ -372,7 +373,7 @@ pub fn compare_strategies(
             model_mix: Vec::new(),
             carryover_liability_usd: 0.0,
             exhaustion_day: None,
-            db_path: strategy_dir_relative.join("simulation.sqlite"),
+            db_url: path_to_sqlite_url(&db_path),
             usage_report_path: strategy_dir_relative.join("usage-report.json"),
             decisions_report_path: strategy_dir_relative.join("decisions-report.json"),
         };
@@ -1283,9 +1284,11 @@ strategies:
 
         let report = compare_strategies(&simulation, tempdir.path()).expect("compare strategies");
         assert_eq!(report.strategies.len(), 2);
-        assert_ne!(report.strategies[0].db_path, report.strategies[1].db_path);
-        assert!(report.strategies[0].db_path.is_relative());
-        assert!(report.strategies[1].db_path.is_relative());
+        assert_ne!(report.strategies[0].db_url, report.strategies[1].db_url);
+        assert!(report.strategies[0].db_url.starts_with("sqlite://"));
+        assert!(report.strategies[1].db_url.starts_with("sqlite://"));
+        assert!(report.strategies[0].db_url.contains("team"));
+        assert!(report.strategies[1].db_url.contains("team"));
         assert_ne!(
             report.strategies[0].usage_report_path,
             report.strategies[1].usage_report_path

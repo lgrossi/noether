@@ -461,7 +461,16 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         simulation_dashboard_path.display()
     );
     for strategy in &report.strategies {
-        let strategy_db_path = out_dir.join(&strategy.db_path);
+        let strategy_db_path =
+            crate::server::sqlite_url_to_path(&strategy.db_url).unwrap_or_else(|| {
+                out_dir
+                    .join("strategies")
+                    .join(crate::simulation::encode_path_component(
+                        &strategy.id,
+                        "simulation",
+                    ))
+                    .join("simulation.sqlite")
+            });
         let strategy_usage_report_path = out_dir.join(&strategy.usage_report_path);
         let strategy_decisions_report_path = out_dir.join(&strategy.decisions_report_path);
         let strategy_dashboard_path = strategy_db_path
@@ -477,7 +486,7 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         )
         .await?;
         println!("strategy\t{}", strategy.id);
-        println!("db_path\t{}", strategy_db_path.display());
+        println!("db_url\t{}", strategy.db_url);
         println!("usage_report\t{}", strategy_usage_report_path.display());
         println!(
             "decisions_report\t{}",
