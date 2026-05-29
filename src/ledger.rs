@@ -28,28 +28,28 @@ pub struct BudgetLedger {
     conn: Option<Connection>,
 }
 
-#[derive(Debug)]
-struct WindowState {
-    started_at: DateTime<Utc>,
-    used_usd: f64,
+#[derive(Debug, Default)]
+pub(crate) struct WindowState {
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) used_usd: f64,
 }
 
 #[derive(Clone, Debug)]
-struct AllocationBucketState {
-    started_at: DateTime<Utc>,
-    protected_amount_usd: f64,
-    current_grant_usd: f64,
-    carryover_usd: f64,
+pub(crate) struct AllocationBucketState {
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) protected_amount_usd: f64,
+    pub(crate) current_grant_usd: f64,
+    pub(crate) carryover_usd: f64,
 }
 
 #[derive(Debug)]
-struct StoredReservation {
-    reservation: Reservation,
-    estimated_cost_usd: f64,
-    budget_rule_ids: Vec<String>,
-    limit_window_spends: Vec<LimitWindowReservationSpend>,
-    allocation_spends: Vec<AllocationReservationSpend>,
-    matched_entity: Option<String>,
+pub(crate) struct StoredReservation {
+    pub(crate) reservation: Reservation,
+    pub(crate) estimated_cost_usd: f64,
+    pub(crate) budget_rule_ids: Vec<String>,
+    pub(crate) limit_window_spends: Vec<LimitWindowReservationSpend>,
+    pub(crate) allocation_spends: Vec<AllocationReservationSpend>,
+    pub(crate) matched_entity: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -57,6 +57,14 @@ pub(crate) struct HotState {
     pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
     pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     pub(crate) reservations: HashMap<String, StoredReservation>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct HotSnapshot {
+    pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
+    pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
+    pub(crate) reservation_id: String,
+    pub(crate) stored: StoredReservation,
 }
 
 pub(crate) type ConnMutex = std::sync::Mutex<Option<rusqlite::Connection>>;
@@ -71,18 +79,18 @@ struct BudgetCandidate {
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
-struct AllocationReservationSpend {
-    rule_id: String,
-    entity_key: String,
-    carryover_usd: f64,
-    current_grant_usd: f64,
+pub(crate) struct AllocationReservationSpend {
+    pub(crate) rule_id: String,
+    pub(crate) entity_key: String,
+    pub(crate) carryover_usd: f64,
+    pub(crate) current_grant_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
-struct LimitWindowReservationSpend {
-    rule_id: String,
-    limit_id: String,
-    scope_key: String,
+pub(crate) struct LimitWindowReservationSpend {
+    pub(crate) rule_id: String,
+    pub(crate) limit_id: String,
+    pub(crate) scope_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1821,152 +1829,9 @@ impl BudgetLedger {
         let Some(conn) = &self.conn else {
             return Ok(());
         };
-        let trace_id = string_metadata(request, "trace_id");
-        let session_id = string_metadata(request, "session_id");
-        let request_id = string_metadata(request, "request_id");
         let routing =
             self.routing_persistence_fields(policy, request, decision, selected_budget_id);
-        let outcome = outcome_text(decision.outcome);
-        let app_run_key = decision_app_run_key(
-            trace_id.as_deref(),
-            request.provider.as_deref(),
-            request.model.as_deref(),
-            outcome,
-            routing.selected_budget_id.as_deref(),
-            &request.metadata,
-            decision.created_at,
-        );
-        let routing_report = decision_routing_report(
-            routing.selected_budget_id.clone(),
-            routing.matched_entity.clone(),
-            routing.selection_reason.clone(),
-            routing.rejected_budget_id.clone(),
-            routing.rejected_budget_reason.clone(),
-            routing.model_check.clone(),
-            routing.budget_window_remaining_usd,
-            routing.budget_window_mode.clone(),
-            routing.budget_window_started_at,
-            routing.budget_window_ends_at,
-        );
-        conn.execute(
-            "
-            INSERT INTO decisions (
-                decision_id, trace_id, session_id, request_id, subject, project, provider, model,
-                estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
-                entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
-                rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
-                limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
-            )
-            ",
-            params![
-                decision.decision_id.as_str(),
-                trace_id.as_deref(),
-                session_id.as_deref(),
-                request_id.as_deref(),
-                request.subject.as_deref(),
-                request.project.as_deref(),
-                request.provider.as_deref(),
-                request.model.as_deref(),
-                request.estimated_tokens.map(|value| value as i64),
-                request.estimated_cost_usd,
-                outcome,
-                action_text(decision.action),
-                serde_json::to_string(&decision.explanations)?,
-                serde_json::to_string(&request.metadata)?,
-                serde_json::to_string(&request.entities)?,
-                routing.selected_budget_id.as_deref(),
-                routing.matched_entity.as_deref(),
-                routing.selection_reason.as_deref(),
-                routing.rejected_budget_id.as_deref(),
-                routing.rejected_budget_reason.as_deref(),
-                routing.model_check.as_deref(),
-                routing.budget_window_remaining_usd,
-                serde_json::to_string(&routing_report)?,
-                serde_json::to_string(limit_hits)?,
-                routing.tool_calls.map(|value| value as i64),
-                routing.agent_steps.map(|value| value as i64),
-                routing.retries.map(|value| value as i64),
-                app_run_key,
-                decision.created_at.to_rfc3339(),
-            ],
-        )?;
-        if let Some(reservation) = &decision.reservation {
-            let limit_window_spends = self
-                .reservations
-                .get(&reservation.id)
-                .map(|stored| stored.limit_window_spends.as_slice())
-                .unwrap_or_default();
-            let budget_rule_ids = self
-                .reservations
-                .get(&reservation.id)
-                .map(|stored| stored.budget_rule_ids.as_slice())
-                .unwrap_or_default();
-            conn.execute(
-                "
-                INSERT INTO reservations (
-                    id, decision_id, amount_usd, estimated_amount_usd, currency, status,
-                    created_at, expires_at, budget_rule_ids_json, limit_window_spends_json,
-                    allocation_spends_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ",
-                params![
-                    reservation.id.as_str(),
-                    decision.decision_id.as_str(),
-                    reservation.amount_usd,
-                    reservation.amount_usd,
-                    reservation.currency.as_str(),
-                    reservation_status_text(reservation.status),
-                    reservation.created_at.to_rfc3339(),
-                    reservation.expires_at.to_rfc3339(),
-                    serde_json::to_string(budget_rule_ids)?,
-                    serde_json::to_string(&limit_window_spends)?,
-                    serde_json::to_string(
-                        &self
-                            .reservations
-                            .get(&reservation.id)
-                            .map(|stored| stored.allocation_spends.as_slice())
-                            .unwrap_or_default(),
-                    )?,
-                ],
-            )?;
-            for spend in limit_window_spends {
-                conn.execute(
-                    "
-                    INSERT INTO reservation_limit_scopes (
-                        reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ",
-                    params![
-                        reservation.id.as_str(),
-                        spend.rule_id.as_str(),
-                        spend.limit_id.as_str(),
-                        spend.scope_key.as_str(),
-                        reservation.amount_usd,
-                        reservation.created_at.to_rfc3339()
-                    ],
-                )?;
-                conn.execute(
-                    "
-                    INSERT INTO rolling_spend_buckets (
-                        rule_id, limit_id, scope_key, bucket_start, amount_usd
-                    ) VALUES (?1, ?2, ?3, ?4, ?5)
-                    ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
-                        amount_usd = amount_usd + excluded.amount_usd
-                    ",
-                    params![
-                        spend.rule_id.as_str(),
-                        spend.limit_id.as_str(),
-                        spend.scope_key.as_str(),
-                        rolling_bucket_start(reservation.created_at).to_rfc3339(),
-                        reservation.amount_usd
-                    ],
-                )?;
-            }
-        }
-        Ok(())
+        persist_decision(conn, request, decision, limit_hits, routing, &self.reservations)
     }
 
     fn routing_persistence_fields(
@@ -2153,94 +2018,14 @@ impl BudgetLedger {
         let Some(conn) = &self.conn else {
             return Ok(());
         };
-        let now = Utc::now();
-        conn.execute(
-            "
-            UPDATE reservations
-            SET amount_usd = ?2, actual_amount_usd = ?2, status = ?3, finalized_at = ?4
-            WHERE id = ?1
-            ",
-            params![
-                reservation.id.as_str(),
-                reservation.amount_usd,
-                reservation_status_text(reservation.status),
-                now.to_rfc3339(),
-            ],
-        )?;
-        if let Some(usage) = &payload.usage {
-            let decision_trace_id: Option<String> = conn
-                .query_row(
-                    "
-                    SELECT d.trace_id
-                    FROM reservations r
-                    JOIN decisions d ON d.decision_id = r.decision_id
-                    WHERE r.id = ?1
-                    ",
-                    [reservation.id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            let trace_id =
-                decision_trace_id.or_else(|| string_value(&payload.metadata, "trace_id"));
-            conn.execute(
-                "
-                INSERT INTO usage_observations (
-                    id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
-                    total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json,
-                    created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                ",
-                params![
-                    Uuid::new_v4().to_string(),
-                    reservation.id.as_str(),
-                    trace_id.as_deref(),
-                    usage.provider.as_deref(),
-                    usage.model.as_deref(),
-                    usage.input_tokens.map(|value| value as i64),
-                    usage.output_tokens.map(|value| value as i64),
-                    usage.total_tokens.map(|value| value as i64),
-                    usage.cost_usd.or(Some(reservation.amount_usd)),
-                    usage.latency_ms.map(|value| value as i64),
-                    usage.stop_reason.as_deref(),
-                    "reservation.finalize",
-                    serde_json::to_string(&payload.metadata)?,
-                    now.to_rfc3339(),
-                ],
-            )?;
-        }
-        Ok(())
+        persist_finalization(conn, reservation, payload)
     }
 
     fn persist_event(&self, event: &TraceEvent) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
         };
-        let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
-        let source = event
-            .payload
-            .as_object()
-            .and_then(|payload| payload.get("source"))
-            .and_then(|value| value.as_str());
-        conn.execute(
-            "
-            INSERT INTO events (id, trace_id, kind, occurred_at, source, payload_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ",
-            params![
-                event
-                    .id
-                    .as_deref()
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                event.trace_id.as_deref(),
-                event.kind.as_str(),
-                occurred_at.to_rfc3339(),
-                source,
-                serde_json::to_string(&event.payload)?,
-            ],
-        )?;
-        Ok(())
+        persist_event(conn, event)
     }
 
     fn persist_windows(&self) -> Result<(), NoetError> {
@@ -2251,54 +2036,14 @@ impl BudgetLedger {
         let Some(conn) = &self.conn else {
             return Ok(());
         };
-        for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
-            conn.execute(
-                "
-                INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
-                    started_at = excluded.started_at,
-                    used_usd = excluded.used_usd
-                ",
-                params![
-                    rule_id,
-                    limit_id,
-                    scope_key,
-                    window.started_at.to_rfc3339(),
-                    window.used_usd
-                ],
-            )?;
-        }
-        Ok(())
+        persist_limit_windows(conn, &self.limit_windows)
     }
 
     fn persist_allocation_buckets(&self) -> Result<(), NoetError> {
         let Some(conn) = &self.conn else {
             return Ok(());
         };
-        for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
-            conn.execute(
-                "
-                INSERT INTO budget_allocation_buckets (
-                    rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT(rule_id, entity_key) DO UPDATE SET
-                    started_at = excluded.started_at,
-                    protected_amount_usd = excluded.protected_amount_usd,
-                    current_grant_usd = excluded.current_grant_usd,
-                    carryover_usd = excluded.carryover_usd
-                ",
-                params![
-                    rule_id,
-                    entity_key,
-                    bucket.started_at.to_rfc3339(),
-                    bucket.protected_amount_usd,
-                    bucket.current_grant_usd,
-                    bucket.carryover_usd
-                ],
-            )?;
-        }
-        Ok(())
+        persist_allocation_buckets(conn, &self.allocation_buckets)
     }
 
     fn load_windows(&mut self) -> Result<(), NoetError> {
@@ -2407,6 +2152,302 @@ impl BudgetLedger {
         self.reservations = reservations.into_iter().collect();
         Ok(())
     }
+}
+
+fn persist_limit_windows(
+    conn: &Connection,
+    windows: &HashMap<(String, String, String), WindowState>,
+) -> Result<(), NoetError> {
+    for ((rule_id, limit_id, scope_key), window) in windows {
+        conn.execute(
+            "
+            INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+                started_at = excluded.started_at,
+                used_usd = excluded.used_usd
+            ",
+            params![
+                rule_id,
+                limit_id,
+                scope_key,
+                window.started_at.to_rfc3339(),
+                window.used_usd
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_allocation_buckets(
+    conn: &Connection,
+    buckets: &HashMap<(String, String), AllocationBucketState>,
+) -> Result<(), NoetError> {
+    for ((rule_id, entity_key), bucket) in buckets {
+        conn.execute(
+            "
+            INSERT INTO budget_allocation_buckets (
+                rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(rule_id, entity_key) DO UPDATE SET
+                started_at = excluded.started_at,
+                protected_amount_usd = excluded.protected_amount_usd,
+                current_grant_usd = excluded.current_grant_usd,
+                carryover_usd = excluded.carryover_usd
+            ",
+            params![
+                rule_id,
+                entity_key,
+                bucket.started_at.to_rfc3339(),
+                bucket.protected_amount_usd,
+                bucket.current_grant_usd,
+                bucket.carryover_usd
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_decision(
+    conn: &Connection,
+    request: &AuthorizeRequest,
+    decision: &AuthorizeDecision,
+    limit_hits: &[DecisionLimitHitReport],
+    routing: RoutingPersistenceFields,
+    reservations: &HashMap<String, StoredReservation>,
+) -> Result<(), NoetError> {
+    let trace_id = string_metadata(request, "trace_id");
+    let session_id = string_metadata(request, "session_id");
+    let request_id = string_metadata(request, "request_id");
+    let outcome = outcome_text(decision.outcome);
+    let app_run_key = decision_app_run_key(
+        trace_id.as_deref(),
+        request.provider.as_deref(),
+        request.model.as_deref(),
+        outcome,
+        routing.selected_budget_id.as_deref(),
+        &request.metadata,
+        decision.created_at,
+    );
+    let routing_report = decision_routing_report(
+        routing.selected_budget_id.clone(),
+        routing.matched_entity.clone(),
+        routing.selection_reason.clone(),
+        routing.rejected_budget_id.clone(),
+        routing.rejected_budget_reason.clone(),
+        routing.model_check.clone(),
+        routing.budget_window_remaining_usd,
+        routing.budget_window_mode.clone(),
+        routing.budget_window_started_at,
+        routing.budget_window_ends_at,
+    );
+    conn.execute(
+        "
+        INSERT INTO decisions (
+            decision_id, trace_id, session_id, request_id, subject, project, provider, model,
+            estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
+            entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+            rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
+            limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+        )
+        ",
+        params![
+            decision.decision_id.as_str(),
+            trace_id.as_deref(),
+            session_id.as_deref(),
+            request_id.as_deref(),
+            request.subject.as_deref(),
+            request.project.as_deref(),
+            request.provider.as_deref(),
+            request.model.as_deref(),
+            request.estimated_tokens.map(|value| value as i64),
+            request.estimated_cost_usd,
+            outcome,
+            action_text(decision.action),
+            serde_json::to_string(&decision.explanations)?,
+            serde_json::to_string(&request.metadata)?,
+            serde_json::to_string(&request.entities)?,
+            routing.selected_budget_id.as_deref(),
+            routing.matched_entity.as_deref(),
+            routing.selection_reason.as_deref(),
+            routing.rejected_budget_id.as_deref(),
+            routing.rejected_budget_reason.as_deref(),
+            routing.model_check.as_deref(),
+            routing.budget_window_remaining_usd,
+            serde_json::to_string(&routing_report)?,
+            serde_json::to_string(limit_hits)?,
+            routing.tool_calls.map(|value| value as i64),
+            routing.agent_steps.map(|value| value as i64),
+            routing.retries.map(|value| value as i64),
+            app_run_key,
+            decision.created_at.to_rfc3339(),
+        ],
+    )?;
+    if let Some(reservation) = &decision.reservation {
+        let limit_window_spends = reservations
+            .get(&reservation.id)
+            .map(|stored| stored.limit_window_spends.as_slice())
+            .unwrap_or_default();
+        let budget_rule_ids = reservations
+            .get(&reservation.id)
+            .map(|stored| stored.budget_rule_ids.as_slice())
+            .unwrap_or_default();
+        conn.execute(
+            "
+            INSERT INTO reservations (
+                id, decision_id, amount_usd, estimated_amount_usd, currency, status,
+                created_at, expires_at, budget_rule_ids_json, limit_window_spends_json,
+                allocation_spends_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                reservation.id.as_str(),
+                decision.decision_id.as_str(),
+                reservation.amount_usd,
+                reservation.amount_usd,
+                reservation.currency.as_str(),
+                reservation_status_text(reservation.status),
+                reservation.created_at.to_rfc3339(),
+                reservation.expires_at.to_rfc3339(),
+                serde_json::to_string(budget_rule_ids)?,
+                serde_json::to_string(&limit_window_spends)?,
+                serde_json::to_string(
+                    &reservations
+                        .get(&reservation.id)
+                        .map(|stored| stored.allocation_spends.as_slice())
+                        .unwrap_or_default(),
+                )?,
+            ],
+        )?;
+        for spend in limit_window_spends {
+            conn.execute(
+                "
+                INSERT INTO reservation_limit_scopes (
+                    reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    reservation.id.as_str(),
+                    spend.rule_id.as_str(),
+                    spend.limit_id.as_str(),
+                    spend.scope_key.as_str(),
+                    reservation.amount_usd,
+                    reservation.created_at.to_rfc3339()
+                ],
+            )?;
+            conn.execute(
+                "
+                INSERT INTO rolling_spend_buckets (
+                    rule_id, limit_id, scope_key, bucket_start, amount_usd
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
+                    amount_usd = amount_usd + excluded.amount_usd
+                ",
+                params![
+                    spend.rule_id.as_str(),
+                    spend.limit_id.as_str(),
+                    spend.scope_key.as_str(),
+                    rolling_bucket_start(reservation.created_at).to_rfc3339(),
+                    reservation.amount_usd
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_finalization(
+    conn: &Connection,
+    reservation: &Reservation,
+    payload: &FinalizeReservation,
+) -> Result<(), NoetError> {
+    let now = Utc::now();
+    conn.execute(
+        "
+        UPDATE reservations
+        SET amount_usd = ?2, actual_amount_usd = ?2, status = ?3, finalized_at = ?4
+        WHERE id = ?1
+        ",
+        params![
+            reservation.id.as_str(),
+            reservation.amount_usd,
+            reservation_status_text(reservation.status),
+            now.to_rfc3339(),
+        ],
+    )?;
+    if let Some(usage) = &payload.usage {
+        let decision_trace_id: Option<String> = conn
+            .query_row(
+                "
+                SELECT d.trace_id
+                FROM reservations r
+                JOIN decisions d ON d.decision_id = r.decision_id
+                WHERE r.id = ?1
+                ",
+                [reservation.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let trace_id = decision_trace_id.or_else(|| string_value(&payload.metadata, "trace_id"));
+        conn.execute(
+            "
+            INSERT INTO usage_observations (
+                id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
+                total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                reservation.id.as_str(),
+                trace_id.as_deref(),
+                usage.provider.as_deref(),
+                usage.model.as_deref(),
+                usage.input_tokens.map(|value| value as i64),
+                usage.output_tokens.map(|value| value as i64),
+                usage.total_tokens.map(|value| value as i64),
+                usage.cost_usd.or(Some(reservation.amount_usd)),
+                usage.latency_ms.map(|value| value as i64),
+                usage.stop_reason.as_deref(),
+                "reservation.finalize",
+                serde_json::to_string(&payload.metadata)?,
+                now.to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_event(conn: &Connection, event: &TraceEvent) -> Result<(), NoetError> {
+    let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
+    let source = event
+        .payload
+        .as_object()
+        .and_then(|payload| payload.get("source"))
+        .and_then(|value| value.as_str());
+    conn.execute(
+        "
+        INSERT INTO events (id, trace_id, kind, occurred_at, source, payload_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+        params![
+            event
+                .id
+                .as_deref()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            event.trace_id.as_deref(),
+            event.kind.as_str(),
+            occurred_at.to_rfc3339(),
+            source,
+            serde_json::to_string(&event.payload)?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn merge_policy_action(current: PolicyAction, next: PolicyAction) -> PolicyAction {
