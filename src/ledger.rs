@@ -38,8 +38,8 @@ use crate::policy::{
 pub struct BudgetLedger {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
-    // TODO(psql): replace this process-local cadence stub with durable per-user advisory state.
     advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
+    pending_advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
     rolling_spend_buckets: HashMap<(String, String, String, DateTime<Utc>), f64>,
     reservations: HashMap<String, StoredReservation>,
     last_selected_budget_id: Option<String>,
@@ -56,6 +56,7 @@ struct LedgerPersistenceSnapshot {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     rolling_spend_buckets: HashMap<(String, String, String, DateTime<Utc>), f64>,
+    pending_advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
     reservations: HashMap<String, StoredReservation>,
     selected_budget_id: Option<String>,
     limit_hits: Vec<DecisionLimitHitReport>,
@@ -93,6 +94,7 @@ impl LedgerPersistenceSnapshot {
                     limit_windows: self.limit_windows.clone(),
                     allocation_buckets: self.allocation_buckets.clone(),
                     advisory_cadence: HashMap::new(),
+                    pending_advisory_cadence: HashMap::new(),
                     rolling_spend_buckets: self.rolling_spend_buckets.clone(),
                     reservations: self.reservations.clone(),
                     last_selected_budget_id: self.selected_budget_id.clone(),
@@ -843,6 +845,7 @@ impl AsyncPostgresLedger {
         load_allocation_buckets_async(&client, &mut ledger).await?;
         load_rolling_spend_buckets_async(&client, &mut ledger, None, Utc::now()).await?;
         load_active_reservations_async(&client, &mut ledger, None).await?;
+        load_advisory_cadence_async(&client, &mut ledger).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
             statements: Arc::new(statements),
@@ -915,12 +918,14 @@ impl AsyncPostgresLedger {
         load_allocation_buckets_async(&tx, &mut ledger).await?;
         load_rolling_spend_buckets_async(&tx, &mut ledger, policy.as_deref(), now).await?;
         load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
+        load_advisory_cadence_async(&tx, &mut ledger).await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
         let db_started = Instant::now();
         persist_decision_async(&tx, &snapshot, policy.as_deref(), &request, &decision).await?;
         tx.commit().await?;
+        ledger.pending_advisory_cadence.clear();
         if self.stage_timing {
             tracing::debug!(
                 decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
@@ -1081,6 +1086,7 @@ impl BudgetLedger {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
             rolling_spend_buckets: self.rolling_spend_buckets.clone(),
+            pending_advisory_cadence: self.pending_advisory_cadence.clone(),
             reservations: self.reservations.clone(),
             selected_budget_id: self.last_selected_budget_id.clone(),
             limit_hits: self.last_limit_hits.clone(),
@@ -1119,6 +1125,7 @@ impl BudgetLedger {
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
+        ledger.load_advisory_cadence_postgres()?;
         Ok(ledger)
     }
 
@@ -1152,7 +1159,8 @@ impl BudgetLedger {
         {
             return MessageHintRecommendation::Hide;
         }
-        self.advisory_cadence.insert(key, now);
+        self.advisory_cadence.insert(key.clone(), now);
+        self.pending_advisory_cadence.insert(key, now);
         MessageHintRecommendation::Show
     }
 
@@ -1170,6 +1178,9 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
+        if self.pg_conn.is_some() {
+            self.load_advisory_cadence_postgres()?;
+        }
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
         let mut limit_hits = Vec::new();
@@ -3228,7 +3239,7 @@ impl BudgetLedger {
     }
 
     fn persist_decision(
-        &self,
+        &mut self,
         policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         decision: &AuthorizeDecision,
@@ -3236,13 +3247,17 @@ impl BudgetLedger {
         limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
         if self.pg_conn.is_some() {
-            return self.persist_decision_postgres(
+            let result = self.persist_decision_postgres(
                 policy,
                 request,
                 decision,
                 selected_budget_id,
                 limit_hits,
             );
+            if result.is_ok() {
+                self.pending_advisory_cadence.clear();
+            }
+            return result;
         }
         let Some(conn) = &self.conn else {
             return Ok(());
@@ -3392,11 +3407,12 @@ impl BudgetLedger {
                 )?;
             }
         }
+        self.pending_advisory_cadence.clear();
         Ok(())
     }
 
     fn persist_decision_postgres(
-        &self,
+        &mut self,
         policy: Option<&PolicyFile>,
         request: &AuthorizeRequest,
         decision: &AuthorizeDecision,
@@ -3570,6 +3586,7 @@ impl BudgetLedger {
                 )?;
             }
         }
+        persist_advisory_cadence_postgres(&mut tx, &self.pending_advisory_cadence)?;
         tx.commit()?;
         Ok(())
     }
@@ -4210,6 +4227,29 @@ impl BudgetLedger {
         Ok(())
     }
 
+    fn load_advisory_cadence_postgres(&mut self) -> Result<(), NoetError> {
+        let Some(pg_conn) = &self.pg_conn else {
+            return Ok(());
+        };
+        let rows = pg_conn.0.lock().expect("postgres mutex").query(
+            "
+            SELECT user_key, advisory_key, scope_key, last_shown_at
+            FROM advisory_delivery_state
+            ",
+            &[],
+        )?;
+        self.advisory_cadence = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    (row.get(0), row.get(1), row.get(2)),
+                    parse_time(row.get::<_, String>(3)),
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
     fn load_active_reservations(&mut self) -> Result<(), NoetError> {
         if let Some(pg_conn) = &self.pg_conn {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
@@ -4707,6 +4747,14 @@ fn init_postgres_schema(conn: &mut PostgresClient) -> Result<(), NoetError> {
             carryover_usd DOUBLE PRECISION NOT NULL,
             PRIMARY KEY (rule_id, entity_key)
         );
+
+        CREATE TABLE IF NOT EXISTS advisory_delivery_state (
+            user_key TEXT NOT NULL,
+            advisory_key TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            last_shown_at TEXT NOT NULL,
+            PRIMARY KEY (user_key, advisory_key, scope_key)
+        );
         ",
     )?;
     Ok(())
@@ -4847,6 +4895,14 @@ async fn init_postgres_schema_async(conn: &AsyncPostgresClient) -> Result<(), No
             carryover_usd DOUBLE PRECISION NOT NULL,
             PRIMARY KEY (rule_id, entity_key)
         );
+
+        CREATE TABLE IF NOT EXISTS advisory_delivery_state (
+            user_key TEXT NOT NULL,
+            advisory_key TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            last_shown_at TEXT NOT NULL,
+            PRIMARY KEY (user_key, advisory_key, scope_key)
+        );
         ",
     )
     .await?;
@@ -4908,6 +4964,31 @@ async fn load_allocation_buckets_async(
                     current_grant_usd: row.get(4),
                     carryover_usd: row.get(5),
                 },
+            )
+        })
+        .collect();
+    Ok(())
+}
+
+async fn load_advisory_cadence_async(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+) -> Result<(), NoetError> {
+    let rows = conn
+        .query(
+            "
+            SELECT user_key, advisory_key, scope_key, last_shown_at
+            FROM advisory_delivery_state
+            ",
+            &[],
+        )
+        .await?;
+    ledger.advisory_cadence = rows
+        .into_iter()
+        .map(|row| {
+            (
+                (row.get(0), row.get(1), row.get(2)),
+                parse_time(row.get::<_, String>(3)),
             )
         })
         .collect();
@@ -5210,6 +5291,8 @@ async fn persist_decision_async(
                         ],
                     )
                     .await?;
+                    persist_advisory_cadence_async(conn, &snapshot.pending_advisory_cadence)
+                        .await?;
                     return Ok(());
                 }
             }
@@ -5265,6 +5348,8 @@ async fn persist_decision_async(
         ],
     )
     .await?;
+
+    persist_advisory_cadence_async(conn, &snapshot.pending_advisory_cadence).await?;
 
     if let Some(reservation) = &decision.reservation {
         let limit_window_spends = snapshot
@@ -5347,6 +5432,57 @@ async fn persist_decision_async(
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+fn persist_advisory_cadence_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    pending: &HashMap<(String, String, String), DateTime<Utc>>,
+) -> Result<(), NoetError> {
+    for ((user_key, advisory_key, scope_key), shown_at) in pending {
+        let shown_at = shown_at.to_rfc3339();
+        tx.execute(
+            "
+            INSERT INTO advisory_delivery_state (
+                user_key, advisory_key, scope_key, last_shown_at
+            ) VALUES ($1, $2, $3, $4)
+            ON CONFLICT(user_key, advisory_key, scope_key) DO UPDATE SET
+                last_shown_at = EXCLUDED.last_shown_at
+            ",
+            &[
+                &user_key.as_str(),
+                &advisory_key.as_str(),
+                &scope_key.as_str(),
+                &shown_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+async fn persist_advisory_cadence_async(
+    conn: &(impl GenericClient + Sync),
+    pending: &HashMap<(String, String, String), DateTime<Utc>>,
+) -> Result<(), NoetError> {
+    for ((user_key, advisory_key, scope_key), shown_at) in pending {
+        let shown_at = shown_at.to_rfc3339();
+        conn.execute(
+            "
+            INSERT INTO advisory_delivery_state (
+                user_key, advisory_key, scope_key, last_shown_at
+            ) VALUES ($1, $2, $3, $4)
+            ON CONFLICT(user_key, advisory_key, scope_key) DO UPDATE SET
+                last_shown_at = EXCLUDED.last_shown_at
+            ",
+            &[
+                &user_key.as_str(),
+                &advisory_key.as_str(),
+                &scope_key.as_str(),
+                &shown_at,
+            ],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -8087,6 +8223,63 @@ mod tests {
             first_message_hint_recommendation(&second).as_deref(),
             Some("hide")
         );
+    }
+
+    #[test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    fn postgres_ledger_persists_advisory_cadence_across_reopen() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_test_{}", Uuid::new_v4().simple());
+        let mut admin =
+            PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
+                max_tokens: 100,
+                action: PolicyAction::Warn,
+            }),
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut request = request(0.01);
+        request.subject = Some("user:alice".to_owned());
+        request.estimated_tokens = Some(101);
+
+        let mut ledger = BudgetLedger::open_postgres(&scoped_url).expect("postgres ledger");
+        let first = ledger
+            .try_authorize(Some(&policy), &request)
+            .expect("first authorize");
+        drop(ledger);
+
+        let mut reopened = BudgetLedger::open_postgres(&scoped_url).expect("reopen postgres");
+        let second = reopened
+            .try_authorize(Some(&policy), &request)
+            .expect("second authorize");
+
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&second).as_deref(),
+            Some("hide")
+        );
+
+        drop(reopened);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .expect("drop test schema");
     }
 
     #[test]
