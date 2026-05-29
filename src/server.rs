@@ -682,6 +682,27 @@ pub async fn build_postgres_state(
     Ok(state)
 }
 
+/// Build an AppState wired to a caller-supplied backend.
+///
+/// Used by the Phase 7 parity test infrastructure so integration tests can
+/// run identically against SQLite and Postgres without duplicating state
+/// construction boilerplate.
+pub fn build_state_with_backend(
+    backend: Arc<Backend>,
+    fixture_dir: PathBuf,
+    policy: Option<PolicyFile>,
+    decision_mode: DecisionMode,
+) -> AppState {
+    let mut state = AppState::with_policy_runtime(
+        fixture_dir,
+        None,
+        PolicyRuntime::static_policy(policy),
+        decision_mode,
+    );
+    state.backend = backend;
+    state
+}
+
 pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     fs::create_dir_all(&config.fixture_dir).await?;
     fs::create_dir_all(&config.simulation_dir).await?;
