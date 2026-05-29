@@ -53,6 +53,7 @@ const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
 struct LedgerPersistenceSnapshot {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
+    rolling_spend_buckets: HashMap<(String, String, String, DateTime<Utc>), f64>,
     reservations: HashMap<String, StoredReservation>,
     selected_budget_id: Option<String>,
     limit_hits: Vec<DecisionLimitHitReport>,
@@ -90,7 +91,7 @@ impl LedgerPersistenceSnapshot {
                     limit_windows: self.limit_windows.clone(),
                     allocation_buckets: self.allocation_buckets.clone(),
                     advisory_cadence: HashMap::new(),
-                    rolling_spend_buckets: HashMap::new(),
+                    rolling_spend_buckets: self.rolling_spend_buckets.clone(),
                     reservations: self.reservations.clone(),
                     last_selected_budget_id: self.selected_budget_id.clone(),
                     last_limit_hits: self.limit_hits.clone(),
@@ -1021,6 +1022,7 @@ impl BudgetLedger {
         LedgerPersistenceSnapshot {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
+            rolling_spend_buckets: self.rolling_spend_buckets.clone(),
             reservations: self.reservations.clone(),
             selected_budget_id: self.last_selected_budget_id.clone(),
             limit_hits: self.last_limit_hits.clone(),
@@ -1334,11 +1336,27 @@ impl BudgetLedger {
                 "
                 SELECT d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
                        COALESCE(SUM(u.input_tokens), 0)::BIGINT, COALESCE(SUM(u.output_tokens), 0)::BIGINT,
-                       COALESCE(SUM(((u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}')::BIGINT)), 0)::BIGINT,
-                       COALESCE(SUM(((u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}')::BIGINT)), 0)::BIGINT,
+                       COALESCE(SUM(CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}')::BIGINT
+                           ELSE 0
+                       END), 0)::BIGINT,
+                       COALESCE(SUM(CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}')::BIGINT
+                           ELSE 0
+                       END), 0)::BIGINT,
                        COALESCE(SUM(u.total_tokens), 0)::BIGINT,
-                       COALESCE(SUM(((u.metadata_json::jsonb #>> '{usage_details,cache_read_cost_usd}')::DOUBLE PRECISION)), 0)::DOUBLE PRECISION,
-                       COALESCE(SUM(((u.metadata_json::jsonb #>> '{usage_details,cache_write_cost_usd}')::DOUBLE PRECISION)), 0)::DOUBLE PRECISION,
+                       COALESCE(SUM(CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_read_cost_usd}') ~ '^-?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_read_cost_usd}')::DOUBLE PRECISION
+                           ELSE 0
+                       END), 0)::DOUBLE PRECISION,
+                       COALESCE(SUM(CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_write_cost_usd}') ~ '^-?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_write_cost_usd}')::DOUBLE PRECISION
+                           ELSE 0
+                       END), 0)::DOUBLE PRECISION,
                        COALESCE(SUM(r.amount_usd), 0),
                        COUNT(r.id)::BIGINT,
                        COALESCE(SUM(CASE WHEN r.status = 'active' THEN 1 ELSE 0 END), 0)::BIGINT,
@@ -2227,8 +2245,16 @@ impl BudgetLedger {
                        COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
                        d.selected_budget_id, d.matched_entity, d.entities_json,
                        COALESCE(u.input_tokens, 0)::BIGINT, COALESCE(u.output_tokens, 0)::BIGINT,
-                       COALESCE((u.metadata_json::jsonb #>> '{{usage_details,cache_read_tokens}}')::BIGINT, 0)::BIGINT,
-                       COALESCE((u.metadata_json::jsonb #>> '{{usage_details,cache_write_tokens}}')::BIGINT, 0)::BIGINT,
+                       CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{{usage_details,cache_read_tokens}}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{{usage_details,cache_read_tokens}}')::BIGINT
+                           ELSE 0
+                       END::BIGINT,
+                       CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{{usage_details,cache_write_tokens}}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{{usage_details,cache_write_tokens}}')::BIGINT
+                           ELSE 0
+                       END::BIGINT,
                        COALESCE(u.total_tokens, 0)::BIGINT,
                        COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0)::DOUBLE PRECISION,
                        COALESCE(u.metadata_json::jsonb ->> 'agent_run_id', d.metadata_json::jsonb ->> 'agent_run_id'),
@@ -2299,8 +2325,16 @@ impl BudgetLedger {
                        COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
                        d.selected_budget_id, d.matched_entity, d.entities_json,
                        COALESCE(u.input_tokens, 0)::BIGINT, COALESCE(u.output_tokens, 0)::BIGINT,
-                       COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}')::BIGINT, 0)::BIGINT,
-                       COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}')::BIGINT, 0)::BIGINT,
+                       CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_read_tokens}')::BIGINT
+                           ELSE 0
+                       END::BIGINT,
+                       CASE
+                           WHEN COALESCE((u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}') ~ '^-?[0-9]+$', false)
+                           THEN (u.metadata_json::jsonb #>> '{usage_details,cache_write_tokens}')::BIGINT
+                           ELSE 0
+                       END::BIGINT,
                        COALESCE(u.total_tokens, 0)::BIGINT,
                        COALESCE(u.cost_usd, r.actual_amount_usd, r.amount_usd, 0)::DOUBLE PRECISION,
                        COALESCE(u.metadata_json::jsonb ->> 'agent_run_id', d.metadata_json::jsonb ->> 'agent_run_id'),
@@ -5254,10 +5288,13 @@ async fn persist_finalization_write_async(
         &write.snapshot,
     )
     .await?;
-    if !persisted_limit_window {
-        apply_finalization_limit_window_deltas_async(conn, &write.reservation, &write.snapshot)
-            .await?;
-    }
+    apply_finalization_spend_deltas_async(
+        conn,
+        &write.reservation,
+        &write.snapshot,
+        !persisted_limit_window,
+    )
+    .await?;
     Ok(())
 }
 
@@ -5401,10 +5438,11 @@ async fn persist_finalization_async(
     Ok(false)
 }
 
-async fn apply_finalization_limit_window_deltas_async(
+async fn apply_finalization_spend_deltas_async(
     conn: &(impl GenericClient + Sync),
     reservation: &Reservation,
     snapshot: &LedgerPersistenceSnapshot,
+    apply_limit_windows: bool,
 ) -> Result<(), NoetError> {
     let Some(stored) = snapshot.reservations.get(&reservation.id) else {
         return Ok(());
@@ -5414,6 +5452,27 @@ async fn apply_finalization_limit_window_deltas_async(
         return Ok(());
     }
     for spend in &stored.limit_window_spends {
+        let bucket_start = rolling_bucket_start(stored.reservation.created_at).to_rfc3339();
+        conn.execute(
+            "
+            INSERT INTO rolling_spend_buckets (
+                rule_id, limit_id, scope_key, bucket_start, amount_usd
+            ) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
+                amount_usd = GREATEST(rolling_spend_buckets.amount_usd + EXCLUDED.amount_usd, 0)
+            ",
+            &[
+                &spend.rule_id.as_str(),
+                &spend.limit_id.as_str(),
+                &spend.scope_key.as_str(),
+                &bucket_start,
+                &delta,
+            ],
+        )
+        .await?;
+        if !apply_limit_windows {
+            continue;
+        }
         let window_key = (
             spend.rule_id.clone(),
             spend.limit_id.clone(),
