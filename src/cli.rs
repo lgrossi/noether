@@ -24,7 +24,7 @@ use crate::scenario::{
     ScenarioAssertion, ScenarioFallbackExpectation, ScenarioFile, ScenarioReportSource,
     ScenarioRequest, validate_scenario,
 };
-use crate::server::{ServeConfig, serve};
+use crate::server::{ServeConfig, path_to_sqlite_url, serve};
 use crate::simulation::{SimulationFile, compare_strategies, validate_simulation};
 
 #[derive(Parser)]
@@ -67,9 +67,10 @@ struct ServeArgs {
     #[arg(long, default_value = ".noet/simulations")]
     simulation_dir: PathBuf,
 
-    /// SQLite ledger path for durable local state.
-    #[arg(long, default_value = ".noet/noether.sqlite")]
-    db_path: PathBuf,
+    /// Database URL for durable local state. Only sqlite:// is supported in this release.
+    /// Default resolves to an absolute path at startup.
+    #[arg(long)]
+    db_url: Option<String>,
 
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
@@ -244,11 +245,14 @@ pub async fn run() -> Result<(), NoetError> {
                 Some(path) => load_proxy_routes(&path).await?.routes,
                 None => Vec::new(),
             };
+            let db_url = args.db_url.unwrap_or_else(|| {
+                path_to_sqlite_url(Path::new(".noet/noether.sqlite"))
+            });
             serve(ServeConfig {
                 bind: args.bind,
                 fixture_dir: args.fixture_dir,
                 simulation_dir: args.simulation_dir,
-                db_path: args.db_path,
+                db_url,
                 upstream: args.upstream,
                 routes,
                 policy_path,
@@ -280,7 +284,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 bind: args.bind,
                 fixture_dir: layout.fixture_dir,
                 simulation_dir: layout.simulation_dir,
-                db_path: layout.db_path,
+                db_url: path_to_sqlite_url(&layout.db_path),
                 upstream: args.upstream,
                 routes,
                 policy_path: Some(layout.policy_path),
@@ -3843,7 +3847,7 @@ mod tests {
                 assert_eq!(args.bind.to_string(), "127.0.0.1:4040");
                 assert_eq!(args.fixture_dir, PathBuf::from(".noet/fixtures"));
                 assert_eq!(args.simulation_dir, PathBuf::from(".noet/simulations"));
-                assert_eq!(args.db_path, PathBuf::from(".noet/noether.sqlite"));
+                assert!(args.db_url.is_none()); // default resolved at runtime in run()
                 assert!(args.upstream.is_none());
                 assert!(args.routes.is_none());
                 assert!(args.policy.is_none());

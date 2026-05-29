@@ -23,6 +23,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::backend::Backend;
 use crate::capture::capture;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, DecisionMode, DecisionOutcome, FinalizeReservation,
@@ -30,7 +31,7 @@ use crate::contract::{
 };
 use crate::error::NoetError;
 use crate::ledger::{
-    BudgetLedger, ConnMutex, HotState, ReplaySpendSeed, TraceReportItem,
+    BudgetLedger, HotState, ReplaySpendSeed, TraceReportItem,
     finalize_hot, persist_allocation_buckets, persist_decision as ledger_persist_decision,
     persist_event, persist_finalization, persist_limit_windows, try_authorize_at_hot,
     validate_event_payload, RoutingPersistenceFields,
@@ -52,10 +53,9 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub policy: PolicyRuntime,
     pub decision_mode: DecisionMode,
-    pub conn: Arc<ConnMutex>,
+    pub backend: Arc<Backend>,
     pub event_count: Arc<AtomicU64>,
     pub hot: Arc<std::sync::Mutex<HotState>>,
-    pub db_path: Option<PathBuf>,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
 }
@@ -373,7 +373,7 @@ struct PolicyFileSnapshot {
 }
 
 impl PolicyRuntime {
-    fn static_policy(policy: Option<PolicyFile>) -> Self {
+    pub fn static_policy(policy: Option<PolicyFile>) -> Self {
         Self {
             state: Arc::new(Mutex::new(PolicyRuntimeState::Static(policy.map(Arc::new)))),
         }
@@ -548,14 +548,16 @@ impl AppState {
             client: reqwest::Client::new(),
             policy,
             decision_mode,
-            conn: Arc::new(std::sync::Mutex::new(None)),
+            backend: Arc::new(Backend::sqlite_from_url(
+                String::new(),
+                Arc::new(std::sync::Mutex::new(None)),
+            )),
             event_count: Arc::new(AtomicU64::new(0)),
             hot: Arc::new(std::sync::Mutex::new(HotState {
                 limit_windows: Default::default(),
                 allocation_buckets: Default::default(),
                 reservations: Default::default(),
             })),
-            db_path: None,
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -596,11 +598,12 @@ impl AppState {
         &self,
         read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
     ) -> Result<T, NoetError> {
-        // db_path is Some: open a fresh read-only connection via spawn_blocking.
+        let db_url = self.backend.db_url().to_owned();
+        // Non-empty sqlite:// URL: open a fresh read-only connection via spawn_blocking.
         // SQLite WAL allows concurrent readers — we never hold ConnMutex here, so
         // reporting calls (including the background replay job) do not serialize against
         // live authorize/finalize persist calls on L2.
-        if let Some(db_path) = self.db_path.clone() {
+        if let Some(db_path) = sqlite_url_to_path(&db_url) {
             return tokio::task::spawn_blocking(move || {
                 let ledger = BudgetLedger::open_sqlite(&db_path)?;
                 read(&ledger)
@@ -608,11 +611,11 @@ impl AppState {
             .await
             .map_err(|e| NoetError::Database(e.to_string()))?;
         }
-        // db_path is None (in-memory / test mode): acquire ConnMutex inside spawn_blocking.
+        // Empty URL (in-memory / test mode): acquire ConnMutex inside spawn_blocking.
         // Take the connection from the mutex, run the read closure with a read_only
         // BudgetLedger (reporting methods return empty data if conn is None, preserving
         // backward compat with tests that never set a connection), then return the connection.
-        let conn_mutex = self.conn.clone();
+        let conn_mutex = Arc::clone(self.backend.sqlite_conn());
         tokio::task::spawn_blocking(move || {
             let mut guard = conn_mutex.lock().expect("conn mutex poisoned");
             let conn = guard.take();
@@ -639,7 +642,7 @@ pub struct ServeConfig {
     pub bind: SocketAddr,
     pub fixture_dir: PathBuf,
     pub simulation_dir: PathBuf,
-    pub db_path: PathBuf,
+    pub db_url: String,
     pub upstream: Option<url::Url>,
     pub routes: Vec<ProxyRoute>,
     pub policy_path: Option<PathBuf>,
@@ -647,15 +650,68 @@ pub struct ServeConfig {
     pub decision_mode: DecisionMode,
 }
 
+/// Convert a filesystem path to a sqlite:// URL.
+/// Resolves the path to absolute using the current working directory.
+pub fn path_to_sqlite_url(p: &Path) -> String {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
+    };
+    format!("sqlite://{}", abs.display())
+}
+
+/// Extract the filesystem path from a sqlite:// URL.
+/// Returns None if the URL is empty or does not start with "sqlite://".
+fn sqlite_url_to_path(url: &str) -> Option<PathBuf> {
+    let tail = url.strip_prefix("sqlite://")?;
+    if tail.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(tail))
+}
+
+/// Build a fully-wired AppState backed by a SQLite database.
+/// This shared factory is used by both `serve()` and `noet-bench` so they
+/// stay in sync when new AppState fields are introduced.
+pub fn build_sqlite_state(
+    db_url: String,
+    policy_runtime: PolicyRuntime,
+    decision_mode: DecisionMode,
+    fixture_dir: PathBuf,
+    simulation_dir: PathBuf,
+) -> Result<AppState, NoetError> {
+    let db_path = sqlite_url_to_path(&db_url).ok_or_else(|| {
+        NoetError::InvalidConfig(format!("db_url must start with sqlite://, got: {db_url}"))
+    })?;
+    let ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let handler_conn = rusqlite::Connection::open(&db_path)?;
+    let hot_state = ledger.hot_state();
+    drop(ledger);
+    let conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
+    let backend = Arc::new(Backend::sqlite_from_url(db_url, conn));
+    let mut state = AppState::with_policy_runtime(fixture_dir, None, policy_runtime, decision_mode);
+    state.simulation_dir = simulation_dir;
+    state.backend = backend;
+    state.hot = Arc::new(std::sync::Mutex::new(hot_state));
+    Ok(state)
+}
+
 pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     fs::create_dir_all(&config.fixture_dir).await?;
     fs::create_dir_all(&config.simulation_dir).await?;
-    if let Some(parent) = config.db_path.parent() {
+    let db_path = sqlite_url_to_path(&config.db_url).ok_or_else(|| {
+        NoetError::InvalidConfig(format!(
+            "db_url must start with sqlite://, got: {}",
+            config.db_url
+        ))
+    })?;
+    if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).await?;
     }
     let bind = config.bind;
-    let ledger = BudgetLedger::open_sqlite(&config.db_path)?;
-    let handler_conn = rusqlite::Connection::open(&config.db_path)?;
     let policy_proposal_path = config
         .simulation_dir
         .parent()
@@ -668,20 +724,16 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         }
         (_, policy) => PolicyRuntime::static_policy(policy),
     };
-    let mut state = AppState::with_policy_runtime(
-        config.fixture_dir,
-        config.upstream,
+    let mut state = build_sqlite_state(
+        config.db_url,
         policy_runtime,
         config.decision_mode,
-    );
-    state.simulation_dir = config.simulation_dir;
+        config.fixture_dir,
+        config.simulation_dir,
+    )?;
+    state.upstream = config.upstream;
     state.policy_proposal_path = policy_proposal_path;
     state.routes = config.routes;
-    state.db_path = Some(config.db_path.clone());
-    let hot_state = ledger.hot_state();
-    drop(ledger);
-    state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
-    state.hot = Arc::new(std::sync::Mutex::new(hot_state));
     let app = build_router(state);
 
     info!(bind = %bind, "starting noet capture server");
@@ -780,7 +832,7 @@ async fn authorize(
     let policy = state.active_policy().await;
     let trace_id = request_trace_id(&request);
     let hot = Arc::clone(&state.hot);
-    let conn = Arc::clone(&state.conn);
+    let conn = Arc::clone(state.backend.sqlite_conn());
     let decision = tokio::task::spawn_blocking(move || -> Result<AuthorizeDecision, NoetError> {
         // L1: acquire HotState, run in-memory authorize, release L1.
         let (decision, snapshot) = {
@@ -857,7 +909,7 @@ async fn finalize_reservation(
 ) -> Result<Json<Reservation>, NoetError> {
     let trace_id = finalize_trace_id(&payload);
     let hot = Arc::clone(&state.hot);
-    let conn = Arc::clone(&state.conn);
+    let conn = Arc::clone(state.backend.sqlite_conn());
     let reservation = tokio::task::spawn_blocking(move || -> Result<Reservation, NoetError> {
         // L1: acquire HotState, run in-memory finalize, release L1.
         let (reservation, lw_snapshot) = {
@@ -892,7 +944,7 @@ async fn record_event(
 ) -> Result<impl IntoResponse, NoetError> {
     validate_event_payload(&event)?;
     let trace_id = event.trace_id.clone();
-    let conn = Arc::clone(&state.conn);
+    let conn = Arc::clone(state.backend.sqlite_conn());
     let event_count = Arc::clone(&state.event_count);
     tokio::task::spawn_blocking(move || -> Result<(), NoetError> {
         let conn_guard = conn.lock().expect("conn mutex poisoned");
@@ -3795,9 +3847,12 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = test_state(None);
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         seed_reporting_data(&db_path);
 
         let expected_usage = {
@@ -4621,9 +4676,12 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4741,9 +4799,12 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4819,9 +4880,12 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4919,9 +4983,12 @@ budgets:
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         // Initialize the schema, then open a second connection for the handler.
         let _ = BudgetLedger::open_sqlite(&db_path).expect("schema init");
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
 
         let app = build_router(state);
         let response = app
@@ -5062,9 +5129,12 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         {
             let mut ledger =
                 BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
@@ -5154,9 +5224,12 @@ budgets:
             DecisionMode::DryRun,
         );
         let db_path = tempdir.path().join("noether.sqlite");
-        state.conn = Arc::new(std::sync::Mutex::new(Some(
-            rusqlite::Connection::open(&db_path).expect("conn"),
-        )));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(
+                rusqlite::Connection::open(&db_path).expect("conn"),
+            )));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         {
             let policy = state.active_policy().await;
@@ -5351,7 +5424,10 @@ budgets:
         let handler_conn =
             rusqlite::Connection::open(&db_path).expect("handler sqlite connection");
         let mut state = test_state(Some(strict_policy()));
-        state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
+        {
+            let conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
+            state.backend = Arc::new(Backend::sqlite_from_url(String::new(), conn));
+        }
         let app = build_router(state);
 
         let authorize_response = app

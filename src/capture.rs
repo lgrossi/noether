@@ -104,7 +104,7 @@ async fn evaluate_capture_decision(
     };
     let authorize_request = authorize_request_from_capture(request);
     let hot = std::sync::Arc::clone(&state.hot);
-    let conn = std::sync::Arc::clone(&state.conn);
+    let conn = std::sync::Arc::clone(state.backend.sqlite_conn());
     let decision_mode = state.decision_mode;
     // Acquire L1 (HotState) inside spawn_blocking to avoid holding across .await.
     let decision = tokio::task::spawn_blocking(move || -> Result<_, NoetError> {

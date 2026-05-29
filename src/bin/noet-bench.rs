@@ -8,7 +8,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use noether::contract::{AuthorizeRequest, DecisionMode, FinalizeReservation, TraceEvent};
 use noether::ledger::BudgetLedger;
 use noether::policy::parse_policy_bytes;
-use noether::server::{AppState, build_router};
+use noether::server::{build_router, build_sqlite_state, path_to_sqlite_url};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -94,20 +94,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ledger = BudgetLedger::open_sqlite(&db_path)?;
         }
     }
-
-    let hot_state = ledger.hot_state();
     drop(ledger);
-    let handler_conn = Connection::open(&db_path)?;
-    let mut state = AppState::new(
-        fixture_dir.clone(),
-        None,
-        Some(policy),
+
+    let db_url = path_to_sqlite_url(&db_path);
+    let policy_runtime = noether::server::PolicyRuntime::static_policy(Some(policy));
+    let mut state = build_sqlite_state(
+        db_url,
+        policy_runtime,
         DecisionMode::Enforce,
-    );
+        fixture_dir.clone(),
+        fixture_dir.join("simulations"),
+    )?;
     state.policy_proposal_path = proposal_path.clone();
-    state.db_path = Some(db_path.clone());
-    state.conn = std::sync::Arc::new(std::sync::Mutex::new(Some(handler_conn)));
-    state.hot = std::sync::Arc::new(std::sync::Mutex::new(hot_state));
     let app = build_router(state.clone());
 
     println!(
