@@ -3073,7 +3073,7 @@ fn outcome_text(outcome: DecisionOutcome) -> &'static str {
     }
 }
 
-fn parse_decision_outcome(value: &str) -> DecisionOutcome {
+pub(crate) fn parse_decision_outcome(value: &str) -> DecisionOutcome {
     match value {
         "warn" => DecisionOutcome::Warn,
         "deny" => DecisionOutcome::Deny,
@@ -3108,7 +3108,7 @@ fn advance_tumbling_window_start(
     started_at + Duration::seconds(completed_windows * window_size_seconds)
 }
 
-fn parse_time(value: String) -> DateTime<Utc> {
+pub(crate) fn parse_time(value: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
@@ -3375,7 +3375,7 @@ fn usage_activity_record_from_row(
     })
 }
 
-fn agent_run_id_from_metadata_json(metadata_json: &str) -> Option<String> {
+pub(crate) fn agent_run_id_from_metadata_json(metadata_json: &str) -> Option<String> {
     serde_json::from_str::<Value>(metadata_json)
         .ok()
         .and_then(|value| {
@@ -3386,7 +3386,7 @@ fn agent_run_id_from_metadata_json(metadata_json: &str) -> Option<String> {
         })
 }
 
-fn decision_routing_report(
+pub(crate) fn decision_routing_report(
     selected_budget_id: Option<String>,
     matched_entity: Option<String>,
     selection_reason: Option<String>,
@@ -3422,11 +3422,11 @@ fn decision_routing_report(
     })
 }
 
-fn parse_entities_json(value: String) -> Vec<String> {
+pub(crate) fn parse_entities_json(value: String) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(&value).unwrap_or_default()
 }
 
-fn parse_optional_json<T: DeserializeOwned>(value: &str) -> Option<T> {
+pub(crate) fn parse_optional_json<T: DeserializeOwned>(value: &str) -> Option<T> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
         None
@@ -3435,7 +3435,7 @@ fn parse_optional_json<T: DeserializeOwned>(value: &str) -> Option<T> {
     }
 }
 
-fn limit_hits_from_explanations_json(
+pub(crate) fn limit_hits_from_explanations_json(
     explanations_json: &str,
 ) -> Option<Vec<DecisionLimitHitReport>> {
     let hits: Vec<DecisionLimitHitReport> =
@@ -3459,7 +3459,7 @@ fn limit_hits_from_explanations_json(
     (!hits.is_empty()).then_some(hits)
 }
 
-fn primary_explanation_rule_id(explanations_json: &str) -> Option<String> {
+pub(crate) fn primary_explanation_rule_id(explanations_json: &str) -> Option<String> {
     serde_json::from_str::<Vec<DecisionExplanation>>(explanations_json)
         .ok()?
         .into_iter()
@@ -4200,35 +4200,35 @@ fn routing_model_check(
     selected_budget_id.map(|budget_id| format!("allowed:{budget_id}"))
 }
 
-struct DecisionSummary<'a> {
-    action: &'a str,
-    decision_id: &'a str,
-    trace_id: Option<&'a str>,
-    request_id: Option<&'a str>,
-    provider: Option<&'a str>,
-    model: Option<&'a str>,
-    estimated_tokens: Option<i64>,
-    estimated_cost_usd: Option<f64>,
-    metadata_json: &'a str,
-    limit_hits: Option<&'a [DecisionLimitHitReport]>,
-    routing: DecisionRoutingSummary<'a>,
+pub(crate) struct DecisionSummary<'a> {
+    pub(crate) action: &'a str,
+    pub(crate) decision_id: &'a str,
+    pub(crate) trace_id: Option<&'a str>,
+    pub(crate) request_id: Option<&'a str>,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) model: Option<&'a str>,
+    pub(crate) estimated_tokens: Option<i64>,
+    pub(crate) estimated_cost_usd: Option<f64>,
+    pub(crate) metadata_json: &'a str,
+    pub(crate) limit_hits: Option<&'a [DecisionLimitHitReport]>,
+    pub(crate) routing: DecisionRoutingSummary<'a>,
 }
 
 #[derive(Clone, Copy)]
-struct DecisionRoutingSummary<'a> {
-    selected_budget_id: Option<&'a str>,
-    matched_entity: Option<&'a str>,
-    selection_reason: Option<&'a str>,
-    rejected_budget_id: Option<&'a str>,
-    rejected_budget_reason: Option<&'a str>,
-    model_check: Option<&'a str>,
-    budget_window_remaining_usd: Option<f64>,
-    budget_window_mode: Option<&'a str>,
-    budget_window_started_at: Option<DateTime<Utc>>,
-    budget_window_ends_at: Option<DateTime<Utc>>,
+pub(crate) struct DecisionRoutingSummary<'a> {
+    pub(crate) selected_budget_id: Option<&'a str>,
+    pub(crate) matched_entity: Option<&'a str>,
+    pub(crate) selection_reason: Option<&'a str>,
+    pub(crate) rejected_budget_id: Option<&'a str>,
+    pub(crate) rejected_budget_reason: Option<&'a str>,
+    pub(crate) model_check: Option<&'a str>,
+    pub(crate) budget_window_remaining_usd: Option<f64>,
+    pub(crate) budget_window_mode: Option<&'a str>,
+    pub(crate) budget_window_started_at: Option<DateTime<Utc>>,
+    pub(crate) budget_window_ends_at: Option<DateTime<Utc>>,
 }
 
-fn summarize_decision(decision: DecisionSummary<'_>) -> String {
+pub(crate) fn summarize_decision(decision: DecisionSummary<'_>) -> String {
     let metadata = serde_json::from_str::<Value>(decision.metadata_json).unwrap_or(Value::Null);
     let mut parts = vec![format!("decision_id={}", decision.decision_id)];
     parts.push(format!("action={}", decision.action));
@@ -4326,7 +4326,7 @@ fn summarize_decision(decision: DecisionSummary<'_>) -> String {
     parts.join(" ")
 }
 
-fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
+pub(crate) fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
     let payload = serde_json::from_str::<Value>(payload_json).unwrap_or(Value::Null);
     match kind {
         "pi.agent_context" => summarize_agent_context_payload(&payload),
@@ -4342,18 +4342,18 @@ fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
     }
 }
 
-struct FinalizedUsageSummary<'a> {
-    provider: Option<&'a str>,
-    model: Option<&'a str>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    total_tokens: Option<i64>,
-    cost: Option<f64>,
-    stop_reason: Option<&'a str>,
-    metadata_json: &'a str,
+pub(crate) struct FinalizedUsageSummary<'a> {
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) model: Option<&'a str>,
+    pub(crate) input_tokens: Option<i64>,
+    pub(crate) output_tokens: Option<i64>,
+    pub(crate) total_tokens: Option<i64>,
+    pub(crate) cost: Option<f64>,
+    pub(crate) stop_reason: Option<&'a str>,
+    pub(crate) metadata_json: &'a str,
 }
 
-fn summarize_finalized_usage(usage: FinalizedUsageSummary<'_>) -> String {
+pub(crate) fn summarize_finalized_usage(usage: FinalizedUsageSummary<'_>) -> String {
     let metadata = serde_json::from_str::<Value>(usage.metadata_json).unwrap_or(Value::Null);
     let details = metadata.get("usage_details").unwrap_or(&Value::Null);
     let mut parts = Vec::new();
