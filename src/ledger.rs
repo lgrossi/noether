@@ -44,7 +44,7 @@ pub struct BudgetLedger {
     reservations: HashMap<String, StoredReservation>,
     last_selected_budget_id: Option<String>,
     last_limit_hits: Vec<DecisionLimitHitReport>,
-    events: Vec<TraceEvent>,
+    events_count: u64,
     store: LedgerStore,
 }
 
@@ -106,7 +106,7 @@ impl LedgerPersistenceSnapshot {
                     reservations: self.reservations.clone(),
                     last_selected_budget_id: self.selected_budget_id.clone(),
                     last_limit_hits: self.limit_hits.clone(),
-                    events: Vec::new(),
+                    events_count: 0,
                     store: LedgerStore::InMemory,
                 };
                 if let Some(projection) = biggest_spend_window_projection(
@@ -1406,12 +1406,12 @@ impl BudgetLedger {
     pub fn record_event(&mut self, event: TraceEvent) -> Result<(), NoetError> {
         validate_event_payload(&event)?;
         self.persist_event(&event)?;
-        self.events.push(event);
+        self.events_count = self.events_count.saturating_add(1);
         Ok(())
     }
 
     pub fn event_count(&self) -> usize {
-        self.events.len()
+        self.events_count as usize
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {

@@ -617,11 +617,18 @@ impl AppState {
     ) -> Result<AuthorizeDecision, NoetError> {
         match &self.ledger_backend {
             LedgerBackend::Postgres { ledger, .. } => ledger.try_authorize(policy, request).await,
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => self
-                .ledger
-                .lock()
+            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
+                let ledger = Arc::clone(&self.ledger);
+                tokio::task::spawn_blocking(move || {
+                    ledger
+                        .blocking_lock()
+                        .try_authorize(policy.as_deref(), &request)
+                })
                 .await
-                .try_authorize(policy.as_deref(), &request),
+                .map_err(|error| {
+                    NoetError::InvalidConfig(format!("ledger authorize task panicked: {error}"))
+                })?
+            }
         }
     }
 
@@ -635,7 +642,14 @@ impl AppState {
                 ledger.finalize(reservation_id, payload).await
             }
             LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
-                self.ledger.lock().await.finalize(&reservation_id, &payload)
+                let ledger = Arc::clone(&self.ledger);
+                tokio::task::spawn_blocking(move || {
+                    ledger.blocking_lock().finalize(&reservation_id, &payload)
+                })
+                .await
+                .map_err(|error| {
+                    NoetError::InvalidConfig(format!("ledger finalize task panicked: {error}"))
+                })?
             }
         }
     }
@@ -644,7 +658,12 @@ impl AppState {
         match &self.ledger_backend {
             LedgerBackend::Postgres { ledger, .. } => ledger.record_event(event).await,
             LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
-                self.ledger.lock().await.record_event(event)
+                let ledger = Arc::clone(&self.ledger);
+                tokio::task::spawn_blocking(move || ledger.blocking_lock().record_event(event))
+                    .await
+                    .map_err(|error| {
+                        NoetError::InvalidConfig(format!("ledger event task panicked: {error}"))
+                    })?
             }
         }
     }

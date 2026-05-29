@@ -50,6 +50,15 @@ This branch also adds `examples/direct-bench.rs`, rebuilt against the current
 SQLite `BudgetLedger` and Postgres `AsyncPostgresLedger` APIs rather than PR
 #49's unmerged HotState/backend API.
 
+This branch also absorbs two incidental PR #49 bug fixes without taking the
+HotState rewrite:
+
+- SQLite/in-memory server write paths now run synchronous ledger work on
+  Tokio's blocking pool instead of executor worker threads.
+- Durable ledgers no longer retain every recorded trace event in process
+  memory; `BudgetLedger` keeps an event count while reports continue to read
+  persisted events.
+
 ## Validation performed
 
 - `cargo test --test parity_server`: 10 passed, SQLite path.
