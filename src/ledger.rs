@@ -52,6 +52,15 @@ struct StoredReservation {
     matched_entity: Option<String>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct HotState {
+    pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
+    pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
+    pub(crate) reservations: HashMap<String, StoredReservation>,
+}
+
+pub(crate) type ConnMutex = std::sync::Mutex<Option<rusqlite::Connection>>;
+
 #[derive(Clone, Debug)]
 struct BudgetCandidate {
     id: String,
