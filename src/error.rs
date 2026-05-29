@@ -43,6 +43,18 @@ impl From<rusqlite::Error> for NoetError {
     }
 }
 
+impl From<deadpool_postgres::PoolError> for NoetError {
+    fn from(e: deadpool_postgres::PoolError) -> Self {
+        Self::Database(e.to_string())
+    }
+}
+
+impl From<tokio_postgres::Error> for NoetError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::Database(e.to_string())
+    }
+}
+
 impl IntoResponse for NoetError {
     fn into_response(self) -> Response {
         error!(error = %self, "request failed");

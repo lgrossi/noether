@@ -650,7 +650,7 @@ pub struct ServeConfig {
     pub decision_mode: DecisionMode,
 }
 
-pub use crate::backend::{path_to_sqlite_url, sqlite_url_to_path};
+pub use crate::backend::{path_to_sqlite_url, sqlite_url_to_path, url_scheme};
 
 /// Build a fully-wired AppState backed by a SQLite database.
 /// This shared factory is used by both `serve()` and `noet-bench` so they
@@ -678,18 +678,31 @@ pub fn build_sqlite_state(
     Ok(state)
 }
 
+/// Build a fully-wired AppState backed by a PostgreSQL pool.
+/// Pings the pool with SELECT 1 to confirm connectivity before returning.
+/// All query methods remain stubs — they panic with a Phase 4+ message.
+pub async fn build_postgres_state(
+    db_url: String,
+    policy_runtime: PolicyRuntime,
+    decision_mode: DecisionMode,
+    fixture_dir: PathBuf,
+    simulation_dir: PathBuf,
+) -> Result<AppState, NoetError> {
+    let backend = Backend::postgres_from_url(db_url)?;
+    // Confirm the pool can actually reach the server before we bind the socket.
+    let client = backend.postgres_pool().get().await?;
+    client.query_one("SELECT 1", &[]).await?;
+    drop(client);
+    let backend = Arc::new(backend);
+    let mut state = AppState::with_policy_runtime(fixture_dir, None, policy_runtime, decision_mode);
+    state.simulation_dir = simulation_dir;
+    state.backend = backend;
+    Ok(state)
+}
+
 pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     fs::create_dir_all(&config.fixture_dir).await?;
     fs::create_dir_all(&config.simulation_dir).await?;
-    let db_path = sqlite_url_to_path(&config.db_url).ok_or_else(|| {
-        NoetError::InvalidConfig(format!(
-            "db_url must start with sqlite://, got: {}",
-            config.db_url
-        ))
-    })?;
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
     let bind = config.bind;
     let policy_proposal_path = config
         .simulation_dir
@@ -703,13 +716,42 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         }
         (_, policy) => PolicyRuntime::static_policy(policy),
     };
-    let mut state = build_sqlite_state(
-        config.db_url,
-        policy_runtime,
-        config.decision_mode,
-        config.fixture_dir,
-        config.simulation_dir,
-    )?;
+    let mut state = match url_scheme(&config.db_url) {
+        Some("sqlite") => {
+            let db_path = sqlite_url_to_path(&config.db_url).ok_or_else(|| {
+                NoetError::InvalidConfig(format!(
+                    "db_url must start with sqlite://, got: {}",
+                    config.db_url
+                ))
+            })?;
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            build_sqlite_state(
+                config.db_url,
+                policy_runtime,
+                config.decision_mode,
+                config.fixture_dir,
+                config.simulation_dir,
+            )?
+        }
+        Some("postgres") | Some("postgresql") => {
+            build_postgres_state(
+                config.db_url,
+                policy_runtime,
+                config.decision_mode,
+                config.fixture_dir,
+                config.simulation_dir,
+            )
+            .await?
+        }
+        _ => {
+            return Err(NoetError::InvalidConfig(format!(
+                "unsupported db url scheme — expected sqlite:// or postgres://, got: {}",
+                config.db_url
+            )));
+        }
+    };
     state.upstream = config.upstream;
     state.policy_proposal_path = policy_proposal_path;
     state.routes = config.routes;
