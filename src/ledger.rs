@@ -23,10 +23,14 @@ use crate::policy::{
 pub struct BudgetLedger {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
+    // TODO(psql): replace this process-local cadence stub with durable per-user advisory state.
+    advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
     reservations: HashMap<String, StoredReservation>,
     events: Vec<TraceEvent>,
     conn: Option<Connection>,
 }
+
+const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
 
 #[derive(Debug)]
 struct WindowState {
@@ -98,6 +102,7 @@ struct AuthorizeMessageHint {
     kind: String,
     rule_id: String,
     severity: DecisionSeverity,
+    recommendation: MessageHintRecommendation,
     #[serde(skip_serializing_if = "Option::is_none")]
     limit_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +121,13 @@ struct AuthorizeMessageHint {
     threshold_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     threshold_percent: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MessageHintRecommendation {
+    Show,
+    Hide,
 }
 
 #[derive(Default)]
@@ -358,6 +370,31 @@ impl BudgetLedger {
     ) -> AuthorizeDecision {
         self.try_authorize(policy, request)
             .expect("authorize decision persistence")
+    }
+
+    fn recommend_message_hint(
+        &mut self,
+        request: &AuthorizeRequest,
+        advisory_key: &str,
+        scope_key: &str,
+        severity: DecisionSeverity,
+        now: DateTime<Utc>,
+    ) -> MessageHintRecommendation {
+        if severity != DecisionSeverity::Warn {
+            return MessageHintRecommendation::Show;
+        }
+        let key = (
+            request_user_key(request),
+            advisory_key.to_owned(),
+            scope_key.to_owned(),
+        );
+        if let Some(last_shown_at) = self.advisory_cadence.get(&key)
+            && *last_shown_at + WARN_ADVISORY_COOLDOWN > now
+        {
+            return MessageHintRecommendation::Hide;
+        }
+        self.advisory_cadence.insert(key, now);
+        MessageHintRecommendation::Show
     }
 
     pub fn try_authorize(
@@ -3247,7 +3284,7 @@ fn is_limit_rule_id(rule_id: &str) -> bool {
 }
 
 fn apply_budget_limits(
-    ledger: &BudgetLedger,
+    ledger: &mut BudgetLedger,
     rule: &BudgetRule,
     request: &AuthorizeRequest,
     estimated_cost: f64,
@@ -3278,6 +3315,13 @@ fn apply_budget_limits(
             kind: "request_cost".to_owned(),
             rule_id: format!("{}.request_cost", rule.id),
             severity: limit.action.decision_severity(),
+            recommendation: ledger.recommend_message_hint(
+                request,
+                &format!("warn.{}.request_cost", rule.id),
+                "request",
+                limit.action.decision_severity(),
+                now,
+            ),
             limit_type: Some("request_cost".to_owned()),
             window_id: None,
             window_label: None,
@@ -3315,6 +3359,13 @@ fn apply_budget_limits(
             kind: "context_tokens".to_owned(),
             rule_id: format!("{}.context_tokens", rule.id),
             severity: limit.action.decision_severity(),
+            recommendation: ledger.recommend_message_hint(
+                request,
+                &format!("warn.{}.context_tokens", rule.id),
+                "context",
+                limit.action.decision_severity(),
+                now,
+            ),
             limit_type: Some("context_tokens".to_owned()),
             window_id: None,
             window_label: None,
@@ -3349,6 +3400,7 @@ fn apply_budget_limits(
                 &projection,
                 DecisionSeverity::Warn,
                 Some(warn_threshold),
+                MessageHintRecommendation::Show,
             ));
         }
         if projection.projected_spend_usd > projection.max_usd {
@@ -3366,6 +3418,13 @@ fn apply_budget_limits(
                 &projection,
                 hit.severity,
                 None,
+                ledger.recommend_message_hint(
+                    request,
+                    &format!("warn.{}", projection.rule_id),
+                    &projection.scope_key,
+                    hit.severity,
+                    now,
+                ),
             ));
             limit_hits.push(hit);
             if denied {
@@ -3386,11 +3445,13 @@ fn message_hint_from_projection(
     projection: &SpendWindowProjection,
     severity: DecisionSeverity,
     threshold_usd: Option<f64>,
+    recommendation: MessageHintRecommendation,
 ) -> AuthorizeMessageHint {
     AuthorizeMessageHint {
         kind: kind.to_owned(),
         rule_id: projection.rule_id.clone(),
         severity,
+        recommendation,
         limit_type: Some("spend".to_owned()),
         window_id: Some(projection.limit_id.clone()),
         window_label: Some(projection.window_label.clone()),
@@ -3412,6 +3473,7 @@ fn message_hint_from_limit_hit(kind: &str, hit: &DecisionLimitHitReport) -> Auth
         kind: kind.to_owned(),
         rule_id: hit.rule_id.clone(),
         severity: hit.severity,
+        recommendation: MessageHintRecommendation::Show,
         limit_type: Some("spend".to_owned()),
         window_id: hit.window_id.clone(),
         window_label: hit.window_id.clone(),
@@ -3664,6 +3726,23 @@ fn spend_limit_scope_key(by: SpendWindowBy, request: &AuthorizeRequest) -> Optio
         SpendWindowBy::Org => first_request_entity(request, "org"),
         SpendWindowBy::Workflow => first_request_entity(request, "workflow"),
         SpendWindowBy::Surface => first_request_entity(request, "surface"),
+    }
+}
+
+fn request_user_key(request: &AuthorizeRequest) -> String {
+    request
+        .subject
+        .as_deref()
+        .map(normalized_user_entity)
+        .or_else(|| first_request_entity(request, "user"))
+        .unwrap_or_else(|| "anonymous".to_owned())
+}
+
+fn normalized_user_entity(value: &str) -> String {
+    if value.contains(':') {
+        value.to_owned()
+    } else {
+        format!("user:{value}")
     }
 }
 
@@ -4517,6 +4596,18 @@ mod tests {
         ))
     }
 
+    fn first_message_hint_recommendation(decision: &AuthorizeDecision) -> Option<String> {
+        decision
+            .metadata
+            .as_ref()?
+            .get("message_hints")?
+            .as_array()?
+            .first()?
+            .get("recommendation")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     fn protected_adoption_policy(cap_window: &str) -> PolicyFile {
         PolicyFile {
             version: 0,
@@ -4751,6 +4842,40 @@ mod tests {
                 && explanation.reason == "estimated context tokens 1200 exceed limit max 1000"
                 && explanation.severity == DecisionSeverity::Warn
         }));
+    }
+
+    #[test]
+    fn budget_limit_cadences_repeated_context_warning_recommendations() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
+                max_tokens: 100,
+                action: PolicyAction::Warn,
+            }),
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut request = request(0.01);
+        request.subject = Some("user:alice".to_owned());
+        request.estimated_tokens = Some(101);
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request);
+        let second = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(first.outcome, DecisionOutcome::Warn);
+        assert_eq!(second.outcome, DecisionOutcome::Warn);
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&second).as_deref(),
+            Some("hide")
+        );
     }
 
     #[test]

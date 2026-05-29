@@ -135,6 +135,7 @@ type AuthorizeMessageHint = {
 	kind?: string;
 	rule_id?: string;
 	severity?: string;
+	recommendation?: string;
 	limit_type?: string;
 	window_id?: string;
 	window_label?: string;
@@ -156,6 +157,14 @@ type AuthorizeDecision = {
 	explanations?: DecisionExplanation[];
 	routing?: DecisionRouting;
 	metadata?: Record<string, unknown>;
+};
+
+type AuthorizeNotification = {
+	kind?: string;
+	key?: string;
+	severity?: string;
+	title?: string;
+	body?: string;
 };
 
 type Usage = {
@@ -1199,7 +1208,10 @@ function buildShortDecisionReason(
 	if (hinted.length > 0) {
 		return hinted.join(" ");
 	}
-	return buildUserDecisionMessage(decision, decisionAction(decision), attemptedModel);
+	return (
+		buildUserDecisionMessage(decision, decisionAction(decision), attemptedModel) ||
+		"Policy warning. Consider a cheaper model."
+	);
 }
 
 function messageHints(decision: AuthorizeDecision | undefined): AuthorizeMessageHint[] {
@@ -1208,14 +1220,43 @@ function messageHints(decision: AuthorizeDecision | undefined): AuthorizeMessage
 	return hints.filter((hint): hint is AuthorizeMessageHint => isRecord(hint));
 }
 
+function decisionNotifications(decision: AuthorizeDecision | undefined): AuthorizeNotification[] {
+	const metadata = isRecord(decision?.metadata) ? decision?.metadata : undefined;
+	const notifications = Array.isArray(metadata?.notifications) ? metadata.notifications : [];
+	return notifications.filter((notification): notification is AuthorizeNotification => isRecord(notification));
+}
+
 function messagesForDecisionHints(decision: AuthorizeDecision | undefined, action: DecisionAction): string[] {
 	const hints = messageHints(decision);
 	if (!hints.length) {
 		return [];
 	}
 	const wantedSeverity = action === "warn" ? "warn" : "deny";
-	const matching = hints.filter((hint) => hint.severity === wantedSeverity);
-	return uniqueStrings((matching.length > 0 ? matching : hints).map((hint) => messageForHint(hint, action)));
+	const severityMatches = hints.filter((hint) => hint.severity === wantedSeverity);
+	const candidates = (severityMatches.length > 0 ? severityMatches : hints).filter(
+		(hint) => action !== "warn" || hint.recommendation !== "hide",
+	);
+	return uniqueStrings(candidates.map((hint) => messageForHint(hint, action)));
+}
+
+function notificationMessage(notification: AuthorizeNotification): string | undefined {
+	const title = stringValue(notification.title);
+	const body = stringValue(notification.body);
+	if (title && body) {
+		return `${title}. ${body}`;
+	}
+	return body || title;
+}
+
+function notificationType(notification: AuthorizeNotification): "info" | "warning" | "error" {
+	const severity = stringValue(notification.severity);
+	if (severity === "error" || severity === "deny") {
+		return "error";
+	}
+	if (severity === "warn" || severity === "warning") {
+		return "warning";
+	}
+	return "info";
 }
 
 function messageForHint(hint: AuthorizeMessageHint, action: DecisionAction): string {
@@ -1372,7 +1413,7 @@ function buildPolicyDecisionMessage(
 	action: DecisionAction,
 	userApproval?: UserApproval,
 	attemptedModel?: AttemptedModelContext,
-): string {
+): string | undefined {
 	if (action === "ask") {
 		if (userApproval === "approved") {
 			return "Continuing by request.";
@@ -1389,10 +1430,14 @@ function buildUserDecisionMessage(
 	decision: AuthorizeDecision,
 	action: DecisionAction,
 	attemptedModel?: AttemptedModelContext,
-): string {
+): string | undefined {
+	const hints = messageHints(decision);
 	const hinted = messagesForDecisionHints(decision, action);
 	if (hinted.length > 0) {
 		return hinted.join(" ");
+	}
+	if (action === "warn" && hints.length > 0) {
+		return undefined;
 	}
 	if (decisionHasReason(decision, "provider/model is not allowed")) {
 		const budgetId = decisionBudgetId(decision);
@@ -2103,12 +2148,22 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 
 			if (decisionNeedsHandling) {
 				const message = buildPolicyDecisionMessage(decision, action, userApproval, attemptedModel);
-				if (policyAction === "warn" || policyAction === "approved") {
+				if (message && (policyAction === "warn" || policyAction === "approved")) {
 					surfaceExtensionMessage(ctx, message, "warning");
 					logPolicyMessage(message, "warn");
-				} else {
+				} else if (message) {
 					surfaceExtensionMessage(ctx, message, "error");
 					logPolicyMessage(message, "error");
+				}
+			} else {
+				for (const notification of decisionNotifications(decision)) {
+					const message = notificationMessage(notification);
+					if (!message) {
+						continue;
+					}
+					const type = notificationType(notification);
+					surfaceExtensionMessage(ctx, message, type);
+					logPolicyMessage(message, type === "error" ? "error" : type === "warning" ? "warn" : "info");
 				}
 			}
 			if (policyAction === "block") {

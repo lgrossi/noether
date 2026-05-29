@@ -893,6 +893,118 @@ function deferred() {
 	globalThis.fetch = async (url) => {
 		if (String(url).endsWith("/v1/authorize")) {
 			return Response.json({
+				decision_id: "dec_hidden_context_warn",
+				outcome: "warn",
+				action: "warn",
+				explanations: [
+					{
+						rule_id: "personal-local.context_tokens",
+						reason: "estimated context tokens 120000 exceeds context limit max 100000",
+						severity: "warn",
+					},
+				],
+				metadata: {
+					message_hints: [
+						{
+							kind: "context_tokens",
+							rule_id: "personal-local.context_tokens",
+							severity: "warn",
+							recommendation: "hide",
+							limit_type: "context_tokens",
+						},
+					],
+				},
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext({ ui: ui.ui }));
+
+		assert.equal(ui.notifications.length, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
+				decision_id: "dec_enablement_tip",
+				outcome: "allow",
+				action: "allow",
+				reservation: { id: "res_tip" },
+				explanations: [],
+				metadata: {
+					notifications: [
+						{
+							kind: "enablement_tip",
+							key: "workflow.codify_repeated_process",
+							severity: "info",
+							title: "AI budget headroom available",
+							body: "Try codifying a repeated team workflow into a reusable skill or checklist.",
+						},
+					],
+				},
+				created_at: new Date().toISOString(),
+			});
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const ui = captureUiSignals();
+		const handlers = new Map();
+		extension.default(
+			{
+				on(event, handler) {
+					handlers.set(event, handler);
+				},
+			},
+			{
+				noetherUrl: "http://127.0.0.1:1",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+			},
+		);
+
+		await handlers.get("before_provider_request")({ payload: { model: "local" } }, fakeContext({ ui: ui.ui }));
+
+		assert.equal(ui.notifications.length, 1);
+		assert.equal(ui.notifications[0].type, "info");
+		assert.match(ui.notifications[0].message, /AI budget headroom available/);
+		assert.match(ui.notifications[0].message, /reusable skill or checklist/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/v1/authorize")) {
+			return Response.json({
 				decision_id: "dec_model_block",
 				outcome: "deny",
 				action: "block",
