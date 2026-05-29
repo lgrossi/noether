@@ -31,10 +31,8 @@ use crate::contract::{
 };
 use crate::error::NoetError;
 use crate::ledger::{
-    BudgetLedger, HotState, ReplaySpendSeed, TraceReportItem,
-    finalize_hot, persist_allocation_buckets, persist_decision as ledger_persist_decision,
-    persist_event, persist_finalization, persist_limit_windows, try_authorize_at_hot,
-    validate_event_payload, RoutingPersistenceFields,
+    BudgetLedger, HotState, ReplaySpendSeed, RoutingPersistenceFields, TraceReportItem,
+    finalize_hot, try_authorize_at_hot, validate_event_payload,
 };
 use crate::noether_app;
 use crate::openapi;
@@ -611,6 +609,15 @@ impl AppState {
             .await
             .map_err(|e| NoetError::Database(e.to_string()))?;
         }
+        // Postgres backend: read_ledger is not supported — PG reporting goes through
+        // the dedicated PostgresBackend methods (Phase 5). Return an error rather than panic.
+        if matches!(self.backend.as_ref(), Backend::Postgres(_)) {
+            return Err(NoetError::InvalidConfig(
+                "read_ledger is not available for the PostgreSQL backend; \
+                 use the /v1/reports/* PG-native endpoints".to_owned(),
+            ));
+        }
+
         // Empty URL (in-memory / test mode): acquire ConnMutex inside spawn_blocking.
         // Take the connection from the mutex, run the read closure with a read_only
         // BudgetLedger (reporting methods return empty data if conn is None, preserving
@@ -859,71 +866,49 @@ async fn authorize(
     let policy = state.active_policy().await;
     let trace_id = request_trace_id(&request);
     let hot = Arc::clone(&state.hot);
-    let conn = Arc::clone(state.backend.sqlite_conn());
-    let decision = tokio::task::spawn_blocking(move || -> Result<AuthorizeDecision, NoetError> {
-        // L1: acquire HotState, run in-memory authorize, release L1.
-        let (decision, snapshot) = {
-            let mut hot_guard = hot.lock().expect("hot mutex poisoned");
-            try_authorize_at_hot(&mut hot_guard, policy.as_deref(), &request, chrono::Utc::now())?
-            // hot_guard dropped here — L1 released.
-        };
+    let request_for_hot = request.clone();
 
-        // L2: acquire conn, persist snapshot, release L2.
-        if let Some(snap) = snapshot {
-            let conn_guard = conn.lock().expect("conn mutex poisoned");
-            if let Some(c) = conn_guard.as_ref() {
-                persist_limit_windows(c, &snap.limit_windows)?;
-                persist_allocation_buckets(c, &snap.allocation_buckets)?;
-
-                // Build routing fields from snapshot + decision.
-                let selected_budget_id = snap.selected_budget_id.clone();
-                let matched_entity = snap.stored.matched_entity.clone();
-                let selection_reason = decision
-                    .explanations
-                    .iter()
-                    .find(|e| {
-                        selected_budget_id
-                            .as_deref()
-                            .map(|id| e.rule_id == id)
-                            .unwrap_or(false)
-                    })
-                    .map(|e| e.reason.clone());
-                let routing = RoutingPersistenceFields {
-                    selected_budget_id,
-                    matched_entity,
-                    selection_reason,
-                    rejected_budget_id: None,
-                    rejected_budget_reason: None,
-                    model_check: None,
-                    budget_window_remaining_usd: None,
-                    budget_window_mode: None,
-                    budget_window_started_at: None,
-                    budget_window_ends_at: None,
-                    tool_calls: None,
-                    agent_steps: None,
-                    retries: None,
-                };
-
-                // Build a single-entry reservations map for persist_decision.
-                let mut reservations = std::collections::HashMap::new();
-                reservations.insert(snap.reservation_id.clone(), snap.stored);
-
-                ledger_persist_decision(
-                    c,
-                    &request,
-                    &decision,
-                    &snap.limit_hits,
-                    routing,
-                    &reservations,
-                )?;
-            }
-            drop(conn_guard); // L2 released.
-        }
-
-        Ok(decision)
+    // Phase 1: sync hot-state mutation inside spawn_blocking.
+    // L1 is held only for the duration of try_authorize_at_hot; released on drop.
+    let (decision, snapshot) = tokio::task::spawn_blocking(move || {
+        let mut hot_guard = hot.lock().expect("hot mutex poisoned");
+        try_authorize_at_hot(&mut hot_guard, policy.as_deref(), &request_for_hot, chrono::Utc::now())
+        // hot_guard dropped here — L1 released.
     })
     .await
     .expect("authorize task panicked")?;
+
+    // Phase 2: async DB write — Backend dispatches to SQLite or PG.
+    if let Some(snap) = snapshot {
+        let selected_budget_id = snap.selected_budget_id.clone();
+        let matched_entity = snap.stored.matched_entity.clone();
+        let selection_reason = decision
+            .explanations
+            .iter()
+            .find(|e| {
+                selected_budget_id
+                    .as_deref()
+                    .map(|id| e.rule_id == id)
+                    .unwrap_or(false)
+            })
+            .map(|e| e.reason.clone());
+        let routing = RoutingPersistenceFields {
+            selected_budget_id,
+            matched_entity,
+            selection_reason,
+            rejected_budget_id: None,
+            rejected_budget_reason: None,
+            model_check: None,
+            budget_window_remaining_usd: None,
+            budget_window_mode: None,
+            budget_window_started_at: None,
+            budget_window_ends_at: None,
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        state.backend.persist_authorize_writes(snap, request, decision.clone(), routing).await?;
+    }
 
     publish_report_update(&state, "authorize", trace_id);
     Ok(Json(decision))
@@ -936,31 +921,21 @@ async fn finalize_reservation(
 ) -> Result<Json<Reservation>, NoetError> {
     let trace_id = finalize_trace_id(&payload);
     let hot = Arc::clone(&state.hot);
-    let conn = Arc::clone(state.backend.sqlite_conn());
-    let reservation = tokio::task::spawn_blocking(move || -> Result<Reservation, NoetError> {
-        // L1: acquire HotState, run in-memory finalize, release L1.
-        let (reservation, lw_snapshot) = {
-            let mut hot_guard = hot.lock().expect("hot mutex poisoned");
-            finalize_hot(&mut hot_guard, &id, &payload)?
-            // hot_guard dropped here — L1 released.
-        };
+    let payload_for_hot = payload.clone();
 
-        // L2: acquire conn, persist finalization + changed limit windows, release L2.
-        let conn_guard = conn.lock().expect("conn mutex poisoned");
-        if let Some(c) = conn_guard.as_ref() {
-            persist_finalization(c, &reservation, &payload)?;
-            if !lw_snapshot.is_empty() {
-                let lw_map: std::collections::HashMap<(String, String, String), _> =
-                    lw_snapshot.into_iter().collect();
-                persist_limit_windows(c, &lw_map)?;
-            }
-        }
-        drop(conn_guard); // L2 released.
-
-        Ok(reservation)
+    // Phase 1: sync hot-state mutation inside spawn_blocking.
+    // L1 held only for finalize_hot; released on drop.
+    let (reservation, lw_snapshot) = tokio::task::spawn_blocking(move || {
+        let mut hot_guard = hot.lock().expect("hot mutex poisoned");
+        finalize_hot(&mut hot_guard, &id, &payload_for_hot)
+        // hot_guard dropped here — L1 released.
     })
     .await
     .expect("finalize task panicked")?;
+
+    // Phase 2: async DB write.
+    state.backend.persist_finalize_writes(reservation.clone(), payload, lw_snapshot).await?;
+
     publish_report_update(&state, "finalize", trace_id);
     Ok(Json(reservation))
 }
@@ -971,19 +946,9 @@ async fn record_event(
 ) -> Result<impl IntoResponse, NoetError> {
     validate_event_payload(&event)?;
     let trace_id = event.trace_id.clone();
-    let conn = Arc::clone(state.backend.sqlite_conn());
-    let event_count = Arc::clone(&state.event_count);
-    tokio::task::spawn_blocking(move || -> Result<(), NoetError> {
-        let conn_guard = conn.lock().expect("conn mutex poisoned");
-        if let Some(c) = conn_guard.as_ref() {
-            persist_event(c, &event)?;
-        }
-        drop(conn_guard);
-        event_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })
-    .await
-    .expect("event task panicked")?;
+    // No HotState mutation — direct async backend write.
+    state.backend.persist_event_write(event).await?;
+    state.event_count.fetch_add(1, Ordering::Relaxed);
     publish_report_update(&state, "event", trace_id);
     Ok((
         StatusCode::ACCEPTED,
@@ -5942,6 +5907,254 @@ policies: []
         assert!(
             (finalized_amount - expected).abs() < 1e-9,
             "finalized amount mismatch: finalized={finalized_amount:.6} expected={expected:.6}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PG stress test — gated on NOET_TEST_PG_URL env var
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires live PG: set NOET_TEST_PG_URL to enable"]
+    async fn pg_stress_no_double_spend() {
+        let pg_url = match std::env::var("NOET_TEST_PG_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("pg_stress_no_double_spend: NOET_TEST_PG_URL not set — skipping");
+                return;
+            }
+        };
+
+        // Reset schema.
+        {
+            let (client, conn) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+                .await
+                .expect("connect PG for schema reset");
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("pg connection error: {e}");
+                }
+            });
+            client
+                .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                .await
+                .expect("schema reset");
+        }
+
+        // Build PG backend AppState.
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![crate::contract::BudgetRule {
+                id: "pg-stress-budget".to_owned(),
+                priority: 0,
+                models: Default::default(),
+                limits: crate::contract::BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![crate::contract::SpendWindowLimit {
+                        id: Some("pg-stress-cap".to_owned()),
+                        by: crate::contract::SpendWindowBy::Global,
+                        window: "1d".to_owned(),
+                        mode: Some(crate::contract::SpendWindowMode::Tumbling),
+                        anchor: Some(crate::contract::WindowAnchorPolicy {
+                            kind: crate::contract::WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 10.0, // 30 * 0.01 = 0.30 << 10.0
+                        warn_at_fractions: vec![],
+                        action: crate::contract::PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
+                allocation: None,
+                rule_match: crate::contract::RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        };
+
+        let fixture_dir = std::path::PathBuf::from("/tmp/pg_stress_fixtures");
+        let simulation_dir = std::path::PathBuf::from("/tmp/pg_stress_simulations");
+        let state = super::build_postgres_state(
+            pg_url.clone(),
+            super::PolicyRuntime::static_policy(Some(policy)),
+            crate::contract::DecisionMode::Enforce,
+            fixture_dir,
+            simulation_dir,
+        )
+        .await
+        .expect("build_postgres_state");
+
+        let app = build_router(state.clone());
+
+        const TASK_COUNT: usize = 30;
+        const COST_PER_TASK: f64 = 0.01;
+
+        // Spawn 30 concurrent authorize+finalize tasks.
+        let handles: Vec<tokio::task::JoinHandle<(StatusCode, serde_json::Value)>> = (0..TASK_COUNT)
+            .map(|i| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let mut metadata = BTreeMap::new();
+                    metadata.insert(
+                        "trace_id".to_owned(),
+                        serde_json::json!(format!("pg-stress-trace-{i}")),
+                    );
+                    metadata.insert(
+                        "request_id".to_owned(),
+                        serde_json::json!(format!("pg-stress-req-{i}")),
+                    );
+                    let body = serde_json::to_string(&crate::contract::AuthorizeRequest {
+                        budget_id: None,
+                        entities: Vec::new(),
+                        subject: None,
+                        project: Some("pg-stress".to_owned()),
+                        provider: Some("openai".to_owned()),
+                        model: Some("gpt-4".to_owned()),
+                        estimated_tokens: None,
+                        estimated_cost_usd: Some(COST_PER_TASK),
+                        metadata,
+                    })
+                    .expect("serialize authorize");
+
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri("/v1/authorize")
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .expect("authorize request"),
+                        )
+                        .await
+                        .expect("authorize response");
+                    let status = response.status();
+                    let body_bytes = to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("authorize body");
+                    let decision: serde_json::Value =
+                        serde_json::from_slice(&body_bytes).expect("authorize json");
+                    (status, decision)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(TASK_COUNT);
+        for handle in handles {
+            results.push(handle.await.expect("task panicked"));
+        }
+
+        // All 30 requests must be allowed.
+        for (status, decision) in &results {
+            assert_eq!(*status, StatusCode::OK, "unexpected status: {decision}");
+            assert_eq!(
+                decision["outcome"].as_str().unwrap_or(""),
+                "allow",
+                "unexpected outcome: {decision}"
+            );
+        }
+
+        // Verify no double-spend in HotState.
+        let hot_guard = state.hot.lock().expect("hot mutex");
+        let total_reserved: f64 = hot_guard
+            .reservations
+            .values()
+            .map(|stored| stored.reservation.amount_usd)
+            .sum();
+        drop(hot_guard);
+        let expected = TASK_COUNT as f64 * COST_PER_TASK;
+        assert!(
+            (total_reserved - expected).abs() < 1e-9,
+            "double-spend in HotState: reserved={total_reserved:.6} expected={expected:.6}"
+        );
+
+        // Finalize all reservations.
+        let reservation_ids: Vec<String> = results
+            .iter()
+            .filter_map(|(_, decision)| {
+                decision["reservation"]["id"].as_str().map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            reservation_ids.len(),
+            TASK_COUNT,
+            "expected all tasks to produce a reservation"
+        );
+
+        let finalize_handles: Vec<tokio::task::JoinHandle<StatusCode>> = reservation_ids
+            .iter()
+            .cloned()
+            .map(|reservation_id| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let body = serde_json::json!({
+                        "actual_cost_usd": COST_PER_TASK,
+                        "usage": {
+                            "provider": "openai",
+                            "model": "gpt-4",
+                            "input_tokens": 100,
+                            "output_tokens": 50,
+                            "total_tokens": 150,
+                            "cost_usd": COST_PER_TASK
+                        }
+                    })
+                    .to_string();
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri(format!("/v1/reservations/{reservation_id}/finalize"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .expect("finalize request"),
+                        )
+                        .await
+                        .expect("finalize response");
+                    response.status()
+                })
+            })
+            .collect();
+
+        for handle in finalize_handles {
+            let status = handle.await.expect("finalize task panicked");
+            assert_eq!(status, StatusCode::OK, "finalize returned non-200");
+        }
+
+        // Verify PG rows: reservations count == TASK_COUNT, no double-spend.
+        let (client, conn) = tokio_postgres::connect(&pg_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect PG for verification");
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("pg verification connection error: {e}");
+            }
+        });
+
+        let row = client
+            .query_one("SELECT COUNT(*) FROM reservations", &[])
+            .await
+            .expect("count reservations");
+        let count: i64 = row.try_get(0).expect("count value");
+        assert_eq!(
+            count as usize, TASK_COUNT,
+            "PG reservations count mismatch: got {count} expected {TASK_COUNT}"
+        );
+
+        // Sum reserved amounts from PG — should equal TASK_COUNT * COST_PER_TASK.
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(amount_usd), 0) FROM reservations WHERE status = 'finalized'",
+                &[],
+            )
+            .await
+            .expect("sum reservations");
+        let pg_total: f64 = row.try_get(0).expect("sum value");
+        assert!(
+            (pg_total - expected).abs() < 1e-9,
+            "PG double-spend: total={pg_total:.6} expected={expected:.6}"
         );
     }
 }

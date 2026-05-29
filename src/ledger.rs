@@ -3001,11 +3001,11 @@ fn ensure_column(
     Ok(())
 }
 
-fn string_metadata(request: &AuthorizeRequest, key: &str) -> Option<String> {
+pub(crate) fn string_metadata(request: &AuthorizeRequest, key: &str) -> Option<String> {
     string_value(&request.metadata, key)
 }
 
-fn string_value(
+pub(crate) fn string_value(
     metadata: &std::collections::BTreeMap<String, serde_json::Value>,
     key: &str,
 ) -> Option<String> {
@@ -3015,7 +3015,7 @@ fn string_value(
         .map(ToOwned::to_owned)
 }
 
-fn decision_app_run_key(
+pub(crate) fn decision_app_run_key(
     trace_id: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
@@ -3065,7 +3065,7 @@ pub(crate) fn validate_event_payload(event: &TraceEvent) -> Result<(), NoetError
     Ok(())
 }
 
-fn outcome_text(outcome: DecisionOutcome) -> &'static str {
+pub(crate) fn outcome_text(outcome: DecisionOutcome) -> &'static str {
     match outcome {
         DecisionOutcome::Allow => "allow",
         DecisionOutcome::Warn => "warn",
@@ -3081,7 +3081,7 @@ pub(crate) fn parse_decision_outcome(value: &str) -> DecisionOutcome {
     }
 }
 
-fn action_text(action: PolicyAction) -> &'static str {
+pub(crate) fn action_text(action: PolicyAction) -> &'static str {
     match action {
         PolicyAction::Allow => "allow",
         PolicyAction::Warn => "warn",
@@ -3090,7 +3090,7 @@ fn action_text(action: PolicyAction) -> &'static str {
     }
 }
 
-fn reservation_status_text(status: ReservationStatus) -> &'static str {
+pub(crate) fn reservation_status_text(status: ReservationStatus) -> &'static str {
     match status {
         ReservationStatus::Active => "active",
         ReservationStatus::Finalized => "finalized",
@@ -4081,7 +4081,7 @@ fn recent_spend_usd(
         .sum()
 }
 
-fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn rolling_bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
     let timestamp = at.timestamp();
     DateTime::from_timestamp(timestamp, 0).expect("valid rolling bucket timestamp")
 }

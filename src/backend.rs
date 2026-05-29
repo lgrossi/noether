@@ -1,21 +1,28 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
+use uuid::Uuid;
 
-use crate::contract::AuthorizeRequest;
+use crate::contract::{AuthorizeDecision, AuthorizeRequest, FinalizeReservation, Reservation, TraceEvent};
 use crate::error::NoetError;
 use crate::ledger::{
-    ConnMutex, DecisionLimitHitReport, DecisionRoutingReport, DecisionRoutingSummary,
-    DecisionSummary, FinalizedUsageSummary, HistoricalAuthorizeRequest, ProtectedAdoptionEntityReport,
-    ProtectedAdoptionReport, RuleStatsReport, RunTotalsReport, SpendScopeTotal, TraceReport,
-    TraceReportItem, UsageActivityRecord, UsageReport, UsageReportRow,
-    agent_run_id_from_metadata_json, binding_limit_hit, decision_routing_report,
-    limit_hits_from_explanations_json, parse_decision_outcome, parse_entities_json,
-    parse_optional_json, parse_time, primary_explanation_rule_id, summarize_decision,
-    summarize_event_payload, summarize_finalized_usage,
+    ConnMutex, DecisionLimitHitReport, DecisionRoutingReport,
+    DecisionRoutingSummary, DecisionSummary, FinalizedUsageSummary, HistoricalAuthorizeRequest,
+    HotSnapshot, ProtectedAdoptionEntityReport, ProtectedAdoptionReport, RoutingPersistenceFields,
+    RuleStatsReport, RunTotalsReport, SpendScopeTotal, TraceReport,
+    TraceReportItem, UsageActivityRecord, UsageReport, UsageReportRow, WindowState,
+    action_text, agent_run_id_from_metadata_json, binding_limit_hit, decision_app_run_key,
+    decision_routing_report, limit_hits_from_explanations_json, outcome_text,
+    parse_decision_outcome, parse_entities_json, parse_optional_json, parse_time,
+    persist_allocation_buckets, persist_decision as sqlite_persist_decision,
+    persist_event, persist_finalization, persist_limit_windows,
+    primary_explanation_rule_id, reservation_status_text, rolling_bucket_start,
+    string_metadata, summarize_decision, summarize_event_payload,
+    summarize_finalized_usage,
 };
 
 // ---------------------------------------------------------------------------
@@ -291,7 +298,7 @@ impl Backend {
             mgr_config,
         );
         let pool = deadpool_postgres::Pool::builder(mgr)
-            .max_size(4)
+            .max_size(16)
             .build()
             .map_err(|e| NoetError::InvalidConfig(format!("failed to build postgres pool: {e}")))?;
         Ok(Backend::Postgres(PostgresBackend {
@@ -320,6 +327,430 @@ impl Backend {
             Backend::Sqlite(b) => &b.db_url,
             Backend::Postgres(b) => &b.db_url,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Write hotpath — Phase 6
+    // -----------------------------------------------------------------------
+
+    pub(crate) async fn persist_authorize_writes(
+        &self,
+        snap: HotSnapshot,
+        request: AuthorizeRequest,
+        decision: AuthorizeDecision,
+        routing: RoutingPersistenceFields,
+    ) -> Result<(), NoetError> {
+        match self {
+            Backend::Sqlite(b) => b.persist_authorize_writes(snap, request, decision, routing).await,
+            Backend::Postgres(b) => b.persist_authorize_writes(snap, request, decision, routing).await,
+        }
+    }
+
+    pub(crate) async fn persist_finalize_writes(
+        &self,
+        reservation: Reservation,
+        payload: FinalizeReservation,
+        lw_snapshot: Vec<((String, String, String), WindowState)>,
+    ) -> Result<(), NoetError> {
+        match self {
+            Backend::Sqlite(b) => b.persist_finalize_writes(reservation, payload, lw_snapshot).await,
+            Backend::Postgres(b) => b.persist_finalize_writes(reservation, payload, lw_snapshot).await,
+        }
+    }
+
+    pub(crate) async fn persist_event_write(&self, event: TraceEvent) -> Result<(), NoetError> {
+        match self {
+            Backend::Sqlite(b) => b.persist_event_write(event).await,
+            Backend::Postgres(b) => b.persist_event_write(event).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SqliteBackend — write hotpath implementations (thin async wrappers)
+// ---------------------------------------------------------------------------
+
+impl SqliteBackend {
+    async fn persist_authorize_writes(
+        &self,
+        snap: HotSnapshot,
+        request: AuthorizeRequest,
+        decision: AuthorizeDecision,
+        routing: RoutingPersistenceFields,
+    ) -> Result<(), NoetError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().expect("conn mutex poisoned");
+            if let Some(c) = conn_guard.as_ref() {
+                persist_limit_windows(c, &snap.limit_windows)?;
+                persist_allocation_buckets(c, &snap.allocation_buckets)?;
+                let mut reservations = HashMap::new();
+                reservations.insert(snap.reservation_id.clone(), snap.stored);
+                sqlite_persist_decision(c, &request, &decision, &snap.limit_hits, routing, &reservations)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("sqlite authorize persist panicked")
+    }
+
+    async fn persist_finalize_writes(
+        &self,
+        reservation: Reservation,
+        payload: FinalizeReservation,
+        lw_snapshot: Vec<((String, String, String), WindowState)>,
+    ) -> Result<(), NoetError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().expect("conn mutex poisoned");
+            if let Some(c) = conn_guard.as_ref() {
+                persist_finalization(c, &reservation, &payload)?;
+                if !lw_snapshot.is_empty() {
+                    let lw_map: HashMap<_, _> = lw_snapshot.into_iter().collect();
+                    persist_limit_windows(c, &lw_map)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("sqlite finalize persist panicked")
+    }
+
+    async fn persist_event_write(&self, event: TraceEvent) -> Result<(), NoetError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().expect("conn mutex poisoned");
+            if let Some(c) = conn_guard.as_ref() {
+                persist_event(c, &event)?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("sqlite event persist panicked")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostgresBackend — write hotpath implementations (native async, single tx)
+// ---------------------------------------------------------------------------
+
+impl PostgresBackend {
+    async fn persist_authorize_writes(
+        &self,
+        snap: HotSnapshot,
+        request: AuthorizeRequest,
+        decision: AuthorizeDecision,
+        routing: RoutingPersistenceFields,
+    ) -> Result<(), NoetError> {
+        let client = self.pool.get().await?;
+        client.batch_execute("BEGIN").await?;
+
+        // Build decision fields.
+        let trace_id = string_metadata(&request, "trace_id");
+        let session_id = string_metadata(&request, "session_id");
+        let request_id = string_metadata(&request, "request_id");
+        let outcome = outcome_text(decision.outcome);
+        let app_run_key = decision_app_run_key(
+            trace_id.as_deref(),
+            request.provider.as_deref(),
+            request.model.as_deref(),
+            outcome,
+            routing.selected_budget_id.as_deref(),
+            &request.metadata,
+            decision.created_at,
+        );
+        let routing_report = decision_routing_report(
+            routing.selected_budget_id.clone(),
+            routing.matched_entity.clone(),
+            routing.selection_reason.clone(),
+            routing.rejected_budget_id.clone(),
+            routing.rejected_budget_reason.clone(),
+            routing.model_check.clone(),
+            routing.budget_window_remaining_usd,
+            routing.budget_window_mode.clone(),
+            routing.budget_window_started_at,
+            routing.budget_window_ends_at,
+        );
+        let explanations_val: serde_json::Value = serde_json::to_value(&decision.explanations)?;
+        let metadata_val: serde_json::Value = serde_json::to_value(&request.metadata)?;
+        let entities_val: serde_json::Value = serde_json::to_value(&request.entities)?;
+        let routing_val: serde_json::Value = serde_json::to_value(&routing_report)?;
+        let limit_hits_val: serde_json::Value = serde_json::to_value(&snap.limit_hits)?;
+        let estimated_tokens: Option<i64> = request.estimated_tokens.map(|v| v as i64);
+        let tool_calls: Option<i64> = routing.tool_calls.map(|v| v as i64);
+        let agent_steps: Option<i64> = routing.agent_steps.map(|v| v as i64);
+        let retries: Option<i64> = routing.retries.map(|v| v as i64);
+
+        let action = action_text(decision.action);
+        let created_at_str = decision.created_at.to_rfc3339();
+        client.execute(
+            "INSERT INTO decisions (
+                 decision_id, trace_id, session_id, request_id, subject, project, provider, model,
+                 estimated_tokens, estimated_cost_usd, outcome, action, explanations_json,
+                 metadata_json, entities_json, selected_budget_id, matched_entity, selection_reason,
+                 rejected_budget_id, rejected_budget_reason, model_check,
+                 budget_window_remaining_usd, routing_json, limit_hits_json,
+                 max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                 $23, $24, $25, $26, $27, $28, $29
+             )",
+            &[
+                &decision.decision_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &trace_id,
+                &session_id,
+                &request_id,
+                &request.subject,
+                &request.project,
+                &request.provider,
+                &request.model,
+                &estimated_tokens,
+                &request.estimated_cost_usd,
+                &outcome,
+                &action,
+                &explanations_val,
+                &metadata_val,
+                &entities_val,
+                &routing.selected_budget_id,
+                &routing.matched_entity,
+                &routing.selection_reason,
+                &routing.rejected_budget_id,
+                &routing.rejected_budget_reason,
+                &routing.model_check,
+                &routing.budget_window_remaining_usd,
+                &routing_val,
+                &limit_hits_val,
+                &tool_calls,
+                &agent_steps,
+                &retries,
+                &app_run_key,
+                &created_at_str,
+            ],
+        ).await?;
+
+        // Insert reservation and related rows if present.
+        if let Some(reservation) = &decision.reservation {
+            let stored = &snap.stored;
+            let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
+            let limit_window_spends_json = serde_json::to_string(&stored.limit_window_spends)?;
+            let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
+
+            let res_status = reservation_status_text(reservation.status);
+            let res_created_at = reservation.created_at.to_rfc3339();
+            let res_expires_at = reservation.expires_at.to_rfc3339();
+            let budget_rule_ids_val: serde_json::Value = serde_json::to_value(&stored.budget_rule_ids)?;
+            let limit_window_spends_val: serde_json::Value = serde_json::to_value(&stored.limit_window_spends)?;
+            let allocation_spends_val: serde_json::Value = serde_json::to_value(&stored.allocation_spends)?;
+            client.execute(
+                "INSERT INTO reservations (
+                     id, decision_id, amount_usd, estimated_amount_usd, currency, status,
+                     created_at, expires_at, budget_rule_ids_json, limit_window_spends_json,
+                     allocation_spends_json
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &reservation.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &decision.decision_id,
+                    &reservation.amount_usd,
+                    &reservation.amount_usd,
+                    &reservation.currency,
+                    &res_status,
+                    &res_created_at,
+                    &res_expires_at,
+                    &budget_rule_ids_val,
+                    &limit_window_spends_val,
+                    &allocation_spends_val,
+                ],
+            ).await?;
+
+            for spend in &stored.limit_window_spends {
+                client.execute(
+                    "INSERT INTO reservation_limit_scopes
+                         (reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[
+                        &reservation.id,
+                        &spend.rule_id,
+                        &spend.limit_id,
+                        &spend.scope_key,
+                        &reservation.amount_usd,
+                        &res_created_at,
+                    ],
+                ).await?;
+
+                let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
+                client.execute(
+                    "INSERT INTO rolling_spend_buckets
+                         (rule_id, limit_id, scope_key, bucket_start, amount_usd)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (rule_id, limit_id, scope_key, bucket_start)
+                     DO UPDATE SET amount_usd = rolling_spend_buckets.amount_usd + EXCLUDED.amount_usd",
+                    &[
+                        &spend.rule_id,
+                        &spend.limit_id,
+                        &spend.scope_key,
+                        &bucket_start,
+                        &reservation.amount_usd,
+                    ],
+                ).await?;
+            }
+        }
+
+        // Upsert limit windows — done last to minimize the hold time on the shared row lock.
+        // With ON CONFLICT DO UPDATE, PG takes a row-level lock; keeping these at the end
+        // reduces serialization pressure when concurrent transactions target the same scope.
+        for ((rule_id, limit_id, scope_key), w) in &snap.limit_windows {
+            let lw_started_at = w.started_at.to_rfc3339();
+            client.execute(
+                "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
+                     started_at = EXCLUDED.started_at,
+                     used_usd = EXCLUDED.used_usd",
+                &[rule_id, limit_id, scope_key, &lw_started_at, &w.used_usd],
+            ).await?;
+        }
+
+        // Upsert allocation buckets — similarly last.
+        for ((rule_id, entity_key), b) in &snap.allocation_buckets {
+            let bucket_started_at = b.started_at.to_rfc3339();
+            client.execute(
+                "INSERT INTO budget_allocation_buckets
+                     (rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (rule_id, entity_key) DO UPDATE SET
+                     started_at = EXCLUDED.started_at,
+                     protected_amount_usd = EXCLUDED.protected_amount_usd,
+                     current_grant_usd = EXCLUDED.current_grant_usd,
+                     carryover_usd = EXCLUDED.carryover_usd",
+                &[
+                    rule_id,
+                    entity_key,
+                    &bucket_started_at,
+                    &b.protected_amount_usd,
+                    &b.current_grant_usd,
+                    &b.carryover_usd,
+                ],
+            ).await?;
+        }
+
+        client.batch_execute("COMMIT").await?;
+        Ok(())
+    }
+
+    async fn persist_finalize_writes(
+        &self,
+        reservation: Reservation,
+        payload: FinalizeReservation,
+        lw_snapshot: Vec<((String, String, String), WindowState)>,
+    ) -> Result<(), NoetError> {
+        let client = self.pool.get().await?;
+        client.batch_execute("BEGIN").await?;
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let status_str = reservation_status_text(reservation.status);
+
+        if let Some(usage) = &payload.usage {
+            // Single CTE eliminates the mid-transaction SELECT for trace_id.
+            let metadata_val: serde_json::Value = serde_json::to_value(&payload.metadata)?;
+            let input_tokens: Option<i64> = usage.input_tokens.map(|v| v as i64);
+            let output_tokens: Option<i64> = usage.output_tokens.map(|v| v as i64);
+            let total_tokens: Option<i64> = usage.total_tokens.map(|v| v as i64);
+            let cost_usd: Option<f64> = usage.cost_usd.or(Some(reservation.amount_usd));
+            let latency_ms: Option<i64> = usage.latency_ms.map(|v| v as i64);
+            let obs_id = Uuid::new_v4().to_string();
+
+            client.execute(
+                "WITH upd AS (
+                     UPDATE reservations
+                     SET amount_usd = $2, actual_amount_usd = $2, status = $3, finalized_at = $4
+                     WHERE id = $1
+                     RETURNING decision_id
+                 )
+                 INSERT INTO usage_observations (
+                     id, reservation_id, trace_id, provider, model,
+                     input_tokens, output_tokens, total_tokens, cost_usd, latency_ms,
+                     stop_reason, source, metadata_json, created_at
+                 )
+                 SELECT $5, $1, d.trace_id, $6, $7, $8, $9, $10, $11, $12, $13,
+                        'reservation.finalize', $14, $4
+                 FROM upd
+                 JOIN decisions d ON d.decision_id = upd.decision_id",
+                &[
+                    &reservation.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &reservation.amount_usd,
+                    &status_str,
+                    &now_str,
+                    &obs_id,
+                    &usage.provider,
+                    &usage.model,
+                    &input_tokens,
+                    &output_tokens,
+                    &total_tokens,
+                    &cost_usd,
+                    &latency_ms,
+                    &usage.stop_reason,
+                    &metadata_val,
+                ],
+            ).await?;
+        } else {
+            client.execute(
+                "UPDATE reservations
+                 SET amount_usd = $2, actual_amount_usd = $2, status = $3, finalized_at = $4
+                 WHERE id = $1",
+                &[
+                    &reservation.id,
+                    &reservation.amount_usd,
+                    &status_str,
+                    &now_str,
+                ],
+            ).await?;
+        }
+
+        // Upsert changed limit windows.
+        for ((rule_id, limit_id, scope_key), w) in &lw_snapshot {
+            let lw_started_at = w.started_at.to_rfc3339();
+            client.execute(
+                "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
+                     started_at = EXCLUDED.started_at,
+                     used_usd = EXCLUDED.used_usd",
+                &[rule_id, limit_id, scope_key, &lw_started_at, &w.used_usd],
+            ).await?;
+        }
+
+        client.batch_execute("COMMIT").await?;
+        Ok(())
+    }
+
+    async fn persist_event_write(&self, event: TraceEvent) -> Result<(), NoetError> {
+        let client = self.pool.get().await?;
+        let occurred_at_str = event.occurred_at.unwrap_or_else(Utc::now).to_rfc3339();
+        let source = event
+            .payload
+            .as_object()
+            .and_then(|p| p.get("source"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let id = event.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        let payload_val = event.payload.clone();
+
+        // Single auto-committed statement — no explicit transaction needed.
+        client.execute(
+            "INSERT INTO events (id, trace_id, kind, occurred_at, source, payload_json)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &event.trace_id,
+                &event.kind,
+                &occurred_at_str,
+                &source,
+                &payload_val,
+            ],
+        ).await?;
+        Ok(())
     }
 }
 
