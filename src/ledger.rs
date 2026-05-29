@@ -369,6 +369,21 @@ impl BudgetLedger {
         Ok(ledger)
     }
 
+    /// Wrap an existing connection for read-only reporting. Does not init schema or load
+    /// in-memory state — the caller owns the connection lifecycle.
+    pub(crate) fn read_only(conn: Connection) -> Self {
+        Self {
+            conn: Some(conn),
+            ..Self::default()
+        }
+    }
+
+    /// Reclaim the connection from a `read_only` instance so the caller can return it to
+    /// the mutex it came from.
+    pub(crate) fn take_conn(self) -> Option<Connection> {
+        self.conn
+    }
+
     pub fn authorize(
         &mut self,
         policy: Option<&PolicyFile>,

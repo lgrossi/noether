@@ -594,16 +594,40 @@ impl AppState {
         self.policy.update_source(source).await
     }
 
-    async fn read_ledger<T>(
+    async fn read_ledger<T: Send + 'static>(
         &self,
-        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError>,
+        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
     ) -> Result<T, NoetError> {
-        if let Some(db_path) = &self.db_path {
-            let ledger = BudgetLedger::open_sqlite(db_path)?;
-            return read(&ledger);
+        // db_path is Some: open a fresh read-only connection via spawn_blocking.
+        // SQLite WAL allows concurrent readers — we never hold ConnMutex here, so
+        // reporting calls (including the background replay job) do not serialize against
+        // live authorize/finalize persist calls on L2.
+        if let Some(db_path) = self.db_path.clone() {
+            return tokio::task::spawn_blocking(move || {
+                let ledger = BudgetLedger::open_sqlite(&db_path)?;
+                read(&ledger)
+            })
+            .await
+            .map_err(|e| NoetError::Database(e.to_string()))?;
         }
-        let ledger = self.ledger.lock().await;
-        read(&ledger)
+        // db_path is None (in-memory / test mode): acquire ConnMutex inside spawn_blocking.
+        // Take the connection from the mutex, run the read closure with a read_only
+        // BudgetLedger (reporting methods return empty data if conn is None, preserving
+        // backward compat with tests that never set a connection), then return the connection.
+        let conn_mutex = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn_mutex.lock().expect("conn mutex poisoned");
+            let conn = guard.take();
+            let ledger = match conn {
+                Some(conn) => BudgetLedger::read_only(conn),
+                None => BudgetLedger::default(),
+            };
+            let result = read(&ledger);
+            *guard = ledger.take_conn();
+            result
+        })
+        .await
+        .map_err(|e| NoetError::Database(e.to_string()))?
     }
 }
 
@@ -973,7 +997,7 @@ async fn report_trace(
     AxumPath(trace_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             Ok(Json(serde_json::to_value(reporting::trace_report(
                 ledger, &trace_id,
             )?)?))
@@ -986,7 +1010,7 @@ async fn report_observations(
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             Ok(Json(serde_json::to_value(reporting::observations_report(
                 ledger,
                 query.kind.as_deref(),
@@ -1157,7 +1181,7 @@ async fn app_runs(
     let limit = query.limit.clamp(1, 250);
     let offset = query.offset;
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             if app_runs_query_is_unfiltered(&query) {
                 let decisions = ledger.decisions_report_for_run_page(limit, offset)?;
                 let agent_run_ids = app_agent_run_ids_from_decisions(&decisions);
@@ -1221,7 +1245,7 @@ async fn app_run_detail(
     AxumPath(run_id): AxumPath<String>,
 ) -> Result<Json<AppRunRow>, NoetError> {
     state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let decisions = reporting::decisions_report(ledger)?;
             let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
             let mut run = app_agent_runs(&decisions, &usage_by_agent_run)
@@ -1256,7 +1280,7 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         .unwrap_or_default();
     if !has_proposed_policy {
         let baseline = state
-            .read_ledger(|ledger| {
+            .read_ledger(move |ledger| {
                 Ok(app_run_totals_from_report(
                     ledger.run_totals_report_since(Some(history_window_start))?,
                 ))
@@ -1273,7 +1297,7 @@ async fn app_replay(State(state): State<AppState>) -> Result<Json<AppReplayRespo
         }));
     }
     let (total_requests, historical_requests, usage_by_agent_run, baseline, spend_seeds) = state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let total_requests =
                 ledger.historical_authorize_request_count_since(Some(history_window_start))?;
             let historical_requests = ledger.latest_historical_authorize_requests_since(
@@ -1438,7 +1462,7 @@ async fn app_replay_full_month_response(state: AppState) -> Result<AppReplayResp
         .transpose()?
         .unwrap_or_default();
     let (total_requests, historical_requests, usage_by_agent_run, baseline) = state
-        .read_ledger(|ledger| {
+        .read_ledger(move |ledger| {
             let total_requests =
                 ledger.historical_authorize_request_count_since(Some(history_window_start))?;
             let historical_requests =
@@ -4600,11 +4624,14 @@ budgets:
     #[tokio::test]
     async fn noether_app_replay_reevaluates_historical_requests_against_draft_policy() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4719,11 +4746,14 @@ budgets:
     #[tokio::test]
     async fn noether_app_full_replay_job_completes_full_month_replay() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4796,11 +4826,14 @@ budgets:
     #[tokio::test]
     async fn noether_app_replay_keeps_unchanged_history_empty() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         std::fs::write(
             &state.policy_proposal_path,
@@ -4893,11 +4926,14 @@ budgets:
     #[tokio::test]
     async fn noether_app_replay_reports_static_history_window() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
 
         let app = build_router(state);
         let response = app
@@ -5036,11 +5072,14 @@ budgets:
     #[tokio::test]
     async fn noether_app_run_detail_returns_agent_run_for_changed_run_links() {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
         {
             let mut ledger = state.ledger.lock().await;
             let mut request = report_request("trace-detail", "req-detail", "gpt-4.1", 0.75);
@@ -5128,10 +5167,13 @@ budgets:
             Some(model_locked_policy()),
             DecisionMode::DryRun,
         );
+        let db_path = tempdir.path().join("noether.sqlite");
         state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
-                .expect("sqlite ledger"),
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         {
             let mut ledger = state.ledger.lock().await;
