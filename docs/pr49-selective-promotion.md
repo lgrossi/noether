@@ -12,7 +12,7 @@ Context: PR #48 already merged PostgreSQL ledger support into `main`. PR #49 is 
 | --- | --- | --- | --- | --- |
 | Server parity tests | Run the same endpoint behavior against SQLite and Postgres | High confidence that both backends preserve auth/finalize/event/report basics | Low if adapted to current `LedgerBackend` instead of importing PR #49 `Backend` | Promoted in this branch |
 | Test Postgres isolation | Per-test schema with `search_path` | Avoids test data collision in shared live PG database | Low; same pattern already exists in current server tests | Promoted in this branch |
-| Backend abstraction (`src/backend.rs`) | Large pluggable storage abstraction plus split hot state | Could reduce server branching long term | High; duplicates or bypasses #48 advisory lock/reload/async-finalize semantics | Do not promote as-is |
+| Backend abstraction (`src/backend.rs`) | Large pluggable storage abstraction plus split hot state | Could reduce server branching long term | High; duplicates or bypasses #48 advisory lock/reload/async-finalize semantics | Do not promote as-is; promote only a narrow explicit backend marker |
 | Hot-path rewrite | Local hot-state first, persisted writes via backend dispatch | Potential latency win | High; #48 deliberately reloads shared DB state and uses advisory transaction locks for multi-instance correctness | Defer to a correctness-first design |
 | `tokio::try_join!` pipelining | Parallelize independent PG writes | Possible latency reduction | Medium; must preserve transaction/advisory-lock boundaries and failure atomicity | Benchmark/design separately |
 | `UNNEST`/batch inserts | Reduce PG round trips for batch writes | Possible seed/report performance win | Medium; useful mainly for bulk seed or non-hot paths | Benchmark separately |
@@ -41,11 +41,16 @@ The tests cover:
 
 Postgres parity runs only when `NOET_TEST_POSTGRES_URL` is set. Otherwise the same tests run SQLite and print a skip line for the Postgres half.
 
+This branch also replaces `BudgetLedger` backend dispatch based on optional
+connection presence with an explicit selected-store marker. SQLite and Postgres
+remain supported; the ledger no longer chooses behavior by asking whether
+`conn` or `pg_conn` happens to be populated.
+
 ## Current recommendation
 
 Promote #49 in small follow-up PRs only:
 
 1. parity tests (this branch),
 2. direct DB-layer benchmark rebuilt against current main APIs,
-3. optional backend abstraction only after a design that preserves #48 advisory-lock/shared-state semantics,
+3. larger backend abstraction only after a design that preserves #48 advisory-lock/shared-state semantics,
 4. hot-path optimizations only with SQLite and Postgres benchmark evidence plus multi-instance correctness tests.

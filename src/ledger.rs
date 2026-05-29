@@ -45,11 +45,26 @@ pub struct BudgetLedger {
     last_selected_budget_id: Option<String>,
     last_limit_hits: Vec<DecisionLimitHitReport>,
     events: Vec<TraceEvent>,
+    store_kind: LedgerStoreKind,
     conn: Option<Connection>,
     pg_conn: Option<Arc<SyncPostgresClient>>,
 }
 
 const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LedgerStoreKind {
+    #[default]
+    InMemory,
+    Sqlite,
+    Postgres,
+}
+
+enum ActiveLedgerStore<'a> {
+    InMemory,
+    Sqlite(&'a Connection),
+    Postgres(&'a Arc<SyncPostgresClient>),
+}
 
 #[derive(Clone, Default)]
 struct LedgerPersistenceSnapshot {
@@ -100,6 +115,7 @@ impl LedgerPersistenceSnapshot {
                     last_selected_budget_id: self.selected_budget_id.clone(),
                     last_limit_hits: self.limit_hits.clone(),
                     events: Vec::new(),
+                    store_kind: LedgerStoreKind::InMemory,
                     conn: None,
                     pg_conn: None,
                 };
@@ -1081,6 +1097,22 @@ impl AsyncPostgresLedger {
 }
 
 impl BudgetLedger {
+    fn active_store(&self) -> ActiveLedgerStore<'_> {
+        match self.store_kind {
+            LedgerStoreKind::InMemory => ActiveLedgerStore::InMemory,
+            LedgerStoreKind::Sqlite => ActiveLedgerStore::Sqlite(
+                self.conn
+                    .as_ref()
+                    .expect("sqlite ledger store missing connection"),
+            ),
+            LedgerStoreKind::Postgres => ActiveLedgerStore::Postgres(
+                self.pg_conn
+                    .as_ref()
+                    .expect("postgres ledger store missing connection"),
+            ),
+        }
+    }
+
     fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
         LedgerPersistenceSnapshot {
             limit_windows: self.limit_windows.clone(),
@@ -1104,6 +1136,7 @@ impl BudgetLedger {
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         init_schema(&conn)?;
         let mut ledger = Self::default();
+        ledger.store_kind = LedgerStoreKind::Sqlite;
         ledger.conn = Some(conn);
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
@@ -1122,6 +1155,7 @@ impl BudgetLedger {
         };
         init_postgres_schema(&mut pg_conn)?;
         let mut ledger = Self::default();
+        ledger.store_kind = LedgerStoreKind::Postgres;
         ledger.pg_conn = Some(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn))));
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
@@ -1179,10 +1213,10 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
-        if self.pg_conn.is_some() {
-            self.load_advisory_cadence_postgres()?;
-        } else if self.conn.is_some() {
-            self.load_advisory_cadence_sqlite()?;
+        match self.active_store() {
+            ActiveLedgerStore::Postgres(_) => self.load_advisory_cadence_postgres()?,
+            ActiveLedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite()?,
+            ActiveLedgerStore::InMemory => {}
         }
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
@@ -1409,7 +1443,7 @@ impl BudgetLedger {
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
@@ -1473,7 +1507,7 @@ impl BudgetLedger {
                 protected_adoption: protected_adoption_report_postgres(pg_conn)?,
             });
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(UsageReport {
                 total_cost_usd: 0.0,
                 rows: Vec::new(),
@@ -1537,7 +1571,7 @@ impl BudgetLedger {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 WITH run_page AS (
@@ -1564,7 +1598,7 @@ impl BudgetLedger {
                 .map(decision_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
@@ -1603,7 +1637,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<RunTotalsReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let since = since.map(|since| since.to_rfc3339());
             let mut totals = RunTotalsReport {
@@ -1690,7 +1724,7 @@ impl BudgetLedger {
             totals.spend_usd = row.get(1);
             return Ok(totals);
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(RunTotalsReport::default());
         };
         let since = since.map(|since| since.to_rfc3339());
@@ -1798,7 +1832,7 @@ impl BudgetLedger {
     }
 
     pub fn rule_stats_report(&self) -> Result<Vec<RuleStatsReport>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut stats = HashMap::<String, RuleStatsReport>::new();
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let rows = pg.query(
@@ -1883,7 +1917,7 @@ impl BudgetLedger {
             stats.sort_by(|left, right| left.rule.cmp(&right.rule));
             return Ok(stats);
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut stats = HashMap::<String, RuleStatsReport>::new();
@@ -1978,7 +2012,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut sql = "
                 SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
                        action,
@@ -2007,7 +2041,7 @@ impl BudgetLedger {
                 .map(decision_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2045,7 +2079,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut sql = "
                 SELECT created_at, decision_id, outcome, metadata_json, entities_json, subject, project,
                        provider, model, estimated_tokens, estimated_cost_usd, metadata_json
@@ -2070,7 +2104,7 @@ impl BudgetLedger {
                 .map(historical_authorize_request_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2126,7 +2160,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<usize, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let count: i64 = if let Some(since) = since {
                 pg_conn.0.lock().expect("postgres mutex").query_one(
                     "SELECT COUNT(*)::BIGINT FROM decisions WHERE created_at >= $1",
@@ -2142,7 +2176,7 @@ impl BudgetLedger {
             .get(0);
             return Ok(count.max(0) as usize);
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(0);
         };
         let count = if let Some(since) = since {
@@ -2164,7 +2198,7 @@ impl BudgetLedger {
         since: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -2202,7 +2236,7 @@ impl BudgetLedger {
                 .map(historical_authorize_request_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         if limit == 0 {
@@ -2246,7 +2280,7 @@ impl BudgetLedger {
         since: DateTime<Utc>,
         before: DateTime<Utc>,
     ) -> Result<Vec<SpendScopeTotal>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT scope_key, COALESCE(SUM(amount_usd), 0)::DOUBLE PRECISION
@@ -2273,7 +2307,7 @@ impl BudgetLedger {
                 })
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
@@ -2309,7 +2343,7 @@ impl BudgetLedger {
         &self,
         agent_run_ids: &[String],
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             if agent_run_ids.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2358,7 +2392,7 @@ impl BudgetLedger {
                 .map(usage_activity_record_from_postgres_row)
                 .collect());
         }
-        if self.conn.is_none() {
+        if !matches!(self.active_store(), ActiveLedgerStore::Sqlite(_)) {
             return Ok(Vec::new());
         }
         if agent_run_ids.is_empty() {
@@ -2397,7 +2431,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut sql = "
                 SELECT u.created_at, COALESCE(u.trace_id, d.trace_id), d.subject, d.project,
                        COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
@@ -2440,7 +2474,7 @@ impl BudgetLedger {
                 .map(usage_activity_record_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2479,7 +2513,7 @@ impl BudgetLedger {
         sql: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(sql)?;
@@ -2493,7 +2527,7 @@ impl BudgetLedger {
         kind_prefix: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut sql = "SELECT occurred_at, kind, payload_json, trace_id FROM events".to_owned();
             let mut clauses = Vec::new();
             if kind_prefix.is_some() {
@@ -2535,7 +2569,7 @@ impl BudgetLedger {
                 .map(event_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(Vec::new());
         };
         let mut sql = "SELECT occurred_at, kind, payload_json, trace_id FROM events".to_owned();
@@ -2589,7 +2623,7 @@ impl BudgetLedger {
     }
 
     pub fn trace_report(&self, trace_id: &str) -> Result<TraceReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let mut items = Vec::new();
             let decisions = pg.query(
@@ -2685,7 +2719,7 @@ impl BudgetLedger {
                 items,
             });
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(TraceReport {
                 trace_id: trace_id.to_owned(),
                 items: Vec::new(),
@@ -3249,20 +3283,24 @@ impl BudgetLedger {
         selected_budget_id: Option<&str>,
         limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
-        if self.pg_conn.is_some() {
-            let result = self.persist_decision_postgres(
-                policy,
-                request,
-                decision,
-                selected_budget_id,
-                limit_hits,
-            );
-            if result.is_ok() {
-                self.pending_advisory_cadence.clear();
+        match self.active_store() {
+            ActiveLedgerStore::Postgres(_) => {
+                let result = self.persist_decision_postgres(
+                    policy,
+                    request,
+                    decision,
+                    selected_budget_id,
+                    limit_hits,
+                );
+                if result.is_ok() {
+                    self.pending_advisory_cadence.clear();
+                }
+                return result;
             }
-            return result;
+            ActiveLedgerStore::Sqlite(_) => {}
+            ActiveLedgerStore::InMemory => return Ok(()),
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(());
         };
         let trace_id = string_metadata(request, "trace_id");
@@ -3423,7 +3461,7 @@ impl BudgetLedger {
         selected_budget_id: Option<&str>,
         limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() else {
             return Ok(());
         };
         let trace_id = string_metadata(request, "trace_id");
@@ -3665,7 +3703,7 @@ impl BudgetLedger {
         &self,
         trace_id: &str,
     ) -> Result<Option<Vec<TraceReportItem>>, NoetError> {
-        let config = if let Some(pg_conn) = &self.pg_conn {
+        let config = if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             pg_conn
                 .0
                 .lock()
@@ -3692,7 +3730,7 @@ impl BudgetLedger {
                     )
                 })
         } else {
-            let Some(conn) = &self.conn else {
+            let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
                 return Ok(None);
             };
             conn.query_row(
@@ -3783,7 +3821,7 @@ impl BudgetLedger {
     }
 
     fn event_count_for_trace(&self, trace_id: &str, kind: &str) -> Result<u64, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let count: i64 = pg_conn
                 .0
                 .lock()
@@ -3799,7 +3837,7 @@ impl BudgetLedger {
                 .get(0);
             return Ok(count.max(0) as u64);
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(0);
         };
         conn.query_row(
@@ -3819,10 +3857,14 @@ impl BudgetLedger {
         reservation: &Reservation,
         payload: &FinalizeReservation,
     ) -> Result<(), NoetError> {
-        if self.pg_conn.is_some() {
-            return self.persist_finalization_postgres(reservation, payload);
+        match self.active_store() {
+            ActiveLedgerStore::Postgres(_) => {
+                return self.persist_finalization_postgres(reservation, payload);
+            }
+            ActiveLedgerStore::Sqlite(_) => {}
+            ActiveLedgerStore::InMemory => return Ok(()),
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(());
         };
         let now = Utc::now();
@@ -3889,7 +3931,7 @@ impl BudgetLedger {
         reservation: &Reservation,
         payload: &FinalizeReservation,
     ) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() else {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
@@ -3958,7 +4000,7 @@ impl BudgetLedger {
     }
 
     fn persist_event(&self, event: &TraceEvent) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
             let source = event
                 .payload
@@ -3987,7 +4029,7 @@ impl BudgetLedger {
             )?;
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(());
         };
         let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
@@ -4022,7 +4064,7 @@ impl BudgetLedger {
     }
 
     fn persist_limit_windows(&self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
                 pg.execute(
@@ -4044,7 +4086,7 @@ impl BudgetLedger {
             }
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(());
         };
         for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
@@ -4069,7 +4111,7 @@ impl BudgetLedger {
     }
 
     fn persist_allocation_buckets(&self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
                 pg.execute(
@@ -4095,7 +4137,7 @@ impl BudgetLedger {
             }
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let ActiveLedgerStore::Sqlite(conn) = self.active_store() else {
             return Ok(());
         };
         for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
@@ -4128,7 +4170,7 @@ impl BudgetLedger {
     }
 
     fn load_limit_windows(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT rule_id, limit_id, scope_key, started_at, used_usd
@@ -4150,9 +4192,13 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        if self.store_kind != LedgerStoreKind::Sqlite {
             return Ok(());
         };
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("sqlite ledger store missing connection");
         let mut stmt = conn.prepare(
             "
             SELECT rule_id, limit_id, scope_key, started_at, used_usd
@@ -4175,7 +4221,7 @@ impl BudgetLedger {
     }
 
     fn load_allocation_buckets(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
@@ -4202,9 +4248,13 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        if self.store_kind != LedgerStoreKind::Sqlite {
             return Ok(());
         };
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("sqlite ledger store missing connection");
         let mut stmt = conn.prepare(
             "
             SELECT rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
@@ -4232,9 +4282,13 @@ impl BudgetLedger {
     }
 
     fn load_advisory_cadence_sqlite(&mut self) -> Result<(), NoetError> {
-        let Some(conn) = &self.conn else {
+        if self.store_kind != LedgerStoreKind::Sqlite {
             return Ok(());
         };
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("sqlite ledger store missing connection");
         let mut stmt = conn.prepare(
             "
             SELECT user_key, advisory_key, scope_key, last_shown_at
@@ -4254,7 +4308,7 @@ impl BudgetLedger {
     }
 
     fn load_advisory_cadence_postgres(&mut self) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() else {
             return Ok(());
         };
         let rows = pg_conn.0.lock().expect("postgres mutex").query(
@@ -4277,7 +4331,7 @@ impl BudgetLedger {
     }
 
     fn load_active_reservations(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let ActiveLedgerStore::Postgres(pg_conn) = self.active_store() {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT id, amount_usd, estimated_amount_usd, currency, status, created_at, expires_at,
@@ -4319,9 +4373,13 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        if self.store_kind != LedgerStoreKind::Sqlite {
             return Ok(());
         };
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("sqlite ledger store missing connection");
         let mut stmt = conn.prepare(
             "
             SELECT id, amount_usd, estimated_amount_usd, currency, status, created_at, expires_at,
@@ -7256,47 +7314,49 @@ fn recent_spend_usd(
     since: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> f64 {
-    if let Some(pg_conn) = &ledger.pg_conn {
-        let bucket_since = rolling_bucket_start(since).to_rfc3339();
-        let bucket_now = rolling_bucket_start(now).to_rfc3339();
-        let value = pg_conn.0.lock().expect("postgres mutex").query_one(
-            "
-            SELECT COALESCE(SUM(amount_usd), 0)
-            FROM rolling_spend_buckets
-            WHERE rule_id = $1
-              AND limit_id = $2
-              AND scope_key = $3
-              AND bucket_start >= $4
-              AND bucket_start <= $5
-            ",
-            &[&rule_id, &limit_id, &scope_key, &bucket_since, &bucket_now],
-        );
-        return value.map(|row| row.get::<_, f64>(0)).unwrap_or(0.0);
-    }
-
-    if let Some(conn) = &ledger.conn {
-        let bucket_since = rolling_bucket_start(since);
-        let bucket_now = rolling_bucket_start(now);
-        let value = conn.query_row(
-            "
-            SELECT COALESCE(SUM(amount_usd), 0)
-            FROM rolling_spend_buckets
-            WHERE rule_id = ?1
-              AND limit_id = ?2
-              AND scope_key = ?3
-              AND bucket_start >= ?4
-              AND bucket_start <= ?5
-            ",
-            params![
-                rule_id,
-                limit_id,
-                scope_key,
-                bucket_since.to_rfc3339(),
-                bucket_now.to_rfc3339()
-            ],
-            |row| row.get::<_, f64>(0),
-        );
-        return value.unwrap_or(0.0);
+    match ledger.active_store() {
+        ActiveLedgerStore::Postgres(pg_conn) => {
+            let bucket_since = rolling_bucket_start(since).to_rfc3339();
+            let bucket_now = rolling_bucket_start(now).to_rfc3339();
+            let value = pg_conn.0.lock().expect("postgres mutex").query_one(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = $1
+                  AND limit_id = $2
+                  AND scope_key = $3
+                  AND bucket_start >= $4
+                  AND bucket_start <= $5
+                ",
+                &[&rule_id, &limit_id, &scope_key, &bucket_since, &bucket_now],
+            );
+            return value.map(|row| row.get::<_, f64>(0)).unwrap_or(0.0);
+        }
+        ActiveLedgerStore::Sqlite(conn) => {
+            let bucket_since = rolling_bucket_start(since);
+            let bucket_now = rolling_bucket_start(now);
+            let value = conn.query_row(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = ?1
+                  AND limit_id = ?2
+                  AND scope_key = ?3
+                  AND bucket_start >= ?4
+                  AND bucket_start <= ?5
+                ",
+                params![
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    bucket_since.to_rfc3339(),
+                    bucket_now.to_rfc3339()
+                ],
+                |row| row.get::<_, f64>(0),
+            );
+            return value.unwrap_or(0.0);
+        }
+        ActiveLedgerStore::InMemory => {}
     }
 
     if !ledger.rolling_spend_buckets.is_empty() {
