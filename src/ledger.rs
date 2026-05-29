@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_postgres::{
-    Client as AsyncPostgresClient, GenericClient, NoTls as AsyncNoTls, Statement,
+    Client as AsyncPostgresClient, GenericClient, NoTls as AsyncNoTls, Row as AsyncPostgresRow,
+    Statement,
 };
 use uuid::Uuid;
 
@@ -37,6 +38,7 @@ pub struct BudgetLedger {
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     // TODO(psql): replace this process-local cadence stub with durable per-user advisory state.
     advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
+    rolling_spend_buckets: HashMap<(String, String, String, DateTime<Utc>), f64>,
     reservations: HashMap<String, StoredReservation>,
     last_selected_budget_id: Option<String>,
     last_limit_hits: Vec<DecisionLimitHitReport>,
@@ -87,6 +89,8 @@ impl LedgerPersistenceSnapshot {
                 let ledger = BudgetLedger {
                     limit_windows: self.limit_windows.clone(),
                     allocation_buckets: self.allocation_buckets.clone(),
+                    advisory_cadence: HashMap::new(),
+                    rolling_spend_buckets: HashMap::new(),
                     reservations: self.reservations.clone(),
                     last_selected_budget_id: self.selected_budget_id.clone(),
                     last_limit_hits: self.limit_hits.clone(),
@@ -94,9 +98,13 @@ impl LedgerPersistenceSnapshot {
                     conn: None,
                     pg_conn: None,
                 };
-                if let Some(projection) =
-                    biggest_spend_window_projection(&ledger, rule, request, 0.0, decision.created_at)
-                {
+                if let Some(projection) = biggest_spend_window_projection(
+                    &ledger,
+                    rule,
+                    request,
+                    0.0,
+                    decision.created_at,
+                ) {
                     fields.budget_window_remaining_usd =
                         Some((projection.max_usd - projection.projected_spend_usd).max(0.0));
                     fields.budget_window_mode = Some(match projection.limit_mode {
@@ -464,7 +472,7 @@ struct AsyncPostgresStatements {
 
 struct AsyncPostgresConnection {
     client: AsyncPostgresClient,
-    statements: AsyncPostgresStatements,
+    statements: Arc<AsyncPostgresStatements>,
 }
 
 struct AsyncPostgresPool {
@@ -709,7 +717,7 @@ async fn connect_async_postgres_connection(
     let statements = prepare_async_postgres_statements(&client).await?;
     Ok(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
         client,
-        statements,
+        statements: Arc::new(statements),
     })))
 }
 
@@ -734,19 +742,24 @@ async fn run_async_postgres_finalize_worker(
     while let Some(write) = rx.recv().await {
         let mut last_error = None;
         for attempt in 1..=3 {
-            let connection = connection.lock().await;
+            let mut connection = connection.lock().await;
+            let statements = connection.statements.clone();
             let result = async {
+                let tx = connection.client.transaction().await?;
+                tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
+                    .await?;
                 let persisted_limit_window = persist_finalization_async(
-                    &connection.client,
-                    &connection.statements,
+                    &tx,
+                    &statements,
                     &write.reservation,
                     &write.payload,
                     &write.snapshot,
                 )
                 .await?;
                 if !persisted_limit_window {
-                    persist_limit_windows_async(&connection.client, &write.snapshot).await?;
+                    persist_limit_windows_async(&tx, &write.snapshot).await?;
                 }
+                tx.commit().await?;
                 Ok::<_, NoetError>(())
             }
             .await;
@@ -797,10 +810,11 @@ impl AsyncPostgresLedger {
         let mut ledger = BudgetLedger::default();
         load_limit_windows_async(&client, &mut ledger).await?;
         load_allocation_buckets_async(&client, &mut ledger).await?;
+        load_rolling_spend_buckets_async(&client, &mut ledger).await?;
         load_active_reservations_async(&client, &mut ledger).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
-            statements,
+            statements: Arc::new(statements),
         })));
         for _ in 1..pool_size {
             connections
@@ -860,6 +874,7 @@ impl AsyncPostgresLedger {
             .await?;
         load_limit_windows_async(&tx, &mut ledger).await?;
         load_allocation_buckets_async(&tx, &mut ledger).await?;
+        load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
         load_active_reservations_async(&tx, &mut ledger).await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
@@ -884,19 +899,57 @@ impl AsyncPostgresLedger {
         payload: FinalizeReservation,
     ) -> Result<Reservation, NoetError> {
         let started = Instant::now();
-        let (reservation, snapshot) = {
+        let finalize_tx = self.finalize_tx.as_ref().cloned();
+        let (reservation, write, decision_elapsed) = {
             let mut ledger = self.ledger.lock().await;
+            let connection = self.pool.connection();
+            let mut connection = connection.lock().await;
+            let statements = connection.statements.clone();
+            let tx = connection.client.transaction().await?;
+            tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
+                .await?;
+            load_limit_windows_async(&tx, &mut ledger).await?;
+            load_allocation_buckets_async(&tx, &mut ledger).await?;
+            load_rolling_spend_buckets_async(&tx, &mut ledger).await?;
+            load_active_reservations_async(&tx, &mut ledger).await?;
+            if !ledger.reservations.contains_key(&reservation_id) {
+                load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
+            }
+            let already_finalized = ledger
+                .reservations
+                .get(&reservation_id)
+                .map(|stored| stored.reservation.status == ReservationStatus::Finalized)
+                .unwrap_or(false);
             let reservation = ledger.finalize(&reservation_id, &payload)?;
+            if already_finalized {
+                tx.commit().await?;
+                return Ok(reservation);
+            }
             let snapshot = ledger.persistence_snapshot();
-            (reservation, snapshot)
-        };
-        let decision_elapsed = started.elapsed();
-        if let Some(finalize_tx) = &self.finalize_tx {
+            let decision_elapsed = started.elapsed();
             let write = AsyncFinalizeWrite {
                 reservation: reservation.clone(),
                 payload,
                 snapshot,
             };
+            if finalize_tx.is_none() {
+                let db_started = Instant::now();
+                persist_finalization_write_async(&tx, &statements, &write).await?;
+                tx.commit().await?;
+                if self.stage_timing {
+                    tracing::debug!(
+                        decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
+                        db_ms = db_started.elapsed().as_secs_f64() * 1000.0,
+                        total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "postgres finalize stages"
+                    );
+                }
+                return Ok(reservation);
+            }
+            tx.commit().await?;
+            (reservation, write, decision_elapsed)
+        };
+        if let Some(finalize_tx) = finalize_tx {
             match finalize_tx.try_send(write) {
                 Ok(()) => {
                     if self.stage_timing {
@@ -924,11 +977,6 @@ impl AsyncPostgresLedger {
                 }
             }
         }
-        let write = AsyncFinalizeWrite {
-            reservation: reservation.clone(),
-            payload,
-            snapshot,
-        };
         self.persist_finalization_write(write, reservation, started, decision_elapsed)
             .await
     }
@@ -942,18 +990,13 @@ impl AsyncPostgresLedger {
     ) -> Result<Reservation, NoetError> {
         let db_started = Instant::now();
         let connection = self.pool.connection();
-        let connection = connection.lock().await;
-        let persisted_limit_window = persist_finalization_async(
-            &connection.client,
-            &connection.statements,
-            &write.reservation,
-            &write.payload,
-            &write.snapshot,
-        )
-        .await?;
-        if !persisted_limit_window {
-            persist_limit_windows_async(&connection.client, &write.snapshot).await?;
-        }
+        let mut connection = connection.lock().await;
+        let statements = connection.statements.clone();
+        let tx = connection.client.transaction().await?;
+        tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
+            .await?;
+        persist_finalization_write_async(&tx, &statements, &write).await?;
+        tx.commit().await?;
         if self.stage_timing {
             tracing::debug!(
                 decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
@@ -4749,10 +4792,69 @@ async fn load_allocation_buckets_async(
     Ok(())
 }
 
+async fn load_rolling_spend_buckets_async(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+) -> Result<(), NoetError> {
+    let rows = conn
+        .query(
+            "
+            SELECT rule_id, limit_id, scope_key, bucket_start, amount_usd
+            FROM rolling_spend_buckets
+            ",
+            &[],
+        )
+        .await?;
+    ledger.rolling_spend_buckets = rows
+        .into_iter()
+        .map(|row| {
+            (
+                (
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    parse_time(row.get::<_, String>(3)),
+                ),
+                row.get(4),
+            )
+        })
+        .collect();
+    Ok(())
+}
+
+async fn load_reservation_async(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+    reservation_id: &str,
+) -> Result<(), NoetError> {
+    if let Some(row) = conn
+        .query_opt(
+            "
+            SELECT id, amount_usd, estimated_amount_usd, currency, status, created_at, expires_at,
+                   budget_rule_ids_json, limit_window_spends_json, allocation_spends_json
+            FROM reservations
+            WHERE id = $1
+            ",
+            &[&reservation_id],
+        )
+        .await?
+    {
+        let (id, reservation) = stored_reservation_from_async_row(&row);
+        ledger.reservations.insert(id, reservation);
+    }
+    Ok(())
+}
+
 async fn load_active_reservations_async(
     conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
 ) -> Result<(), NoetError> {
+    let local_finalized = ledger
+        .reservations
+        .iter()
+        .filter(|(_, stored)| stored.reservation.status != ReservationStatus::Active)
+        .map(|(id, stored)| (id.clone(), stored.clone()))
+        .collect::<Vec<_>>();
     let rows = conn
         .query(
             "
@@ -4764,37 +4866,42 @@ async fn load_active_reservations_async(
             &[],
         )
         .await?;
-    ledger.reservations = rows
+    let mut reservations: HashMap<String, StoredReservation> = rows
         .into_iter()
-        .map(|row| {
-            let id: String = row.get(0);
-            let budget_rule_ids_json: String = row.get(7);
-            let limit_window_spends_json: String = row.get(8);
-            let allocation_spends_json: String = row.get(9);
-            (
-                id.clone(),
-                StoredReservation {
-                    reservation: Reservation {
-                        id,
-                        amount_usd: row.get(1),
-                        currency: row.get(3),
-                        status: ReservationStatus::Active,
-                        created_at: parse_time(row.get::<_, String>(5)),
-                        expires_at: parse_time(row.get::<_, String>(6)),
-                    },
-                    estimated_cost_usd: row.get(2),
-                    budget_rule_ids: serde_json::from_str(&budget_rule_ids_json)
-                        .unwrap_or_default(),
-                    limit_window_spends: serde_json::from_str(&limit_window_spends_json)
-                        .unwrap_or_default(),
-                    allocation_spends: serde_json::from_str(&allocation_spends_json)
-                        .unwrap_or_default(),
-                    matched_entity: None,
-                },
-            )
-        })
+        .map(|row| stored_reservation_from_async_row(&row))
         .collect();
+    for (id, stored) in local_finalized {
+        reservations.insert(id, stored);
+    }
+    ledger.reservations = reservations;
     Ok(())
+}
+
+fn stored_reservation_from_async_row(row: &AsyncPostgresRow) -> (String, StoredReservation) {
+    let id: String = row.get(0);
+    let status: String = row.get(4);
+    let budget_rule_ids_json: String = row.get(7);
+    let limit_window_spends_json: String = row.get(8);
+    let allocation_spends_json: String = row.get(9);
+    (
+        id.clone(),
+        StoredReservation {
+            reservation: Reservation {
+                id,
+                amount_usd: row.get(1),
+                currency: row.get(3),
+                status: parse_reservation_status(&status),
+                created_at: parse_time(row.get::<_, String>(5)),
+                expires_at: parse_time(row.get::<_, String>(6)),
+            },
+            estimated_cost_usd: row.get(2),
+            budget_rule_ids: serde_json::from_str(&budget_rule_ids_json).unwrap_or_default(),
+            limit_window_spends: serde_json::from_str(&limit_window_spends_json)
+                .unwrap_or_default(),
+            allocation_spends: serde_json::from_str(&allocation_spends_json).unwrap_or_default(),
+            matched_entity: None,
+        },
+    )
 }
 
 async fn persist_limit_windows_async(
@@ -5105,8 +5212,27 @@ async fn persist_decision_async(
     Ok(())
 }
 
+async fn persist_finalization_write_async(
+    conn: &(impl GenericClient + Sync),
+    statements: &AsyncPostgresStatements,
+    write: &AsyncFinalizeWrite,
+) -> Result<(), NoetError> {
+    let persisted_limit_window = persist_finalization_async(
+        conn,
+        statements,
+        &write.reservation,
+        &write.payload,
+        &write.snapshot,
+    )
+    .await?;
+    if !persisted_limit_window {
+        persist_limit_windows_async(conn, &write.snapshot).await?;
+    }
+    Ok(())
+}
+
 async fn persist_finalization_async(
-    conn: &AsyncPostgresClient,
+    conn: &(impl GenericClient + Sync),
     statements: &AsyncPostgresStatements,
     reservation: &Reservation,
     payload: &FinalizeReservation,
@@ -5472,6 +5598,13 @@ fn reservation_status_text(status: ReservationStatus) -> &'static str {
     match status {
         ReservationStatus::Active => "active",
         ReservationStatus::Finalized => "finalized",
+    }
+}
+
+fn parse_reservation_status(value: &str) -> ReservationStatus {
+    match value {
+        "finalized" => ReservationStatus::Finalized,
+        _ => ReservationStatus::Active,
     }
 }
 
@@ -6746,6 +6879,25 @@ fn recent_spend_usd(
             |row| row.get::<_, f64>(0),
         );
         return value.unwrap_or(0.0);
+    }
+
+    if !ledger.rolling_spend_buckets.is_empty() {
+        let bucket_since = rolling_bucket_start(since);
+        let bucket_now = rolling_bucket_start(now);
+        return ledger
+            .rolling_spend_buckets
+            .iter()
+            .filter(
+                |((bucket_rule, bucket_limit, bucket_scope, bucket_start), _)| {
+                    bucket_rule == rule_id
+                        && bucket_limit == limit_id
+                        && bucket_scope == scope_key
+                        && *bucket_start >= bucket_since
+                        && *bucket_start <= bucket_now
+                },
+            )
+            .map(|(_, amount)| *amount)
+            .sum();
     }
 
     ledger

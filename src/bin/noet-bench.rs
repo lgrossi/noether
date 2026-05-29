@@ -229,7 +229,7 @@ struct BenchConfig {
     database_url: Option<String>,
     postgres_profile: String,
     postgres_pool_size: usize,
-    postgres_async_finalize: bool,
+    postgres_async_finalize: Option<bool>,
     postgres_finalize_queue_capacity: usize,
     postgres_synchronous_commit: Option<String>,
     postgres_stage_timing: bool,
@@ -257,7 +257,7 @@ impl BenchConfig {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4);
-        let mut postgres_async_finalize = parse_env_bool("NOET_POSTGRES_ASYNC_FINALIZE");
+        let mut postgres_async_finalize = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE");
         let mut postgres_finalize_queue_capacity =
             std::env::var("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")
                 .ok()
@@ -301,7 +301,10 @@ impl BenchConfig {
                         .parse::<usize>()?;
                 }
                 "--postgres-async-finalize" => {
-                    postgres_async_finalize = true;
+                    postgres_async_finalize = Some(true);
+                }
+                "--postgres-sync-finalize" | "--no-postgres-async-finalize" => {
+                    postgres_async_finalize = Some(false);
                 }
                 "--postgres-finalize-queue-capacity" => {
                     postgres_finalize_queue_capacity = args
@@ -369,8 +372,8 @@ impl BenchConfig {
         let mut options = AsyncPostgresLedgerOptions::from_profile(&self.postgres_profile)
             .expect("validated Postgres profile");
         options.pool_size = self.postgres_pool_size;
-        if self.postgres_async_finalize {
-            options.async_finalize = true;
+        if let Some(async_finalize) = self.postgres_async_finalize {
+            options.async_finalize = async_finalize;
         }
         options.finalize_queue_capacity = self.postgres_finalize_queue_capacity;
         if let Some(synchronous_commit) = self.postgres_synchronous_commit.clone() {
@@ -391,15 +394,16 @@ impl BenchConfig {
 }
 
 fn parse_env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    parse_env_bool_option(name).unwrap_or(false)
+}
+
+fn parse_env_bool_option(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 async fn create_postgres_bench_schema(database_url: &str) -> Result<String, Box<dyn Error>> {

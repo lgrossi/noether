@@ -85,9 +85,14 @@ struct ServeArgs {
     #[arg(long, env = "NOET_POSTGRES_POOL_SIZE", default_value_t = 4)]
     postgres_pool_size: usize,
 
-    /// Queue PostgreSQL finalize persistence after updating in-memory state.
-    #[arg(long, env = "NOET_POSTGRES_ASYNC_FINALIZE", default_value_t = false)]
-    postgres_async_finalize: bool,
+    /// Override whether PostgreSQL finalization persistence is queued after updating in-memory state.
+    #[arg(
+        long,
+        env = "NOET_POSTGRES_ASYNC_FINALIZE",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    postgres_async_finalize: Option<bool>,
 
     /// Bounded queue size for async PostgreSQL finalize persistence.
     #[arg(
@@ -312,8 +317,8 @@ fn postgres_options_from_serve_args(
 ) -> Result<AsyncPostgresLedgerOptions, NoetError> {
     let mut options = AsyncPostgresLedgerOptions::from_profile(&args.postgres_profile)?;
     options.pool_size = args.postgres_pool_size.max(1);
-    if args.postgres_async_finalize {
-        options.async_finalize = true;
+    if let Some(async_finalize) = args.postgres_async_finalize {
+        options.async_finalize = async_finalize;
     }
     options.finalize_queue_capacity = args.postgres_finalize_queue_capacity.max(1);
     if let Some(synchronous_commit) = args.postgres_synchronous_commit.clone() {
