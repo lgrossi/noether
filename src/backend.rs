@@ -885,9 +885,6 @@ impl PostgresBackend {
         // Insert reservation and related rows if present.
         if let Some(reservation) = &decision.reservation {
             let stored = &snap.stored;
-            let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
-            let limit_window_spends_json = serde_json::to_string(&stored.limit_window_spends)?;
-            let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
 
             let res_status = reservation_status_text(reservation.status);
             let res_created_at = reservation.created_at.to_rfc3339();
@@ -916,75 +913,156 @@ impl PostgresBackend {
                 ],
             ).await?;
 
-            for spend in &stored.limit_window_spends {
-                client.execute(
-                    "INSERT INTO reservation_limit_scopes
-                         (reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                    &[
-                        &reservation.id,
-                        &spend.rule_id,
-                        &spend.limit_id,
-                        &spend.scope_key,
-                        &reservation.amount_usd,
-                        &res_created_at,
-                    ],
-                ).await?;
+            // Batch all limit-scope and rolling-bucket rows in two single round-trips via UNNEST.
+            // This replaces 2*N sequential .execute() calls with exactly 2 calls regardless of N.
+            let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
+            let n = stored.limit_window_spends.len();
+            let mut rls_reservation_ids: Vec<&str> = Vec::with_capacity(n);
+            let mut rls_rule_ids: Vec<&str> = Vec::with_capacity(n);
+            let mut rls_limit_ids: Vec<&str> = Vec::with_capacity(n);
+            let mut rls_scope_keys: Vec<&str> = Vec::with_capacity(n);
+            let mut rls_amounts: Vec<f64> = Vec::with_capacity(n);
+            let mut rls_created_ats: Vec<&str> = Vec::with_capacity(n);
 
-                let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
-                client.execute(
-                    "INSERT INTO rolling_spend_buckets
-                         (rule_id, limit_id, scope_key, bucket_start, amount_usd)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (rule_id, limit_id, scope_key, bucket_start)
-                     DO UPDATE SET amount_usd = rolling_spend_buckets.amount_usd + EXCLUDED.amount_usd",
-                    &[
-                        &spend.rule_id,
-                        &spend.limit_id,
-                        &spend.scope_key,
-                        &bucket_start,
-                        &reservation.amount_usd,
-                    ],
-                ).await?;
+            for spend in &stored.limit_window_spends {
+                rls_reservation_ids.push(&reservation.id);
+                rls_rule_ids.push(&spend.rule_id);
+                rls_limit_ids.push(&spend.limit_id);
+                rls_scope_keys.push(&spend.scope_key);
+                rls_amounts.push(reservation.amount_usd);
+                rls_created_ats.push(&res_created_at);
+            }
+
+            if !stored.limit_window_spends.is_empty() {
+                // Pipeline both inserts: they write to different tables and neither depends
+                // on the other's result. tokio-postgres sends both queries on the wire before
+                // waiting for either acknowledgement, saving one full TCP RTT.
+                let rls_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+                    &rls_reservation_ids,
+                    &rls_rule_ids,
+                    &rls_limit_ids,
+                    &rls_scope_keys,
+                    &rls_amounts,
+                    &rls_created_ats,
+                ];
+                let rsb_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+                    &rls_rule_ids,
+                    &rls_limit_ids,
+                    &rls_scope_keys,
+                    &rls_amounts,
+                    &bucket_start,
+                ];
+                tokio::try_join!(
+                    client.execute(
+                        "INSERT INTO reservation_limit_scopes
+                             (reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at)
+                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::text[])",
+                        rls_params,
+                    ),
+                    client.execute(
+                        "INSERT INTO rolling_spend_buckets
+                             (rule_id, limit_id, scope_key, bucket_start, amount_usd)
+                         SELECT rule_id, limit_id, scope_key, $5::text, amount_usd
+                         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[])
+                             AS t(rule_id, limit_id, scope_key, amount_usd)
+                         ON CONFLICT (rule_id, limit_id, scope_key, bucket_start)
+                         DO UPDATE SET amount_usd = rolling_spend_buckets.amount_usd + EXCLUDED.amount_usd",
+                        rsb_params,
+                    ),
+                )?;
             }
         }
 
-        // Upsert limit windows — done last to minimize the hold time on the shared row lock.
-        // With ON CONFLICT DO UPDATE, PG takes a row-level lock; keeping these at the end
-        // reduces serialization pressure when concurrent transactions target the same scope.
+        // Build UNNEST parameter arrays for limit windows and allocation buckets.
+        // Both tables are written at the end (to minimize row-lock hold time) and are independent
+        // of each other — pipeline them together to save one TCP RTT.
+        let mut lw_rule_ids: Vec<&str> = Vec::with_capacity(snap.limit_windows.len());
+        let mut lw_limit_ids: Vec<&str> = Vec::with_capacity(snap.limit_windows.len());
+        let mut lw_scope_keys: Vec<&str> = Vec::with_capacity(snap.limit_windows.len());
+        let mut lw_started_ats: Vec<String> = Vec::with_capacity(snap.limit_windows.len());
+        let mut lw_used_usds: Vec<f64> = Vec::with_capacity(snap.limit_windows.len());
+
         for ((rule_id, limit_id, scope_key), w) in &snap.limit_windows {
-            let lw_started_at = w.started_at.to_rfc3339();
-            client.execute(
-                "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
-                     started_at = EXCLUDED.started_at,
-                     used_usd = EXCLUDED.used_usd",
-                &[rule_id, limit_id, scope_key, &lw_started_at, &w.used_usd],
-            ).await?;
+            lw_rule_ids.push(rule_id.as_str());
+            lw_limit_ids.push(limit_id.as_str());
+            lw_scope_keys.push(scope_key.as_str());
+            lw_started_ats.push(w.started_at.to_rfc3339());
+            lw_used_usds.push(w.used_usd);
         }
 
-        // Upsert allocation buckets — similarly last.
+        let mut ab_rule_ids: Vec<&str> = Vec::with_capacity(snap.allocation_buckets.len());
+        let mut ab_entity_keys: Vec<&str> = Vec::with_capacity(snap.allocation_buckets.len());
+        let mut ab_started_ats: Vec<String> = Vec::with_capacity(snap.allocation_buckets.len());
+        let mut ab_protected: Vec<f64> = Vec::with_capacity(snap.allocation_buckets.len());
+        let mut ab_grants: Vec<f64> = Vec::with_capacity(snap.allocation_buckets.len());
+        let mut ab_carryovers: Vec<f64> = Vec::with_capacity(snap.allocation_buckets.len());
+
         for ((rule_id, entity_key), b) in &snap.allocation_buckets {
-            let bucket_started_at = b.started_at.to_rfc3339();
-            client.execute(
-                "INSERT INTO budget_allocation_buckets
-                     (rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (rule_id, entity_key) DO UPDATE SET
-                     started_at = EXCLUDED.started_at,
-                     protected_amount_usd = EXCLUDED.protected_amount_usd,
-                     current_grant_usd = EXCLUDED.current_grant_usd,
-                     carryover_usd = EXCLUDED.carryover_usd",
-                &[
-                    rule_id,
-                    entity_key,
-                    &bucket_started_at,
-                    &b.protected_amount_usd,
-                    &b.current_grant_usd,
-                    &b.carryover_usd,
-                ],
-            ).await?;
+            ab_rule_ids.push(rule_id.as_str());
+            ab_entity_keys.push(entity_key.as_str());
+            ab_started_ats.push(b.started_at.to_rfc3339());
+            ab_protected.push(b.protected_amount_usd);
+            ab_grants.push(b.current_grant_usd);
+            ab_carryovers.push(b.carryover_usd);
+        }
+
+        // Pre-build typed param slices so temporaries live long enough for try_join!.
+        let lw_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &lw_rule_ids, &lw_limit_ids, &lw_scope_keys, &lw_started_ats, &lw_used_usds,
+        ];
+        let ab_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &ab_rule_ids, &ab_entity_keys, &ab_started_ats, &ab_protected, &ab_grants, &ab_carryovers,
+        ];
+
+        match (!snap.limit_windows.is_empty(), !snap.allocation_buckets.is_empty()) {
+            (true, true) => {
+                // Pipeline: send both queries before waiting for either response.
+                tokio::try_join!(
+                    client.execute(
+                        "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
+                         ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
+                             started_at = EXCLUDED.started_at,
+                             used_usd = EXCLUDED.used_usd",
+                        lw_params,
+                    ),
+                    client.execute(
+                        "INSERT INTO budget_allocation_buckets
+                             (rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd)
+                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[])
+                         ON CONFLICT (rule_id, entity_key) DO UPDATE SET
+                             started_at = EXCLUDED.started_at,
+                             protected_amount_usd = EXCLUDED.protected_amount_usd,
+                             current_grant_usd = EXCLUDED.current_grant_usd,
+                             carryover_usd = EXCLUDED.carryover_usd",
+                        ab_params,
+                    ),
+                )?;
+            }
+            (true, false) => {
+                client.execute(
+                    "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+                     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
+                     ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
+                         started_at = EXCLUDED.started_at,
+                         used_usd = EXCLUDED.used_usd",
+                    lw_params,
+                ).await?;
+            }
+            (false, true) => {
+                client.execute(
+                    "INSERT INTO budget_allocation_buckets
+                         (rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd)
+                     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[])
+                     ON CONFLICT (rule_id, entity_key) DO UPDATE SET
+                         started_at = EXCLUDED.started_at,
+                         protected_amount_usd = EXCLUDED.protected_amount_usd,
+                         current_grant_usd = EXCLUDED.current_grant_usd,
+                         carryover_usd = EXCLUDED.carryover_usd",
+                    ab_params,
+                ).await?;
+            }
+            (false, false) => {}
         }
 
         client.batch_execute("COMMIT").await?;
@@ -1061,16 +1139,35 @@ impl PostgresBackend {
             ).await?;
         }
 
-        // Upsert changed limit windows.
-        for ((rule_id, limit_id, scope_key), w) in &lw_snapshot {
-            let lw_started_at = w.started_at.to_rfc3339();
+        // Batch-upsert all changed limit windows in a single round-trip via UNNEST.
+        if !lw_snapshot.is_empty() {
+            let mut lw_rule_ids: Vec<&str> = Vec::with_capacity(lw_snapshot.len());
+            let mut lw_limit_ids: Vec<&str> = Vec::with_capacity(lw_snapshot.len());
+            let mut lw_scope_keys: Vec<&str> = Vec::with_capacity(lw_snapshot.len());
+            let mut lw_started_ats: Vec<String> = Vec::with_capacity(lw_snapshot.len());
+            let mut lw_used_usds: Vec<f64> = Vec::with_capacity(lw_snapshot.len());
+
+            for ((rule_id, limit_id, scope_key), w) in &lw_snapshot {
+                lw_rule_ids.push(rule_id.as_str());
+                lw_limit_ids.push(limit_id.as_str());
+                lw_scope_keys.push(scope_key.as_str());
+                lw_started_ats.push(w.started_at.to_rfc3339());
+                lw_used_usds.push(w.used_usd);
+            }
+
             client.execute(
                 "INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
-                 VALUES ($1, $2, $3, $4, $5)
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
                  ON CONFLICT (rule_id, limit_id, scope_key) DO UPDATE SET
                      started_at = EXCLUDED.started_at,
                      used_usd = EXCLUDED.used_usd",
-                &[rule_id, limit_id, scope_key, &lw_started_at, &w.used_usd],
+                &[
+                    &lw_rule_ids as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &lw_limit_ids,
+                    &lw_scope_keys,
+                    &lw_started_ats,
+                    &lw_used_usds,
+                ],
             ).await?;
         }
 
