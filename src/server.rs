@@ -29,7 +29,12 @@ use crate::contract::{
     Reservation, SpendWindowMode, TraceEvent,
 };
 use crate::error::NoetError;
-use crate::ledger::{BudgetLedger, ConnMutex, ReplaySpendSeed, TraceReportItem, persist_event, validate_event_payload};
+use crate::ledger::{
+    BudgetLedger, ConnMutex, HotState, ReplaySpendSeed, TraceReportItem,
+    persist_allocation_buckets, persist_decision as ledger_persist_decision,
+    persist_event, persist_limit_windows, try_authorize_at_hot, validate_event_payload,
+    RoutingPersistenceFields,
+};
 use crate::noether_app;
 use crate::openapi;
 use crate::policy::PolicyFile;
@@ -50,6 +55,7 @@ pub struct AppState {
     pub ledger: Arc<Mutex<BudgetLedger>>,
     pub conn: Arc<ConnMutex>,
     pub event_count: Arc<AtomicU64>,
+    pub hot: Arc<std::sync::Mutex<HotState>>,
     pub db_path: Option<PathBuf>,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
@@ -546,6 +552,11 @@ impl AppState {
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
             conn: Arc::new(std::sync::Mutex::new(None)),
             event_count: Arc::new(AtomicU64::new(0)),
+            hot: Arc::new(std::sync::Mutex::new(HotState {
+                limit_windows: Default::default(),
+                allocation_buckets: Default::default(),
+                reservations: Default::default(),
+            })),
             db_path: None,
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -645,8 +656,10 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     state.policy_proposal_path = policy_proposal_path;
     state.routes = config.routes;
     state.db_path = Some(config.db_path.clone());
+    let hot_state = ledger.hot_state();
     state.ledger = Arc::new(Mutex::new(ledger));
     state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
+    state.hot = Arc::new(std::sync::Mutex::new(hot_state));
     let app = build_router(state);
 
     info!(bind = %bind, "starting noet capture server");
@@ -744,14 +757,81 @@ async fn authorize(
 ) -> Result<Json<AuthorizeDecision>, NoetError> {
     let policy = state.active_policy().await;
     let trace_id = request_trace_id(&request);
+    let hot = Arc::clone(&state.hot);
+    let conn = Arc::clone(&state.conn);
     let ledger = Arc::clone(&state.ledger);
-    let decision = tokio::task::spawn_blocking(move || {
-        ledger
-            .blocking_lock()
-            .try_authorize(policy.as_deref(), &request)
+    let decision = tokio::task::spawn_blocking(move || -> Result<AuthorizeDecision, NoetError> {
+        // L1: acquire HotState, run in-memory authorize, release L1.
+        let (decision, snapshot) = {
+            let mut hot_guard = hot.lock().expect("hot mutex poisoned");
+            try_authorize_at_hot(&mut hot_guard, policy.as_deref(), &request, chrono::Utc::now())?
+            // hot_guard dropped here — L1 released.
+        };
+
+        // Mirror the reservation into state.ledger so that the finalize
+        // handler (which still uses ledger) can look it up.
+        if let Some(ref snap) = snapshot {
+            let mut ledger_guard = ledger.blocking_lock();
+            ledger_guard.mirror_reservation(snap.reservation_id.clone(), snap.stored.clone());
+        }
+
+        // L2: acquire conn, persist snapshot, release L2.
+        if let Some(snap) = snapshot {
+            let conn_guard = conn.lock().expect("conn mutex poisoned");
+            if let Some(c) = conn_guard.as_ref() {
+                persist_limit_windows(c, &snap.limit_windows)?;
+                persist_allocation_buckets(c, &snap.allocation_buckets)?;
+
+                // Build routing fields from snapshot + decision.
+                let selected_budget_id = snap.selected_budget_id.clone();
+                let matched_entity = snap.stored.matched_entity.clone();
+                let selection_reason = decision
+                    .explanations
+                    .iter()
+                    .find(|e| {
+                        selected_budget_id
+                            .as_deref()
+                            .map(|id| e.rule_id == id)
+                            .unwrap_or(false)
+                    })
+                    .map(|e| e.reason.clone());
+                let routing = RoutingPersistenceFields {
+                    selected_budget_id,
+                    matched_entity,
+                    selection_reason,
+                    rejected_budget_id: None,
+                    rejected_budget_reason: None,
+                    model_check: None,
+                    budget_window_remaining_usd: None,
+                    budget_window_mode: None,
+                    budget_window_started_at: None,
+                    budget_window_ends_at: None,
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                };
+
+                // Build a single-entry reservations map for persist_decision.
+                let mut reservations = std::collections::HashMap::new();
+                reservations.insert(snap.reservation_id.clone(), snap.stored);
+
+                ledger_persist_decision(
+                    c,
+                    &request,
+                    &decision,
+                    &snap.limit_hits,
+                    routing,
+                    &reservations,
+                )?;
+            }
+            drop(conn_guard); // L2 released.
+        }
+
+        Ok(decision)
     })
     .await
-    .expect("ledger task panicked")?;
+    .expect("authorize task panicked")?;
+
     publish_report_update(&state, "authorize", trace_id);
     Ok(Json(decision))
 }
@@ -5527,5 +5607,123 @@ policies: []
             )
             .expect("authorize with preserved policy");
         assert_eq!(decision.outcome, crate::contract::DecisionOutcome::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_concurrent_authorize_does_not_double_spend() {
+
+        // Policy with a large enough cap so all 50 requests go through.
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: vec![crate::contract::BudgetRule {
+                id: "stress-budget".to_owned(),
+                priority: 0,
+                models: Default::default(),
+                limits: crate::contract::BudgetLimitPolicy {
+                    request_cost: None,
+                    context_tokens: None,
+                    spend: vec![crate::contract::SpendWindowLimit {
+                        id: Some("stress-cap".to_owned()),
+                        by: crate::contract::SpendWindowBy::Global,
+                        window: "1d".to_owned(),
+                        mode: Some(crate::contract::SpendWindowMode::Tumbling),
+                        anchor: Some(crate::contract::WindowAnchorPolicy {
+                            kind: crate::contract::WindowAnchorKind::FirstSeen,
+                        }),
+                        max_usd: 10.0, // 50 * 0.01 = 0.50 << 10.0
+                        warn_at_fractions: vec![],
+                        action: crate::contract::PolicyAction::Block,
+                    }],
+                    tool_calls: None,
+                    agent_steps: None,
+                    retries: None,
+                },
+                allocation: None,
+                rule_match: crate::contract::RuleMatch::default(),
+            }],
+            policies: Vec::new(),
+        };
+
+        let state = test_state(Some(policy));
+        let app = build_router(state.clone());
+
+        const TASK_COUNT: usize = 50;
+        const COST_PER_TASK: f64 = 0.01;
+
+        let handles: Vec<tokio::task::JoinHandle<(StatusCode, serde_json::Value)>> = (0..TASK_COUNT)
+            .map(|i| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let mut metadata = BTreeMap::new();
+                    metadata.insert(
+                        "request_id".to_owned(),
+                        serde_json::json!(format!("stress-req-{i}")),
+                    );
+                    let body = serde_json::to_string(&crate::contract::AuthorizeRequest {
+                        budget_id: None,
+                        entities: Vec::new(),
+                        subject: None,
+                        project: None,
+                        provider: Some("openai".to_owned()),
+                        model: Some("gpt-4".to_owned()),
+                        estimated_tokens: None,
+                        estimated_cost_usd: Some(COST_PER_TASK),
+                        metadata,
+                    })
+                    .expect("serialize");
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri("/v1/authorize")
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .expect("request"),
+                        )
+                        .await
+                        .expect("response");
+                    let status = response.status();
+                    let body = to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("body");
+                    let decision: serde_json::Value =
+                        serde_json::from_slice(&body).expect("decision json");
+                    (status, decision)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(TASK_COUNT);
+        for handle in handles {
+            results.push(handle.await.expect("task panicked"));
+        }
+
+        // All 50 requests should be allowed (total 0.50 << cap 10.0).
+        for (status, decision) in &results {
+            assert_eq!(*status, StatusCode::OK, "unexpected status: {decision}");
+            assert_eq!(
+                decision["outcome"].as_str().unwrap_or(""),
+                "allow",
+                "unexpected outcome: {decision}"
+            );
+        }
+
+        // Sum the reserved amounts from the HotState — must equal 50 * 0.01
+        // exactly (within floating-point tolerance). No double-spending.
+        let hot_guard = state.hot.lock().expect("hot mutex");
+        let total_reserved: f64 = hot_guard
+            .reservations
+            .values()
+            .map(|stored| stored.reservation.amount_usd)
+            .sum();
+        drop(hot_guard);
+
+        let expected = TASK_COUNT as f64 * COST_PER_TASK;
+        assert!(
+            (total_reserved - expected).abs() < 1e-9,
+            "double-spend detected: reserved={total_reserved:.6} expected={expected:.6}"
+        );
     }
 }

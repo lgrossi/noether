@@ -29,7 +29,7 @@ pub struct BudgetLedger {
     conn: Option<Connection>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct WindowState {
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) used_usd: f64,
@@ -43,7 +43,7 @@ pub(crate) struct AllocationBucketState {
     pub(crate) carryover_usd: f64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredReservation {
     pub(crate) reservation: Reservation,
     pub(crate) estimated_cost_usd: f64,
@@ -53,19 +53,19 @@ pub(crate) struct StoredReservation {
     pub(crate) matched_entity: Option<String>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct HotState {
+pub struct HotState {
     pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
     pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     pub(crate) reservations: HashMap<String, StoredReservation>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct HotSnapshot {
     pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
     pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     pub(crate) reservation_id: String,
     pub(crate) stored: StoredReservation,
+    pub(crate) selected_budget_id: Option<String>,
+    pub(crate) limit_hits: Vec<DecisionLimitHitReport>,
 }
 
 pub(crate) type ConnMutex = std::sync::Mutex<Option<rusqlite::Connection>>;
@@ -137,20 +137,20 @@ struct AuthorizeMessageHint {
 }
 
 #[derive(Default)]
-struct RoutingPersistenceFields {
-    selected_budget_id: Option<String>,
-    matched_entity: Option<String>,
-    selection_reason: Option<String>,
-    rejected_budget_id: Option<String>,
-    rejected_budget_reason: Option<String>,
-    model_check: Option<String>,
-    budget_window_remaining_usd: Option<f64>,
-    budget_window_mode: Option<String>,
-    budget_window_started_at: Option<DateTime<Utc>>,
-    budget_window_ends_at: Option<DateTime<Utc>>,
-    tool_calls: Option<u64>,
-    agent_steps: Option<u64>,
-    retries: Option<u64>,
+pub(crate) struct RoutingPersistenceFields {
+    pub(crate) selected_budget_id: Option<String>,
+    pub(crate) matched_entity: Option<String>,
+    pub(crate) selection_reason: Option<String>,
+    pub(crate) rejected_budget_id: Option<String>,
+    pub(crate) rejected_budget_reason: Option<String>,
+    pub(crate) model_check: Option<String>,
+    pub(crate) budget_window_remaining_usd: Option<f64>,
+    pub(crate) budget_window_mode: Option<String>,
+    pub(crate) budget_window_started_at: Option<DateTime<Utc>>,
+    pub(crate) budget_window_ends_at: Option<DateTime<Utc>>,
+    pub(crate) tool_calls: Option<u64>,
+    pub(crate) agent_steps: Option<u64>,
+    pub(crate) retries: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -612,6 +612,18 @@ impl BudgetLedger {
 
     pub fn event_count(&self) -> usize {
         self.events_count.load(Ordering::Relaxed) as usize
+    }
+
+    pub(crate) fn hot_state(&self) -> HotState {
+        HotState {
+            limit_windows: self.limit_windows.clone(),
+            allocation_buckets: self.allocation_buckets.clone(),
+            reservations: self.reservations.clone(),
+        }
+    }
+
+    pub(crate) fn mirror_reservation(&mut self, id: String, stored: StoredReservation) {
+        self.reservations.insert(id, stored);
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {
@@ -2155,7 +2167,106 @@ impl BudgetLedger {
     }
 }
 
-fn persist_limit_windows(
+pub(crate) fn try_authorize_at_hot(
+    hot: &mut HotState,
+    policy: Option<&PolicyFile>,
+    request: &AuthorizeRequest,
+    now: DateTime<Utc>,
+) -> Result<(AuthorizeDecision, Option<HotSnapshot>), NoetError> {
+    // Move HotState fields into a no-conn BudgetLedger so all existing
+    // tested logic runs unchanged. All persist_* calls inside
+    // try_authorize_at are no-ops when conn=None.
+    let mut temp = BudgetLedger {
+        limit_windows: std::mem::take(&mut hot.limit_windows),
+        allocation_buckets: std::mem::take(&mut hot.allocation_buckets),
+        reservations: std::mem::take(&mut hot.reservations),
+        events_count: AtomicU64::new(0),
+        conn: None,
+    };
+
+    let decision = temp.try_authorize_at(policy, request, now)?;
+
+    // Build snapshot of changed entries for the caller to persist via L2.
+    let snapshot = decision.reservation.as_ref().map(|reservation| {
+        let stored = temp
+            .reservations
+            .get(&reservation.id)
+            .expect("created reservation is in temp ledger");
+
+        let changed_limit_windows: HashMap<(String, String, String), WindowState> = stored
+            .limit_window_spends
+            .iter()
+            .filter_map(|spend| {
+                let key = (
+                    spend.rule_id.clone(),
+                    spend.limit_id.clone(),
+                    spend.scope_key.clone(),
+                );
+                temp.limit_windows.get(&key).map(|w| {
+                    (
+                        key,
+                        WindowState {
+                            started_at: w.started_at,
+                            used_usd: w.used_usd,
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let changed_allocation_buckets: HashMap<(String, String), AllocationBucketState> = stored
+            .allocation_spends
+            .iter()
+            .filter_map(|spend| {
+                let key = (spend.rule_id.clone(), spend.entity_key.clone());
+                temp.allocation_buckets.get(&key).map(|b| (key, b.clone()))
+            })
+            .collect();
+
+        let selected_budget_id = stored.budget_rule_ids.first().cloned();
+
+        // Derive limit_hits from the decision explanations: any severity=Deny
+        // explanation whose rule_id matches a limit pattern was a limit hit.
+        let limit_hits: Vec<DecisionLimitHitReport> = decision
+            .explanations
+            .iter()
+            .filter(|explanation| {
+                explanation.severity == DecisionSeverity::Deny
+                    && is_limit_rule_id(&explanation.rule_id)
+            })
+            .map(|explanation| DecisionLimitHitReport {
+                rule_id: explanation.rule_id.clone(),
+                reason: explanation.reason.clone(),
+                severity: explanation.severity,
+                window_id: None,
+                window_mode: None,
+                window_started_at: None,
+                window_ends_at: None,
+                projected_spend_usd: None,
+                max_usd: None,
+                scope_entity: None,
+            })
+            .collect();
+
+        HotSnapshot {
+            limit_windows: changed_limit_windows,
+            allocation_buckets: changed_allocation_buckets,
+            reservation_id: reservation.id.clone(),
+            stored: stored.clone(),
+            selected_budget_id,
+            limit_hits,
+        }
+    });
+
+    // Move mutated data back into HotState.
+    hot.limit_windows = temp.limit_windows;
+    hot.allocation_buckets = temp.allocation_buckets;
+    hot.reservations = temp.reservations;
+
+    Ok((decision, snapshot))
+}
+
+pub(crate) fn persist_limit_windows(
     conn: &Connection,
     windows: &HashMap<(String, String, String), WindowState>,
 ) -> Result<(), NoetError> {
@@ -2180,7 +2291,7 @@ fn persist_limit_windows(
     Ok(())
 }
 
-fn persist_allocation_buckets(
+pub(crate) fn persist_allocation_buckets(
     conn: &Connection,
     buckets: &HashMap<(String, String), AllocationBucketState>,
 ) -> Result<(), NoetError> {
@@ -2209,7 +2320,7 @@ fn persist_allocation_buckets(
     Ok(())
 }
 
-fn persist_decision(
+pub(crate) fn persist_decision(
     conn: &Connection,
     request: &AuthorizeRequest,
     decision: &AuthorizeDecision,
