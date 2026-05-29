@@ -40,5 +40,7 @@ This directory holds Noether's north-star product and architecture notes.
 - [Export and reporting API contract](./export-reporting-api.md): shipped reporting HTTP endpoints,
   live-dashboard data/update surfaces, artifact-backed simulation routes, and the CLI/HTTP contract
   shape they share.
+- [Storage backends](./storage-backends.md): SQLite and PostgreSQL deployment modes,
+  guarantees, and tradeoffs.
 
 These docs are intentionally higher-level than implementation tickets. They should change when the product thesis or architectural boundaries change, not for every small code edit.

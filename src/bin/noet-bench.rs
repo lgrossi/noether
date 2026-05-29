@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use noether::contract::{AuthorizeRequest, DecisionMode, FinalizeReservation, TraceEvent};
-use noether::ledger::BudgetLedger;
+use noether::ledger::{AsyncPostgresLedger, AsyncPostgresLedgerOptions, BudgetLedger};
 use noether::policy::parse_policy_bytes;
-use noether::server::{AppState, build_router};
+use noether::server::{AppState, LedgerBackend, build_router};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use tokio_postgres::NoTls;
 use tower::ServiceExt;
 
 const BENCH_POLICY: &str = r#"
@@ -85,15 +87,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = std::fs::remove_dir_all(&fixture_dir);
     std::fs::create_dir_all(&fixture_dir)?;
 
-    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
-    match config.seed_mode {
-        SeedMode::Product => seed_ledger(&mut ledger, &policy, config.rows)?,
-        SeedMode::BulkCompany => {
-            drop(ledger);
-            seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
-            ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let mut postgres_schema = None;
+    let effective_database_url = if let Some(database_url) = config.database_url.as_deref() {
+        let schema = create_postgres_bench_schema(database_url).await?;
+        let scoped_url = postgres_url_with_search_path(database_url, &schema);
+        postgres_schema = Some((database_url.to_owned(), schema));
+        Some(scoped_url)
+    } else {
+        None
+    };
+
+    let mut postgres_ledger = None;
+    let ledger = match (config.seed_mode, effective_database_url.as_deref()) {
+        (SeedMode::Product, Some(database_url)) => {
+            let seed_ledger = AsyncPostgresLedger::connect_with_options(
+                database_url,
+                config.seed_postgres_options(),
+            )
+            .await?;
+            seed_async_postgres_ledger(&seed_ledger, &policy, config.rows).await?;
+            drop(seed_ledger);
+            let ledger =
+                AsyncPostgresLedger::connect_with_options(database_url, config.postgres_options())
+                    .await?;
+            postgres_ledger = Some(ledger);
+            BudgetLedger::default()
         }
-    }
+        (SeedMode::Product, None) => {
+            let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+            seed_ledger(&mut ledger, &policy, config.rows)?;
+            ledger
+        }
+        (SeedMode::BulkCompany, Some(database_url)) => {
+            let seed_ledger = AsyncPostgresLedger::connect_with_options(
+                database_url,
+                config.seed_postgres_options(),
+            )
+            .await?;
+            drop(seed_ledger);
+            seed_postgres_ledger_bulk(database_url, config.rows, config.events_per_decision)
+                .await?;
+            let ledger =
+                AsyncPostgresLedger::connect_with_options(database_url, config.postgres_options())
+                    .await?;
+            postgres_ledger = Some(ledger);
+            BudgetLedger::default()
+        }
+        (SeedMode::BulkCompany, None) => {
+            seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
+            BudgetLedger::open_sqlite(&db_path)?
+        }
+    };
 
     let mut state = AppState::new(
         fixture_dir.clone(),
@@ -101,54 +145,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(policy),
         DecisionMode::Enforce,
     );
+    if let Some((database_url, postgres_ledger)) =
+        effective_database_url.clone().zip(postgres_ledger.clone())
+    {
+        state.ledger_backend = LedgerBackend::Postgres {
+            database_url,
+            ledger: postgres_ledger,
+        };
+    } else {
+        state.ledger_backend = LedgerBackend::SQLite {
+            path: db_path.clone(),
+        };
+    }
     state.policy_proposal_path = proposal_path.clone();
     *state.ledger.lock().await = ledger;
     let app = build_router(state.clone());
 
     println!(
-        "noet-bench rows={} iterations={} db={}",
+        "noet-bench rows={} iterations={} backend={} db={}",
         config.rows,
         config.iterations,
+        if config.database_url.is_some() {
+            "postgres"
+        } else {
+            "sqlite"
+        },
         db_path.display()
     );
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+    println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
 
-    bench_get(
-        "GET /v1/app/policy",
-        app.clone(),
-        "/v1/app/policy",
-        config.iterations,
-    )
-    .await?;
-    bench_get(
-        "GET /v1/app/runs",
-        app.clone(),
-        "/v1/app/runs?limit=80",
-        config.iterations,
-    )
-    .await?;
-    bench_get(
-        "GET /v1/app/replay",
-        app.clone(),
-        "/v1/app/replay",
-        config.iterations,
-    )
-    .await?;
-    if !config.skip_draft_replay {
-        std::fs::write(&proposal_path, BENCH_REPLAY_PROPOSAL)?;
+    if !config.hot_only {
         bench_get(
-            "GET /v1/app/replay (draft simulation)",
+            "GET /v1/app/policy",
+            app.clone(),
+            "/v1/app/policy",
+            config.iterations,
+        )
+        .await?;
+        bench_get(
+            "GET /v1/app/runs",
+            app.clone(),
+            "/v1/app/runs?limit=80",
+            config.iterations,
+        )
+        .await?;
+        bench_get(
+            "GET /v1/app/replay",
             app.clone(),
             "/v1/app/replay",
             config.iterations,
         )
         .await?;
+        if !config.skip_draft_replay {
+            std::fs::write(&proposal_path, BENCH_REPLAY_PROPOSAL)?;
+            bench_get(
+                "GET /v1/app/replay (draft simulation)",
+                app.clone(),
+                "/v1/app/replay",
+                config.iterations,
+            )
+            .await?;
+        }
     }
     bench_authorize(app.clone(), config.iterations).await?;
     bench_finalize(app.clone(), config.iterations).await?;
-    bench_event(app, config.iterations).await?;
+    if !config.hot_only {
+        bench_event(app, config.iterations).await?;
+    }
 
     remove_sqlite_files(&db_path);
+    if let Some((database_url, schema)) = postgres_schema {
+        drop_postgres_bench_schema(&database_url, &schema).await?;
+    }
     let _ = std::fs::remove_dir_all(&fixture_dir);
     Ok(())
 }
@@ -158,9 +226,17 @@ struct BenchConfig {
     rows: usize,
     iterations: usize,
     base_url: Option<String>,
+    database_url: Option<String>,
+    postgres_profile: String,
+    postgres_pool_size: usize,
+    postgres_async_finalize: Option<bool>,
+    postgres_finalize_queue_capacity: usize,
+    postgres_synchronous_commit: Option<String>,
+    postgres_stage_timing: bool,
     seed_mode: SeedMode,
     events_per_decision: usize,
     skip_draft_replay: bool,
+    hot_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,9 +250,26 @@ impl BenchConfig {
         let mut rows = 1_000;
         let mut iterations = 30;
         let mut base_url = None;
+        let mut database_url = std::env::var("NOET_DATABASE_URL").ok();
+        let mut postgres_profile =
+            std::env::var("NOET_POSTGRES_PROFILE").unwrap_or_else(|_| "strict".to_owned());
+        let mut postgres_pool_size = std::env::var("NOET_POSTGRES_POOL_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4);
+        let mut postgres_async_finalize = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE");
+        let mut postgres_finalize_queue_capacity =
+            std::env::var("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1024);
+        let mut postgres_synchronous_commit =
+            std::env::var("NOET_POSTGRES_SYNCHRONOUS_COMMIT").ok();
+        let mut postgres_stage_timing = parse_env_bool("NOET_POSTGRES_STAGE_TIMING");
         let mut seed_mode = SeedMode::Product;
         let mut events_per_decision = 1;
         let mut skip_draft_replay = false;
+        let mut hot_only = false;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -195,6 +288,39 @@ impl BenchConfig {
                 "--base-url" => {
                     base_url = Some(args.next().ok_or("--base-url requires a value")?);
                 }
+                "--database-url" => {
+                    database_url = Some(args.next().ok_or("--database-url requires a value")?);
+                }
+                "--postgres-profile" => {
+                    postgres_profile = args.next().ok_or("--postgres-profile requires a value")?;
+                }
+                "--postgres-pool-size" => {
+                    postgres_pool_size = args
+                        .next()
+                        .ok_or("--postgres-pool-size requires a value")?
+                        .parse::<usize>()?;
+                }
+                "--postgres-async-finalize" => {
+                    postgres_async_finalize = Some(true);
+                }
+                "--postgres-sync-finalize" | "--no-postgres-async-finalize" => {
+                    postgres_async_finalize = Some(false);
+                }
+                "--postgres-finalize-queue-capacity" => {
+                    postgres_finalize_queue_capacity = args
+                        .next()
+                        .ok_or("--postgres-finalize-queue-capacity requires a value")?
+                        .parse::<usize>()?;
+                }
+                "--postgres-synchronous-commit" => {
+                    postgres_synchronous_commit = Some(
+                        args.next()
+                            .ok_or("--postgres-synchronous-commit requires a value")?,
+                    );
+                }
+                "--postgres-stage-timing" => {
+                    postgres_stage_timing = true;
+                }
                 "--seed-mode" => {
                     seed_mode = match args.next().ok_or("--seed-mode requires a value")?.as_str() {
                         "product" => SeedMode::Product,
@@ -211,24 +337,114 @@ impl BenchConfig {
                 "--skip-draft-replay" => {
                     skip_draft_replay = true;
                 }
+                "--hot-only" => {
+                    hot_only = true;
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--base-url URL]"
+                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--hot-only] [--database-url URL] [--postgres-profile strict|performance] [--postgres-pool-size N] [--postgres-async-finalize] [--postgres-synchronous-commit on|off|local|remote_write|remote_apply] [--postgres-stage-timing] [--base-url URL]"
                     );
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown argument: {other}").into()),
             }
         }
+        AsyncPostgresLedgerOptions::from_profile(&postgres_profile)?;
         Ok(Self {
             rows,
             iterations,
             base_url,
+            database_url,
+            postgres_profile,
+            postgres_pool_size: postgres_pool_size.max(1),
+            postgres_async_finalize,
+            postgres_finalize_queue_capacity: postgres_finalize_queue_capacity.max(1),
+            postgres_synchronous_commit,
+            postgres_stage_timing,
             seed_mode,
             events_per_decision,
             skip_draft_replay,
+            hot_only,
         })
     }
+
+    fn postgres_options(&self) -> AsyncPostgresLedgerOptions {
+        let mut options = AsyncPostgresLedgerOptions::from_profile(&self.postgres_profile)
+            .expect("validated Postgres profile");
+        options.pool_size = self.postgres_pool_size;
+        if let Some(async_finalize) = self.postgres_async_finalize {
+            options.async_finalize = async_finalize;
+        }
+        options.finalize_queue_capacity = self.postgres_finalize_queue_capacity;
+        if let Some(synchronous_commit) = self.postgres_synchronous_commit.clone() {
+            options.synchronous_commit = Some(synchronous_commit);
+        }
+        if self.postgres_stage_timing {
+            options.stage_timing = true;
+        }
+        options
+    }
+
+    fn seed_postgres_options(&self) -> AsyncPostgresLedgerOptions {
+        AsyncPostgresLedgerOptions {
+            async_finalize: false,
+            ..self.postgres_options()
+        }
+    }
+}
+
+fn parse_env_bool(name: &str) -> bool {
+    parse_env_bool_option(name).unwrap_or(false)
+}
+
+fn parse_env_bool_option(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+async fn create_postgres_bench_schema(database_url: &str) -> Result<String, Box<dyn Error>> {
+    let schema = format!(
+        "noether_bench_{}_{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default().abs()
+    );
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres bench schema connection error: {error}");
+        }
+    });
+    client
+        .batch_execute(&format!(
+            r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+        ))
+        .await?;
+    Ok(schema)
+}
+
+async fn drop_postgres_bench_schema(
+    database_url: &str,
+    schema: &str,
+) -> Result<(), Box<dyn Error>> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres bench schema cleanup connection error: {error}");
+        }
+    });
+    client
+        .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+        .await?;
+    Ok(())
+}
+
+fn postgres_url_with_search_path(database_url: &str, schema: &str) -> String {
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    format!("{database_url}{separator}options=-csearch_path%3D{schema}")
 }
 
 fn seed_ledger(
@@ -266,6 +482,212 @@ fn seed_ledger(
             }),
         })?;
     }
+    Ok(())
+}
+
+async fn seed_async_postgres_ledger(
+    ledger: &AsyncPostgresLedger,
+    policy: &noether::policy::PolicyFile,
+    rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    let base_time = Utc::now() - ChronoDuration::seconds(rows as i64);
+    for index in 0..rows {
+        let trace_id = format!("bench-trace-{index}");
+        let request_id = format!("bench-request-{index}");
+        let agent_run_id = format!("bench-run-{index}");
+        let request = authorize_request(
+            index,
+            Some(&trace_id),
+            Some(&request_id),
+            Some(&agent_run_id),
+        );
+        let created_at = base_time + ChronoDuration::seconds(index as i64);
+        let decision = ledger
+            .try_authorize_at(Some(Arc::new(policy.clone())), request, created_at)
+            .await?;
+        if let Some(reservation) = decision.reservation {
+            let finalize = finalize_payload(index, &trace_id, &request_id, &agent_run_id);
+            ledger.finalize(reservation.id, finalize).await?;
+        }
+        ledger
+            .record_event(TraceEvent {
+                id: None,
+                trace_id: Some(trace_id),
+                occurred_at: Some(created_at),
+                kind: "tool.observed".to_owned(),
+                payload: json!({
+                    "name": "shell",
+                    "duration_ms": 10 + (index % 90),
+                    "success": index % 17 != 0,
+                    "metadata": { "agent_run_id": agent_run_id, "request_id": request_id }
+                }),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn seed_postgres_ledger_bulk(
+    database_url: &str,
+    rows: usize,
+    events_per_decision: usize,
+) -> Result<(), Box<dyn Error>> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres bulk seed connection error: {error}");
+        }
+    });
+    client
+        .batch_execute("SET synchronous_commit TO off")
+        .await?;
+    let rows = rows as i64;
+    let events_per_decision = events_per_decision as i64;
+    client
+        .execute(
+            "
+            INSERT INTO decisions (
+                decision_id, trace_id, request_id, subject, project, provider, model,
+                estimated_tokens, estimated_cost_usd, outcome, action, explanations_json,
+                metadata_json, entities_json, selected_budget_id, matched_entity,
+                selection_reason, model_check, routing_json, limit_hits_json, app_run_key, created_at
+            )
+            SELECT
+                'bench-company-decision-' || gs,
+                'bench-company-trace-' || (gs / 4),
+                'bench-company-request-' || gs,
+                'user:bench-' || (gs % 500),
+                'noether',
+                'openai-codex',
+                CASE WHEN gs % 7 = 0 THEN 'gpt-large-bench' ELSE 'gpt-small-bench' END,
+                600 + (gs % 2000),
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                'allow',
+                'allow',
+                '[{\"rule_id\":\"bench-project\",\"reason\":\"selected fallback budget for project:noether\",\"severity\":\"info\"}]',
+                '{\"trace_id\":\"bench-company-trace-' || (gs / 4) ||
+                    '\",\"request_id\":\"bench-company-request-' || gs ||
+                    '\",\"agent_run_id\":\"bench-company-run-' || (gs / 4) || '\"}',
+                '[\"project:noether\",\"user:bench-' || (gs % 500) || '\"]',
+                'bench-project',
+                'project:noether',
+                'selected fallback budget for project:noether',
+                'allowed:bench-project',
+                '{\"selected_budget_id\":\"bench-project\",\"matched_entity\":\"project:noether\",\"selection_reason\":\"selected fallback budget for project:noether\",\"model_check\":\"allowed:bench-project\"}',
+                '[]',
+                'agent-run:bench-company-run-' || (gs / 4),
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+            FROM generate_series(0::BIGINT, $1::BIGINT - 1) AS gs
+            ",
+            &[&rows],
+        )
+        .await?;
+    client
+        .execute(
+            "
+            INSERT INTO reservations (
+                id, decision_id, amount_usd, estimated_amount_usd, actual_amount_usd, currency,
+                status, created_at, expires_at, finalized_at, budget_rule_ids_json,
+                limit_window_spends_json, allocation_spends_json
+            )
+            SELECT
+                'bench-company-reservation-' || gs,
+                'bench-company-decision-' || gs,
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                'USD',
+                'finalized',
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second') + interval '1 hour', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                '[\"bench-project\"]',
+                '[{\"rule_id\":\"bench-project\",\"limit_id\":\"bench-budget-cap\",\"scope_key\":\"project:noether\",\"amount_usd\":' ||
+                    (0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0)) || '}]',
+                '[]'
+            FROM generate_series(0::BIGINT, $1::BIGINT - 1) AS gs
+            ",
+            &[&rows],
+        )
+        .await?;
+    client
+        .execute(
+            "
+            INSERT INTO reservation_limit_scopes (
+                reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+            )
+            SELECT
+                'bench-company-reservation-' || gs,
+                'bench-project',
+                'bench-budget-cap',
+                'project:noether',
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+            FROM generate_series(0::BIGINT, $1::BIGINT - 1) AS gs
+            ",
+            &[&rows],
+        )
+        .await?;
+    client
+        .execute(
+            "
+            INSERT INTO usage_observations (
+                id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
+                total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json, created_at
+            )
+            SELECT
+                'bench-company-usage-' || gs,
+                'bench-company-reservation-' || gs,
+                'bench-company-trace-' || (gs / 4),
+                'openai-codex',
+                CASE WHEN gs % 7 = 0 THEN 'gpt-large-bench' ELSE 'gpt-small-bench' END,
+                500 + (gs % 1000),
+                100 + (gs % 300),
+                600 + (gs % 1000) + (gs % 300),
+                0.001 + ((gs % 200)::DOUBLE PRECISION / 100000.0),
+                900 + (gs % 300),
+                'stop',
+                'bench',
+                '{\"trace_id\":\"bench-company-trace-' || (gs / 4) ||
+                    '\",\"request_id\":\"bench-company-request-' || gs ||
+                    '\",\"agent_run_id\":\"bench-company-run-' || (gs / 4) || '\"}',
+                to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+            FROM generate_series(0::BIGINT, $1::BIGINT - 1) AS gs
+            ",
+            &[&rows],
+        )
+        .await?;
+    if events_per_decision > 0 {
+        client
+            .execute(
+                "
+                INSERT INTO events (id, trace_id, kind, occurred_at, source, payload_json)
+                SELECT
+                    'bench-company-event-' || gs || '-' || event_index,
+                    'bench-company-trace-' || (gs / 4),
+                    CASE WHEN event_index = 0 THEN 'tool.observed' ELSE 'usage.observed' END,
+                    to_char((now() AT TIME ZONE 'UTC') - (($1::BIGINT - gs) * interval '1 second'), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                    'bench',
+                    '{\"name\":\"bench\",\"success\":true,\"metadata\":{\"agent_run_id\":\"bench-company-run-' || (gs / 4) ||
+                        '\",\"request_id\":\"bench-company-request-' || gs || '\"}}'
+                FROM generate_series(0::BIGINT, $1::BIGINT - 1) AS gs
+                CROSS JOIN generate_series(0::BIGINT, $2::BIGINT - 1) AS event_index
+                ",
+                &[&rows, &events_per_decision],
+            )
+            .await?;
+    }
+    client
+        .batch_execute(
+            "
+            INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+            VALUES ('bench-project', 'bench-budget-cap', 'project:noether',
+                    to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), 0)
+            ON CONFLICT(rule_id, limit_id, scope_key) DO NOTHING;
+            ANALYZE;
+            ",
+        )
+        .await?;
     Ok(())
 }
 
@@ -615,7 +1037,7 @@ async fn run_live_bench(base_url: &str, iterations: usize) -> Result<(), Box<dyn
     let base_url = base_url.trim_end_matches('/');
     let client = reqwest::Client::new();
     println!("noet-bench-live base_url={base_url} iterations={iterations}");
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+    println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
     bench_live_authorize(&client, base_url, iterations).await?;
     bench_live_finalize(&client, base_url, iterations).await?;
     Ok(())
@@ -774,13 +1196,14 @@ fn print_summary(name: &str, samples: &[Duration]) {
     let max = values.last().copied().unwrap_or_default();
     let p50 = percentile(&values, 0.50);
     let p95 = percentile(&values, 0.95);
+    let p99 = percentile(&values, 0.99);
     let avg = if values.is_empty() {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
     };
     println!(
-        "{name},{},{min:.3},{p50:.3},{p95:.3},{max:.3},{avg:.3}",
+        "{name},{},{min:.3},{p50:.3},{p95:.3},{p99:.3},{max:.3},{avg:.3}",
         values.len()
     );
 }

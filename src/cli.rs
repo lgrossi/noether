@@ -11,7 +11,9 @@ use tokio::fs;
 use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, TraceEvent};
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
-use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
+use crate::ledger::{
+    AsyncPostgresLedgerOptions, BudgetLedger, TraceReport, TraceReportItem, UsageReport,
+};
 use crate::local::{
     DEFAULT_LOCAL_BIND, ensure_local_runtime_layout, read_local_sidecar_owner,
     write_local_sidecar_owner,
@@ -70,6 +72,38 @@ struct ServeArgs {
     /// SQLite ledger path for durable local state.
     #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
+
+    /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
+    #[arg(long, env = "NOET_DATABASE_URL")]
+    database_url: Option<String>,
+
+    /// PostgreSQL durability/latency profile: strict or performance.
+    #[arg(long, env = "NOET_POSTGRES_PROFILE", default_value = "strict")]
+    postgres_profile: String,
+
+    /// Number of async PostgreSQL connections to use for hot-path writes.
+    #[arg(long)]
+    postgres_pool_size: Option<usize>,
+
+    /// Override whether PostgreSQL finalization persistence is queued after updating in-memory state.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    postgres_async_finalize: Option<bool>,
+
+    /// Bounded queue size for async PostgreSQL finalize persistence.
+    #[arg(long, long)]
+    postgres_finalize_queue_capacity: Option<usize>,
+
+    /// Per-connection PostgreSQL synchronous_commit setting: on, off, local, remote_write, remote_apply.
+    #[arg(long)]
+    postgres_synchronous_commit: Option<String>,
+
+    /// Emit debug logs with PostgreSQL hot-path stage timings.
+    #[arg(long)]
+    postgres_stage_timing: bool,
 
     /// Optional upstream base URL. When omitted, Noether returns mock responses.
     #[arg(long)]
@@ -169,6 +203,10 @@ struct ReportCommand {
     #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
 
+    /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
+    #[arg(long, env = "NOET_DATABASE_URL")]
+    database_url: Option<String>,
+
     /// Emit JSON instead of human-readable text.
     #[arg(long)]
     json: bool,
@@ -236,6 +274,11 @@ pub async fn run() -> Result<(), NoetError> {
     match cli.command {
         Command::Serve(args) => {
             let policy_path = args.policy.clone();
+            let postgres_options = if args.database_url.is_some() {
+                postgres_options_from_serve_args(&args)?
+            } else {
+                AsyncPostgresLedgerOptions::default()
+            };
             let policy = match policy_path.as_ref() {
                 Some(path) => Some(load_policy(path).await?),
                 None => None,
@@ -249,6 +292,8 @@ pub async fn run() -> Result<(), NoetError> {
                 fixture_dir: args.fixture_dir,
                 simulation_dir: args.simulation_dir,
                 db_path: args.db_path,
+                database_url: args.database_url,
+                postgres_options,
                 upstream: args.upstream,
                 routes,
                 policy_path,
@@ -263,6 +308,76 @@ pub async fn run() -> Result<(), NoetError> {
         Command::Report(command) => run_report(command).await,
         Command::Scenario(command) => run_scenario(command).await,
         Command::Simulate(command) => run_simulate(command).await,
+    }
+}
+
+fn postgres_options_from_serve_args(
+    args: &ServeArgs,
+) -> Result<AsyncPostgresLedgerOptions, NoetError> {
+    let mut options = AsyncPostgresLedgerOptions::from_profile(&args.postgres_profile)?;
+    if let Some(pool_size) = parse_env_usize_option("NOET_POSTGRES_POOL_SIZE")? {
+        options.pool_size = pool_size.max(1);
+    }
+    if let Some(async_finalize) = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE")? {
+        options.async_finalize = async_finalize;
+    }
+    if let Some(finalize_queue_capacity) =
+        parse_env_usize_option("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")?
+    {
+        options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+    }
+    if let Some(synchronous_commit) = std::env::var("NOET_POSTGRES_SYNCHRONOUS_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        options.synchronous_commit = Some(synchronous_commit);
+    }
+    if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING")? {
+        options.stage_timing = stage_timing;
+    }
+    if let Some(pool_size) = args.postgres_pool_size {
+        options.pool_size = pool_size.max(1);
+    }
+    if let Some(async_finalize) = args.postgres_async_finalize {
+        options.async_finalize = async_finalize;
+    }
+    if let Some(finalize_queue_capacity) = args.postgres_finalize_queue_capacity {
+        options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+    }
+    if let Some(synchronous_commit) = args.postgres_synchronous_commit.clone() {
+        options.synchronous_commit = Some(synchronous_commit);
+    }
+    if args.postgres_stage_timing {
+        options.stage_timing = true;
+    }
+    Ok(options)
+}
+
+fn parse_env_usize_option(name: &str) -> Result<Option<usize>, NoetError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value.trim().parse::<usize>().map(Some).map_err(|error| {
+        NoetError::InvalidConfig(format!("invalid {name} value {value:?}: {error}"))
+    })
+}
+
+fn parse_env_bool_option(name: &str) -> Result<Option<bool>, NoetError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(NoetError::InvalidConfig(format!(
+            "invalid {name} value {value:?}; expected true/false"
+        ))),
     }
 }
 
@@ -281,6 +396,8 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 fixture_dir: layout.fixture_dir,
                 simulation_dir: layout.simulation_dir,
                 db_path: layout.db_path,
+                database_url: None,
+                postgres_options: AsyncPostgresLedgerOptions::default(),
                 upstream: args.upstream,
                 routes,
                 policy_path: Some(layout.policy_path),
@@ -356,7 +473,10 @@ async fn run_fixtures(command: FixturesCommand) -> Result<(), NoetError> {
 }
 
 async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
-    let ledger = BudgetLedger::open_sqlite(&command.db_path)?;
+    let ledger = match command.database_url.as_deref() {
+        Some(database_url) => BudgetLedger::open_postgres(database_url)?,
+        None => BudgetLedger::open_sqlite(&command.db_path)?,
+    };
     match command.command {
         ReportSubcommand::Usage => {
             let report = reporting::usage_report(&ledger)?;

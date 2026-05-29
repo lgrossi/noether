@@ -24,6 +24,12 @@ pub enum NoetError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] postgres::Error),
+
+    #[error("PostgreSQL TLS error: {0}")]
+    PostgresTls(#[from] native_tls::Error),
+
     #[error("invalid upstream method: {0}")]
     Method(String),
 
@@ -45,9 +51,13 @@ impl IntoResponse for NoetError {
                 StatusCode::BAD_REQUEST
             }
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Io(_) | Self::Upstream(_) | Self::Url(_) | Self::Method(_) | Self::Sqlite(_) => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::Io(_)
+            | Self::Upstream(_)
+            | Self::Url(_)
+            | Self::Method(_)
+            | Self::Sqlite(_)
+            | Self::Postgres(_)
+            | Self::PostgresTls(_) => StatusCode::BAD_GATEWAY,
         };
 
         (status, json!({ "error": self.to_string() }).to_string()).into_response()

@@ -103,10 +103,8 @@ async fn evaluate_capture_decision(
     };
     let authorize_request = authorize_request_from_capture(request);
     let decision = state
-        .ledger
-        .lock()
-        .await
-        .try_authorize(Some(policy.as_ref()), &authorize_request)?;
+        .authorize_request(Some(policy), authorize_request)
+        .await?;
     Ok(Some(CapturedDecision {
         mode: state.decision_mode,
         decision,
