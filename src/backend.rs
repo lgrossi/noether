@@ -333,7 +333,9 @@ impl Backend {
     // Write hotpath — Phase 6
     // -----------------------------------------------------------------------
 
-    pub(crate) async fn persist_authorize_writes(
+    /// Persist authorize writes. Exposed for `noet-db-bench` / direct-bench example;
+    /// not stable public API.
+    pub async fn persist_authorize_writes(
         &self,
         snap: HotSnapshot,
         request: AuthorizeRequest,
@@ -346,7 +348,9 @@ impl Backend {
         }
     }
 
-    pub(crate) async fn persist_finalize_writes(
+    /// Persist finalize writes. Exposed for `noet-db-bench` / direct-bench example;
+    /// not stable public API.
+    pub async fn persist_finalize_writes(
         &self,
         reservation: Reservation,
         payload: FinalizeReservation,

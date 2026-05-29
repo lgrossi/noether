@@ -30,7 +30,7 @@ pub struct BudgetLedger {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct WindowState {
+pub struct WindowState {
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) used_usd: f64,
 }
@@ -53,22 +53,30 @@ pub(crate) struct StoredReservation {
     pub(crate) matched_entity: Option<String>,
 }
 
+#[derive(Default)]
 pub struct HotState {
     pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
     pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     pub(crate) reservations: HashMap<String, StoredReservation>,
 }
 
-pub(crate) struct HotSnapshot {
+pub struct HotSnapshot {
     pub(crate) limit_windows: HashMap<(String, String, String), WindowState>,
     pub(crate) allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     pub(crate) reservation_id: String,
     pub(crate) stored: StoredReservation,
-    pub(crate) selected_budget_id: Option<String>,
+    pub selected_budget_id: Option<String>,
     pub(crate) limit_hits: Vec<DecisionLimitHitReport>,
 }
 
-pub(crate) type ConnMutex = std::sync::Mutex<Option<rusqlite::Connection>>;
+impl HotSnapshot {
+    /// `matched_entity` of the reservation this snapshot was built for.
+    pub fn matched_entity(&self) -> Option<&str> {
+        self.stored.matched_entity.as_deref()
+    }
+}
+
+pub type ConnMutex = std::sync::Mutex<Option<rusqlite::Connection>>;
 
 #[derive(Clone, Debug)]
 struct BudgetCandidate {
@@ -137,20 +145,20 @@ struct AuthorizeMessageHint {
 }
 
 #[derive(Default)]
-pub(crate) struct RoutingPersistenceFields {
-    pub(crate) selected_budget_id: Option<String>,
-    pub(crate) matched_entity: Option<String>,
-    pub(crate) selection_reason: Option<String>,
-    pub(crate) rejected_budget_id: Option<String>,
-    pub(crate) rejected_budget_reason: Option<String>,
-    pub(crate) model_check: Option<String>,
-    pub(crate) budget_window_remaining_usd: Option<f64>,
-    pub(crate) budget_window_mode: Option<String>,
-    pub(crate) budget_window_started_at: Option<DateTime<Utc>>,
-    pub(crate) budget_window_ends_at: Option<DateTime<Utc>>,
-    pub(crate) tool_calls: Option<u64>,
-    pub(crate) agent_steps: Option<u64>,
-    pub(crate) retries: Option<u64>,
+pub struct RoutingPersistenceFields {
+    pub selected_budget_id: Option<String>,
+    pub matched_entity: Option<String>,
+    pub selection_reason: Option<String>,
+    pub rejected_budget_id: Option<String>,
+    pub rejected_budget_reason: Option<String>,
+    pub model_check: Option<String>,
+    pub budget_window_remaining_usd: Option<f64>,
+    pub budget_window_mode: Option<String>,
+    pub budget_window_started_at: Option<DateTime<Utc>>,
+    pub budget_window_ends_at: Option<DateTime<Utc>>,
+    pub tool_calls: Option<u64>,
+    pub agent_steps: Option<u64>,
+    pub retries: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2178,7 +2186,8 @@ impl BudgetLedger {
     }
 }
 
-pub(crate) fn try_authorize_at_hot(
+/// In-memory authorize cycle. Exposed for direct benchmarking; not stable public API.
+pub fn try_authorize_at_hot(
     hot: &mut HotState,
     policy: Option<&PolicyFile>,
     request: &AuthorizeRequest,
@@ -2280,7 +2289,8 @@ pub(crate) fn try_authorize_at_hot(
 /// Mutate HotState for a finalize: adjust window spends by the cost delta,
 /// mark the reservation finalized, and return the updated Reservation plus a
 /// Vec of (key, WindowState) pairs that changed (for L2 persistence).
-pub(crate) fn finalize_hot(
+/// In-memory finalize cycle. Exposed for direct benchmarking; not stable public API.
+pub fn finalize_hot(
     hot: &mut HotState,
     reservation_id: &str,
     payload: &FinalizeReservation,
