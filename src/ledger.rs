@@ -641,8 +641,11 @@ WITH updated AS (
         rule_id, limit_id, scope_key, started_at, used_usd
     ) VALUES ($16, $17, $18, $19, $20)
     ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
-        started_at = EXCLUDED.started_at,
-        used_usd = EXCLUDED.used_usd
+        used_usd = CASE
+            WHEN limit_window_states.started_at = EXCLUDED.started_at
+            THEN GREATEST(limit_window_states.used_usd + EXCLUDED.used_usd, 0)
+            ELSE limit_window_states.used_usd
+        END
     RETURNING 1
 )
 SELECT 1 FROM updated, inserted_usage, upsert_window
@@ -659,8 +662,11 @@ WITH updated AS (
         rule_id, limit_id, scope_key, started_at, used_usd
     ) VALUES ($5, $6, $7, $8, $9)
     ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
-        started_at = EXCLUDED.started_at,
-        used_usd = EXCLUDED.used_usd
+        used_usd = CASE
+            WHEN limit_window_states.started_at = EXCLUDED.started_at
+            THEN GREATEST(limit_window_states.used_usd + EXCLUDED.used_usd, 0)
+            ELSE limit_window_states.used_usd
+        END
     RETURNING 1
 )
 SELECT 1 FROM updated, upsert_window
@@ -748,17 +754,7 @@ async fn run_async_postgres_finalize_worker(
                 let tx = connection.client.transaction().await?;
                 tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
                     .await?;
-                let persisted_limit_window = persist_finalization_async(
-                    &tx,
-                    &statements,
-                    &write.reservation,
-                    &write.payload,
-                    &write.snapshot,
-                )
-                .await?;
-                if !persisted_limit_window {
-                    persist_limit_windows_async(&tx, &write.snapshot).await?;
-                }
+                persist_finalization_write_async(&tx, &statements, &write).await?;
                 tx.commit().await?;
                 Ok::<_, NoetError>(())
             }
@@ -5259,7 +5255,8 @@ async fn persist_finalization_write_async(
     )
     .await?;
     if !persisted_limit_window {
-        persist_limit_windows_async(conn, &write.snapshot).await?;
+        apply_finalization_limit_window_deltas_async(conn, &write.reservation, &write.snapshot)
+            .await?;
     }
     Ok(())
 }
@@ -5274,6 +5271,7 @@ async fn persist_finalization_async(
     let now = Utc::now().to_rfc3339();
     if let Some(stored) = snapshot.reservations.get(&reservation.id) {
         if stored.limit_window_spends.len() == 1 {
+            let delta = finalization_amount_delta(reservation, stored);
             let spend = &stored.limit_window_spends[0];
             let window_key = (
                 spend.rule_id.clone(),
@@ -5315,7 +5313,7 @@ async fn persist_finalization_async(
                         &spend.limit_id.as_str(),
                         &spend.scope_key.as_str(),
                         &window_started_at,
-                        &window.used_usd,
+                        &delta,
                     ],
                 )
                 .await?;
@@ -5332,7 +5330,7 @@ async fn persist_finalization_async(
                     &spend.limit_id.as_str(),
                     &spend.scope_key.as_str(),
                     &window_started_at,
-                    &window.used_usd,
+                    &delta,
                 ],
             )
             .await?;
@@ -5401,6 +5399,57 @@ async fn persist_finalization_async(
         .await?;
     }
     Ok(false)
+}
+
+async fn apply_finalization_limit_window_deltas_async(
+    conn: &(impl GenericClient + Sync),
+    reservation: &Reservation,
+    snapshot: &LedgerPersistenceSnapshot,
+) -> Result<(), NoetError> {
+    let Some(stored) = snapshot.reservations.get(&reservation.id) else {
+        return Ok(());
+    };
+    let delta = finalization_amount_delta(reservation, stored);
+    if delta == 0.0 {
+        return Ok(());
+    }
+    for spend in &stored.limit_window_spends {
+        let window_key = (
+            spend.rule_id.clone(),
+            spend.limit_id.clone(),
+            spend.scope_key.clone(),
+        );
+        let Some(window) = snapshot.limit_windows.get(&window_key) else {
+            continue;
+        };
+        let window_started_at = window.started_at.to_rfc3339();
+        conn.execute(
+            "
+            INSERT INTO limit_window_states (
+                rule_id, limit_id, scope_key, started_at, used_usd
+            ) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+                used_usd = CASE
+                    WHEN limit_window_states.started_at = EXCLUDED.started_at
+                    THEN GREATEST(limit_window_states.used_usd + EXCLUDED.used_usd, 0)
+                    ELSE limit_window_states.used_usd
+                END
+            ",
+            &[
+                &spend.rule_id.as_str(),
+                &spend.limit_id.as_str(),
+                &spend.scope_key.as_str(),
+                &window_started_at,
+                &delta,
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn finalization_amount_delta(reservation: &Reservation, stored: &StoredReservation) -> f64 {
+    reservation.amount_usd - stored.estimated_cost_usd
 }
 
 async fn persist_event_async(
