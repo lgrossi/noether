@@ -1,3 +1,7 @@
+// PG bench command:
+//   BENCH_PG_URL=postgres://noether:test@localhost:5433/noether \
+//   cargo run --release --bin noet-bench -- \
+//   --db-url postgres://noether:test@localhost:5433/noether
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -8,7 +12,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use noether::contract::{AuthorizeRequest, DecisionMode, FinalizeReservation, TraceEvent};
 use noether::ledger::BudgetLedger;
 use noether::policy::parse_policy_bytes;
-use noether::server::{build_router, build_sqlite_state, path_to_sqlite_url};
+use noether::server::{build_router, build_sqlite_state, path_to_sqlite_url, url_scheme};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -69,13 +73,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(base_url) = config.base_url.as_deref() {
         return run_live_bench(base_url, config.iterations).await;
     }
+
     let policy = parse_policy_bytes(BENCH_POLICY.as_bytes())?;
-    let db_path = std::env::temp_dir().join(format!(
-        "noether-bench-{}-{}.sqlite",
-        std::process::id(),
-        config.rows
-    ));
-    remove_sqlite_files(&db_path);
     let fixture_dir = std::env::temp_dir().join(format!(
         "noether-bench-fixtures-{}-{}",
         std::process::id(),
@@ -85,36 +84,95 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = std::fs::remove_dir_all(&fixture_dir);
     std::fs::create_dir_all(&fixture_dir)?;
 
-    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
-    match config.seed_mode {
-        SeedMode::Product => seed_ledger(&mut ledger, &policy, config.rows)?,
-        SeedMode::BulkCompany => {
-            drop(ledger);
-            seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
-            ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let db_url = config.db_url.clone().unwrap_or_else(|| {
+        let db_path = std::env::temp_dir().join(format!(
+            "noether-bench-{}-{}.sqlite",
+            std::process::id(),
+            config.rows
+        ));
+        path_to_sqlite_url(&db_path)
+    });
+
+    let is_postgres = url_scheme(&db_url).map_or(false, |s| s.starts_with("postgres"));
+
+    let (app, db_path_for_cleanup) = if is_postgres {
+        println!(
+            "noet-bench rows={} iterations={} db={}",
+            config.rows,
+            config.iterations,
+            db_url
+        );
+        println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
+
+        // For PG we always use seed_ledger (the API path) because
+        // seed_company_ledger_bulk writes raw SQLite SQL that cannot run on PG.
+        // Phase 9 may revisit if larger seed data is needed for PG tuning —
+        // at that point a native PG bulk-seed path should be added.
+        let pg_rows = config.rows.min(100);
+        if pg_rows < config.rows {
+            eprintln!(
+                "note: PG seeding uses api path, capped at {} rows (was {})",
+                pg_rows, config.rows
+            );
         }
-    }
-    drop(ledger);
 
-    let db_url = path_to_sqlite_url(&db_path);
-    let policy_runtime = noether::server::PolicyRuntime::static_policy(Some(policy));
-    let mut state = build_sqlite_state(
-        db_url,
-        policy_runtime,
-        DecisionMode::Enforce,
-        fixture_dir.clone(),
-        fixture_dir.join("simulations"),
-    )?;
-    state.policy_proposal_path = proposal_path.clone();
-    let app = build_router(state.clone());
+        let policy_runtime = noether::server::PolicyRuntime::static_policy(Some(policy.clone()));
+        let mut state = noether::server::build_postgres_state(
+            db_url.clone(),
+            policy_runtime,
+            DecisionMode::Enforce,
+            fixture_dir.clone(),
+            fixture_dir.join("simulations"),
+        )
+        .await?;
 
-    println!(
-        "noet-bench rows={} iterations={} db={}",
-        config.rows,
-        config.iterations,
-        db_path.display()
-    );
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+        // Seed via the AppState backend (PG-safe).
+        // We construct a temporary per-bench AppState-less ledger via the
+        // router's authorize endpoint — but the simplest approach is to call
+        // seed_ledger_via_backend which needs BudgetLedger. Because BudgetLedger
+        // is SQLite-only we seed via repeated HTTP calls through the live router.
+        state.policy_proposal_path = proposal_path.clone();
+        let seed_app = build_router(state.clone());
+        seed_pg_via_http(seed_app.clone(), &policy, pg_rows).await?;
+
+        let app = build_router(state);
+        (app, None)
+    } else {
+        let db_path = noether::server::sqlite_url_to_path(&db_url)
+            .ok_or("db_url must be sqlite:// or postgres://")?;
+        remove_sqlite_files(&db_path);
+
+        println!(
+            "noet-bench rows={} iterations={} db={}",
+            config.rows,
+            config.iterations,
+            db_path.display()
+        );
+        println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
+
+        let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+        match config.seed_mode {
+            SeedMode::Product => seed_ledger(&mut ledger, &policy, config.rows)?,
+            SeedMode::BulkCompany => {
+                drop(ledger);
+                seed_company_ledger_bulk(&db_path, config.rows, config.events_per_decision)?;
+                ledger = BudgetLedger::open_sqlite(&db_path)?;
+            }
+        }
+        drop(ledger);
+
+        let policy_runtime = noether::server::PolicyRuntime::static_policy(Some(policy));
+        let mut state = build_sqlite_state(
+            db_url.clone(),
+            policy_runtime,
+            DecisionMode::Enforce,
+            fixture_dir.clone(),
+            fixture_dir.join("simulations"),
+        )?;
+        state.policy_proposal_path = proposal_path.clone();
+        let app = build_router(state);
+        (app, Some(db_path))
+    };
 
     bench_get(
         "GET /v1/app/policy",
@@ -151,8 +209,59 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bench_finalize(app.clone(), config.iterations).await?;
     bench_event(app, config.iterations).await?;
 
-    remove_sqlite_files(&db_path);
+    if let Some(db_path) = db_path_for_cleanup {
+        remove_sqlite_files(&db_path);
+    }
     let _ = std::fs::remove_dir_all(&fixture_dir);
+    Ok(())
+}
+
+/// Seed the PG database by issuing real HTTP authorize+finalize+event calls
+/// through the in-process router. Slower than bulk SQL but backend-agnostic.
+async fn seed_pg_via_http(
+    app: axum::Router,
+    policy: &noether::policy::PolicyFile,
+    rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    let base_time = Utc::now() - ChronoDuration::seconds(rows as i64);
+    for index in 0..rows {
+        let trace_id = format!("bench-trace-{index}");
+        let request_id = format!("bench-request-{index}");
+        let agent_run_id = format!("bench-run-{index}");
+        let request = authorize_request(
+            index,
+            Some(&trace_id),
+            Some(&request_id),
+            Some(&agent_run_id),
+        );
+        let body = serde_json::to_vec(&request)?;
+        let response = request_json(app.clone(), Method::POST, "/v1/authorize", Some(body)).await?;
+        if let Some(reservation_id) = response
+            .get("reservation")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+        {
+            let _ = policy; // policy is enforced server-side
+            let finalize = finalize_payload(index, &trace_id, &request_id, &agent_run_id);
+            let body = serde_json::to_vec(&finalize)?;
+            let uri = format!("/v1/reservations/{reservation_id}/finalize");
+            let _ = request_body(app.clone(), Method::POST, &uri, Some(body)).await?;
+        }
+        let event = TraceEvent {
+            id: None,
+            trace_id: Some(trace_id),
+            occurred_at: Some(base_time + ChronoDuration::seconds(index as i64)),
+            kind: "tool.observed".to_owned(),
+            payload: json!({
+                "name": "shell",
+                "duration_ms": 10 + (index % 90),
+                "success": index % 17 != 0,
+                "metadata": { "agent_run_id": agent_run_id, "request_id": request_id }
+            }),
+        };
+        let body = serde_json::to_vec(&event)?;
+        let _ = request_body(app.clone(), Method::POST, "/v1/events", Some(body)).await?;
+    }
     Ok(())
 }
 
@@ -161,6 +270,7 @@ struct BenchConfig {
     rows: usize,
     iterations: usize,
     base_url: Option<String>,
+    db_url: Option<String>,
     seed_mode: SeedMode,
     events_per_decision: usize,
     skip_draft_replay: bool,
@@ -177,6 +287,7 @@ impl BenchConfig {
         let mut rows = 1_000;
         let mut iterations = 30;
         let mut base_url = None;
+        let mut db_url = std::env::var("BENCH_PG_URL").ok();
         let mut seed_mode = SeedMode::Product;
         let mut events_per_decision = 1;
         let mut skip_draft_replay = false;
@@ -198,6 +309,9 @@ impl BenchConfig {
                 "--base-url" => {
                     base_url = Some(args.next().ok_or("--base-url requires a value")?);
                 }
+                "--db-url" => {
+                    db_url = Some(args.next().ok_or("--db-url requires a value")?);
+                }
                 "--seed-mode" => {
                     seed_mode = match args.next().ok_or("--seed-mode requires a value")?.as_str() {
                         "product" => SeedMode::Product,
@@ -216,7 +330,7 @@ impl BenchConfig {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--base-url URL]"
+                        "Usage: cargo run --release --bin noet-bench -- [--rows N] [--iterations N] [--db-url sqlite://path|postgres://...] [--seed-mode product|bulk-company] [--events-per-decision N] [--skip-draft-replay] [--base-url URL]\n\nEnv vars: BENCH_PG_URL — sets --db-url default for PG runs"
                     );
                     std::process::exit(0);
                 }
@@ -227,6 +341,7 @@ impl BenchConfig {
             rows,
             iterations,
             base_url,
+            db_url,
             seed_mode,
             events_per_decision,
             skip_draft_replay,
@@ -618,7 +733,7 @@ async fn run_live_bench(base_url: &str, iterations: usize) -> Result<(), Box<dyn
     let base_url = base_url.trim_end_matches('/');
     let client = reqwest::Client::new();
     println!("noet-bench-live base_url={base_url} iterations={iterations}");
-    println!("name,count,min_ms,p50_ms,p95_ms,max_ms,avg_ms");
+    println!("name,count,min_ms,p50_ms,p95_ms,p99_ms,max_ms,avg_ms");
     bench_live_authorize(&client, base_url, iterations).await?;
     bench_live_finalize(&client, base_url, iterations).await?;
     Ok(())
@@ -777,13 +892,14 @@ fn print_summary(name: &str, samples: &[Duration]) {
     let max = values.last().copied().unwrap_or_default();
     let p50 = percentile(&values, 0.50);
     let p95 = percentile(&values, 0.95);
+    let p99 = percentile(&values, 0.99);
     let avg = if values.is_empty() {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
     };
     println!(
-        "{name},{},{min:.3},{p50:.3},{p95:.3},{max:.3},{avg:.3}",
+        "{name},{},{min:.3},{p50:.3},{p95:.3},{p99:.3},{max:.3},{avg:.3}",
         values.len()
     );
 }
