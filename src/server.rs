@@ -52,7 +52,6 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub policy: PolicyRuntime,
     pub decision_mode: DecisionMode,
-    pub ledger: Arc<Mutex<BudgetLedger>>,
     pub conn: Arc<ConnMutex>,
     pub event_count: Arc<AtomicU64>,
     pub hot: Arc<std::sync::Mutex<HotState>>,
@@ -549,7 +548,6 @@ impl AppState {
             client: reqwest::Client::new(),
             policy,
             decision_mode,
-            ledger: Arc::new(Mutex::new(BudgetLedger::default())),
             conn: Arc::new(std::sync::Mutex::new(None)),
             event_count: Arc::new(AtomicU64::new(0)),
             hot: Arc::new(std::sync::Mutex::new(HotState {
@@ -681,7 +679,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     state.routes = config.routes;
     state.db_path = Some(config.db_path.clone());
     let hot_state = ledger.hot_state();
-    state.ledger = Arc::new(Mutex::new(ledger));
+    drop(ledger);
     state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
     state.hot = Arc::new(std::sync::Mutex::new(hot_state));
     let app = build_router(state);
@@ -783,7 +781,6 @@ async fn authorize(
     let trace_id = request_trace_id(&request);
     let hot = Arc::clone(&state.hot);
     let conn = Arc::clone(&state.conn);
-    let ledger = Arc::clone(&state.ledger);
     let decision = tokio::task::spawn_blocking(move || -> Result<AuthorizeDecision, NoetError> {
         // L1: acquire HotState, run in-memory authorize, release L1.
         let (decision, snapshot) = {
@@ -791,13 +788,6 @@ async fn authorize(
             try_authorize_at_hot(&mut hot_guard, policy.as_deref(), &request, chrono::Utc::now())?
             // hot_guard dropped here — L1 released.
         };
-
-        // Mirror the reservation into state.ledger so that the finalize
-        // handler (which still uses ledger) can look it up.
-        if let Some(ref snap) = snapshot {
-            let mut ledger_guard = ledger.blocking_lock();
-            ledger_guard.mirror_reservation(snap.reservation_id.clone(), snap.stored.clone());
-        }
 
         // L2: acquire conn, persist snapshot, release L2.
         if let Some(snap) = snapshot {
@@ -3011,8 +3001,8 @@ mod tests {
         }
     }
 
-    async fn seed_reporting_data(state: &AppState) {
-        let mut ledger = state.ledger.lock().await;
+    fn seed_reporting_data(db_path: &std::path::Path) {
+        let mut ledger = BudgetLedger::open_sqlite(db_path).expect("open seed ledger");
 
         let alpha = ledger
             .try_authorize(
@@ -3802,26 +3792,31 @@ mod tests {
 
     #[tokio::test]
     async fn reporting_endpoints_match_shared_reporting_domain() {
-        let state = test_state(None);
-        seed_reporting_data(&state).await;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("noether.sqlite");
+        let mut state = test_state(None);
+        state.conn = Arc::new(std::sync::Mutex::new(Some(
+            rusqlite::Connection::open(&db_path).expect("conn"),
+        )));
+        seed_reporting_data(&db_path);
 
         let expected_usage = {
-            let ledger = state.ledger.lock().await;
+            let ledger = BudgetLedger::open_sqlite(&db_path).expect("ledger");
             serde_json::to_value(reporting::usage_report(&ledger).expect("usage report"))
                 .expect("usage json")
         };
         let expected_decisions = {
-            let ledger = state.ledger.lock().await;
+            let ledger = BudgetLedger::open_sqlite(&db_path).expect("ledger");
             serde_json::to_value(reporting::decisions_report(&ledger).expect("decisions report"))
                 .expect("decisions json")
         };
         let expected_trace = {
-            let ledger = state.ledger.lock().await;
+            let ledger = BudgetLedger::open_sqlite(&db_path).expect("ledger");
             serde_json::to_value(reporting::trace_report(&ledger, "trace-beta").expect("trace"))
                 .expect("trace json")
         };
         let expected_observations = {
-            let ledger = state.ledger.lock().await;
+            let ledger = BudgetLedger::open_sqlite(&db_path).expect("ledger");
             serde_json::to_value(
                 reporting::observations_report(&ledger, Some("tool"), Some("trace-beta"))
                     .expect("observations"),
@@ -4626,9 +4621,6 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
@@ -4640,7 +4632,8 @@ budgets:
         .expect("write proposal");
 
         {
-            let mut ledger = state.ledger.lock().await;
+            let mut ledger =
+                BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
             let mut request = report_request("trace-replay", "req-replay", "gpt-4.1", 1.25);
             request
                 .metadata
@@ -4748,9 +4741,6 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
@@ -4761,7 +4751,8 @@ budgets:
         )
         .expect("write proposal");
         {
-            let mut ledger = state.ledger.lock().await;
+            let mut ledger =
+                BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
             let mut request = report_request("trace-job", "request-job", "gpt-4.1", 0.01);
             request.project = None;
             request.entities = Vec::new();
@@ -4828,9 +4819,6 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
@@ -4848,7 +4836,8 @@ budgets:
         .expect("write proposal");
 
         {
-            let mut ledger = state.ledger.lock().await;
+            let mut ledger =
+                BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
             let mut request = report_request("trace-same", "req-same", "gpt-4.1", 0.5);
             request
                 .metadata
@@ -4928,9 +4917,8 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
+        // Initialize the schema, then open a second connection for the handler.
+        let _ = BudgetLedger::open_sqlite(&db_path).expect("schema init");
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
@@ -5074,14 +5062,12 @@ budgets:
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
         {
-            let mut ledger = state.ledger.lock().await;
+            let mut ledger =
+                BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
             let mut request = report_request("trace-detail", "req-detail", "gpt-4.1", 0.75);
             request
                 .metadata
@@ -5168,19 +5154,18 @@ budgets:
             DecisionMode::DryRun,
         );
         let db_path = tempdir.path().join("noether.sqlite");
-        state.ledger = Arc::new(Mutex::new(
-            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
-        ));
         state.conn = Arc::new(std::sync::Mutex::new(Some(
             rusqlite::Connection::open(&db_path).expect("conn"),
         )));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
         {
-            let mut ledger = state.ledger.lock().await;
+            let policy = state.active_policy().await;
+            let mut ledger =
+                BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
             let mut request = report_request("trace-model", "req-model", "gpt-5.5", 0.5);
             request.provider = Some("openai-codex".to_owned());
             ledger
-                .try_authorize(state.active_policy().await.as_deref(), &request)
+                .try_authorize(policy.as_deref(), &request)
                 .expect("authorize denied model");
         }
 
@@ -5361,11 +5346,11 @@ budgets:
     async fn sqlite_ledger_persists_decision_reservation_usage_and_events() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("noether.sqlite");
-        let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        // Initialize the schema first, then open a second connection for the handler.
+        let _ = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger init");
         let handler_conn =
             rusqlite::Connection::open(&db_path).expect("handler sqlite connection");
         let mut state = test_state(Some(strict_policy()));
-        state.ledger = Arc::new(Mutex::new(ledger));
         state.conn = Arc::new(std::sync::Mutex::new(Some(handler_conn)));
         let app = build_router(state);
 
@@ -5565,10 +5550,7 @@ policies: []
         );
 
         let allowed_policy = state.active_policy().await;
-        let allowed = state
-            .ledger
-            .lock()
-            .await
+        let allowed = BudgetLedger::default()
             .try_authorize(
                 allowed_policy.as_deref(),
                 &report_request("trace-reload-allow", "req-allow", "gpt-4.1", 0.01),
@@ -5605,10 +5587,7 @@ policies: []
         .expect("write updated policy");
 
         let denied_policy = state.active_policy().await;
-        let denied = state
-            .ledger
-            .lock()
-            .await
+        let denied = BudgetLedger::default()
             .try_authorize(
                 denied_policy.as_deref(),
                 &report_request("trace-reload-deny", "req-deny", "gpt-4.1", 0.01),
@@ -5659,10 +5638,7 @@ policies: []
         std::fs::write(&policy_path, "version: nope\n").expect("write invalid policy");
 
         let preserved_policy = state.active_policy().await;
-        let decision = state
-            .ledger
-            .lock()
-            .await
+        let decision = BudgetLedger::default()
             .try_authorize(
                 preserved_policy.as_deref(),
                 &report_request("trace-reload-stale", "req-stale", "gpt-4.1", 0.01),

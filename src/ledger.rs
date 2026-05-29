@@ -629,16 +629,12 @@ impl BudgetLedger {
         self.events_count.load(Ordering::Relaxed) as usize
     }
 
-    pub(crate) fn hot_state(&self) -> HotState {
+    pub fn hot_state(&self) -> HotState {
         HotState {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
             reservations: self.reservations.clone(),
         }
-    }
-
-    pub(crate) fn mirror_reservation(&mut self, id: String, stored: StoredReservation) {
-        self.reservations.insert(id, stored);
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {

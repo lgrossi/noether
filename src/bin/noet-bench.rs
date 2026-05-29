@@ -95,6 +95,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let hot_state = ledger.hot_state();
+    drop(ledger);
+    let handler_conn = Connection::open(&db_path)?;
     let mut state = AppState::new(
         fixture_dir.clone(),
         None,
@@ -102,7 +105,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         DecisionMode::Enforce,
     );
     state.policy_proposal_path = proposal_path.clone();
-    *state.ledger.lock().await = ledger;
+    state.db_path = Some(db_path.clone());
+    state.conn = std::sync::Arc::new(std::sync::Mutex::new(Some(handler_conn)));
+    state.hot = std::sync::Arc::new(std::sync::Mutex::new(hot_state));
     let app = build_router(state.clone());
 
     println!(
