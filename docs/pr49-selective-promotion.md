@@ -19,7 +19,7 @@ Context: PR #48 already merged PostgreSQL ledger support into `main`. PR #49 is 
 | `events_count` instead of retained events vec | Avoid in-memory event growth | Already addressed differently in current main via persistence-focused paths | Low value now | No action |
 | Report/read dispatch | Backend-specific read path | Already present in current main through `AppState::read_ledger` and `spawn_blocking` reads | Low value now | No action |
 | `noet-bench` p99/live additions | Better endpoint benchmark reporting | Mostly already present in current main from #48 follow-up work | Low value now | No action |
-| `examples/direct-bench.rs` | Direct DB-layer benchmark separate from Axum service bench | Useful for isolating storage cost | Medium; PR #49 version depends on its unmerged backend/hot-state API | Rebuild separately against current #48 APIs if needed |
+| `examples/direct-bench.rs` | Direct DB-layer benchmark separate from Axum service bench | Useful for isolating storage cost | Medium; PR #49 version depends on its unmerged backend/hot-state API | Rebuilt against current APIs in this branch |
 | Simulation PG isolation | Schema-per-strategy simulation isolation | Could be useful for future PG simulation support | Medium; current simulation path remains SQLite-oriented | Defer |
 
 ## What was promoted
@@ -46,11 +46,23 @@ connection presence with a typed selected-store enum. SQLite and Postgres
 remain supported; the ledger now owns exactly one active store variant instead
 of carrying parallel optional connections.
 
+This branch also adds `examples/direct-bench.rs`, rebuilt against the current
+SQLite `BudgetLedger` and Postgres `AsyncPostgresLedger` APIs rather than PR
+#49's unmerged HotState/backend API.
+
+## Validation performed
+
+- `cargo test --test parity_server`: 10 passed, SQLite path.
+- `NOET_TEST_POSTGRES_URL=postgres://spillio:spillio@127.0.0.1:5432/spillio cargo test --test parity_server`: 10 passed, SQLite plus live Postgres schema-isolated parity paths.
+- `cargo test`: 168 passed, 4 ignored.
+- `cargo run --release --example direct-bench -- --backend sqlite --iterations 10`: passed.
+- `cargo run --release --example direct-bench -- --backend postgres --db-url postgres://spillio:spillio@127.0.0.1:5432/spillio?... --iterations 10 --postgres-profile strict`: passed against an isolated schema.
+
 ## Current recommendation
 
 Promote #49 in small follow-up PRs only:
 
 1. parity tests (this branch),
-2. direct DB-layer benchmark rebuilt against current main APIs,
+2. direct DB-layer benchmark rebuilt against current main APIs (this branch),
 3. larger backend abstraction only after a design that preserves #48 advisory-lock/shared-state semantics,
 4. hot-path optimizations only with SQLite and Postgres benchmark evidence plus multi-instance correctness tests.

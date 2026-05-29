@@ -47,7 +47,12 @@ impl Drop for PostgresTestSchema {
                         let _ = connection.await;
                     });
                     let _ = admin
-                        .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+                        .batch_execute(&format!(
+                            r#"
+                            SET lock_timeout = '2s';
+                            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+                            "#
+                        ))
                         .await;
                 }
             });
@@ -115,7 +120,11 @@ pub async fn run_server_parity<F, Fut>(
     body(state).await;
 
     match postgres_state(policy, decision_mode).await {
-        Some((state, _postgres_schema)) => body(state).await,
+        Some((state, postgres_schema)) => {
+            body(state.clone()).await;
+            drop(state);
+            drop(postgres_schema);
+        }
         None => eprintln!("{name}: NOET_TEST_POSTGRES_URL not set; skipped Postgres parity run"),
     }
 }
