@@ -994,12 +994,12 @@ impl AsyncPostgresLedger {
             (reservation, write, decision_elapsed)
         };
         if let Some(finalize_tx) = finalize_tx {
+            self.pending_async_finalizations
+                .lock()
+                .await
+                .insert(reservation.id.clone());
             match finalize_tx.try_send(write) {
                 Ok(()) => {
-                    self.pending_async_finalizations
-                        .lock()
-                        .await
-                        .insert(reservation.id.clone());
                     if self.stage_timing {
                         tracing::debug!(
                             decision_ms = decision_elapsed.as_secs_f64() * 1000.0,
@@ -1010,12 +1010,20 @@ impl AsyncPostgresLedger {
                     return Ok(reservation);
                 }
                 Err(mpsc::error::TrySendError::Full(write)) => {
+                    self.pending_async_finalizations
+                        .lock()
+                        .await
+                        .remove(&reservation.id);
                     tracing::warn!("postgres async finalize queue full; persisting synchronously");
                     return self
                         .persist_finalization_write(write, reservation, started, decision_elapsed)
                         .await;
                 }
                 Err(mpsc::error::TrySendError::Closed(write)) => {
+                    self.pending_async_finalizations
+                        .lock()
+                        .await
+                        .remove(&reservation.id);
                     tracing::warn!(
                         "postgres async finalize queue closed; persisting synchronously"
                     );
