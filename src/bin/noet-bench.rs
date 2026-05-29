@@ -148,14 +148,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some((database_url, postgres_ledger)) =
         effective_database_url.clone().zip(postgres_ledger.clone())
     {
-        state.ledger_backend = LedgerBackend::Postgres {
-            database_url,
-            ledger: postgres_ledger,
-        };
+        state.ledger_backend = LedgerBackend::postgres(database_url, postgres_ledger);
     } else {
-        state.ledger_backend = LedgerBackend::SQLite {
-            path: db_path.clone(),
-        };
+        state.ledger_backend = LedgerBackend::sqlite(db_path.clone());
     }
     state.policy_proposal_path = proposal_path.clone();
     *state.ledger.lock().await = ledger;

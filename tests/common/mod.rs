@@ -21,7 +21,7 @@ pub fn sqlite_state(
         decision_mode,
     );
     state.ledger = Arc::new(Mutex::new(ledger));
-    state.ledger_backend = LedgerBackend::SQLite { path: db_path };
+    state.ledger_backend = LedgerBackend::sqlite(db_path);
     (state, dir)
 }
 
@@ -94,10 +94,7 @@ pub async fn postgres_state(
         policy,
         decision_mode,
     );
-    state.ledger_backend = LedgerBackend::Postgres {
-        database_url: scoped_url,
-        ledger: postgres_ledger,
-    };
+    state.ledger_backend = LedgerBackend::postgres(scoped_url, postgres_ledger);
     Some((
         state,
         PostgresTestSchema {

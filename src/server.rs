@@ -1,7 +1,10 @@
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -55,25 +58,317 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
-pub enum LedgerBackend {
-    InMemory,
-    SQLite {
-        path: PathBuf,
-    },
-    Postgres {
-        database_url: String,
-        ledger: AsyncPostgresLedger,
-    },
+pub struct LedgerBackend {
+    driver: Arc<dyn LedgerBackendDriver>,
 }
 
 impl LedgerBackend {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::InMemory => "in_memory",
-            Self::SQLite { .. } => "sqlite",
-            Self::Postgres { .. } => "postgres",
+    pub fn in_memory() -> Self {
+        Self {
+            driver: Arc::new(InMemoryLedgerBackend),
         }
     }
+
+    pub fn sqlite(path: PathBuf) -> Self {
+        Self {
+            driver: Arc::new(SqliteLedgerBackend { path }),
+        }
+    }
+
+    pub fn postgres(database_url: String, ledger: AsyncPostgresLedger) -> Self {
+        Self {
+            driver: Arc::new(PostgresLedgerBackend {
+                database_url,
+                ledger,
+            }),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.driver.name()
+    }
+
+    fn postgres_async_finalize_failures(&self) -> Option<u64> {
+        self.driver.postgres_async_finalize_failures()
+    }
+
+    async fn authorize_request(
+        &self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        policy: Option<Arc<PolicyFile>>,
+        request: AuthorizeRequest,
+    ) -> Result<AuthorizeDecision, NoetError> {
+        self.driver
+            .authorize_request(sync_ledger, policy, request)
+            .await
+    }
+
+    async fn finalize_reservation(
+        &self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        reservation_id: String,
+        payload: FinalizeReservation,
+    ) -> Result<Reservation, NoetError> {
+        self.driver
+            .finalize_reservation(sync_ledger, reservation_id, payload)
+            .await
+    }
+
+    async fn record_trace_event(
+        &self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        event: TraceEvent,
+    ) -> Result<(), NoetError> {
+        self.driver.record_trace_event(sync_ledger, event).await
+    }
+
+    async fn read_ledger<T: Send + 'static>(
+        &self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
+    ) -> Result<T, NoetError> {
+        let result = self
+            .driver
+            .read_ledger_boxed(
+                sync_ledger,
+                Box::new(move |ledger| {
+                    read(ledger).map(|value| Box::new(value) as Box<dyn Any + Send>)
+                }),
+            )
+            .await?;
+        result.downcast::<T>().map(|value| *value).map_err(|_| {
+            NoetError::InvalidConfig("ledger read returned unexpected result type".to_owned())
+        })
+    }
+}
+
+type LedgerBackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, NoetError>> + Send + 'a>>;
+type LedgerReadBox =
+    Box<dyn FnOnce(&BudgetLedger) -> Result<Box<dyn Any + Send>, NoetError> + Send + 'static>;
+
+trait LedgerBackendDriver: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn postgres_async_finalize_failures(&self) -> Option<u64> {
+        None
+    }
+
+    fn authorize_request<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        policy: Option<Arc<PolicyFile>>,
+        request: AuthorizeRequest,
+    ) -> LedgerBackendFuture<'a, AuthorizeDecision>;
+
+    fn finalize_reservation<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        reservation_id: String,
+        payload: FinalizeReservation,
+    ) -> LedgerBackendFuture<'a, Reservation>;
+
+    fn record_trace_event<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        event: TraceEvent,
+    ) -> LedgerBackendFuture<'a, ()>;
+
+    fn read_ledger_boxed<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        read: LedgerReadBox,
+    ) -> LedgerBackendFuture<'a, Box<dyn Any + Send>>;
+}
+
+struct InMemoryLedgerBackend;
+
+struct SqliteLedgerBackend {
+    path: PathBuf,
+}
+
+struct PostgresLedgerBackend {
+    database_url: String,
+    ledger: AsyncPostgresLedger,
+}
+
+impl LedgerBackendDriver for InMemoryLedgerBackend {
+    fn name(&self) -> &'static str {
+        "in_memory"
+    }
+
+    fn authorize_request<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        policy: Option<Arc<PolicyFile>>,
+        request: AuthorizeRequest,
+    ) -> LedgerBackendFuture<'a, AuthorizeDecision> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| {
+                ledger.try_authorize(policy.as_deref(), &request)
+            })
+            .await
+        })
+    }
+
+    fn finalize_reservation<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        reservation_id: String,
+        payload: FinalizeReservation,
+    ) -> LedgerBackendFuture<'a, Reservation> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| {
+                ledger.finalize(&reservation_id, &payload)
+            })
+            .await
+        })
+    }
+
+    fn record_trace_event<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        event: TraceEvent,
+    ) -> LedgerBackendFuture<'a, ()> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| ledger.record_event(event)).await
+        })
+    }
+
+    fn read_ledger_boxed<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        read: LedgerReadBox,
+    ) -> LedgerBackendFuture<'a, Box<dyn Any + Send>> {
+        Box::pin(async move {
+            let ledger = sync_ledger.lock().await;
+            read(&ledger)
+        })
+    }
+}
+
+impl LedgerBackendDriver for SqliteLedgerBackend {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn authorize_request<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        policy: Option<Arc<PolicyFile>>,
+        request: AuthorizeRequest,
+    ) -> LedgerBackendFuture<'a, AuthorizeDecision> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| {
+                ledger.try_authorize(policy.as_deref(), &request)
+            })
+            .await
+        })
+    }
+
+    fn finalize_reservation<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        reservation_id: String,
+        payload: FinalizeReservation,
+    ) -> LedgerBackendFuture<'a, Reservation> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| {
+                ledger.finalize(&reservation_id, &payload)
+            })
+            .await
+        })
+    }
+
+    fn record_trace_event<'a>(
+        &'a self,
+        sync_ledger: Arc<Mutex<BudgetLedger>>,
+        event: TraceEvent,
+    ) -> LedgerBackendFuture<'a, ()> {
+        Box::pin(async move {
+            spawn_sync_ledger_task(sync_ledger, move |ledger| ledger.record_event(event)).await
+        })
+    }
+
+    fn read_ledger_boxed<'a>(
+        &'a self,
+        _sync_ledger: Arc<Mutex<BudgetLedger>>,
+        read: LedgerReadBox,
+    ) -> LedgerBackendFuture<'a, Box<dyn Any + Send>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let ledger = BudgetLedger::open_sqlite(&path)?;
+                read(&ledger)
+            })
+            .await
+            .map_err(|error| {
+                NoetError::InvalidConfig(format!("sqlite read task panicked: {error}"))
+            })?
+        })
+    }
+}
+
+impl LedgerBackendDriver for PostgresLedgerBackend {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn postgres_async_finalize_failures(&self) -> Option<u64> {
+        Some(self.ledger.async_finalize_failures())
+    }
+
+    fn authorize_request<'a>(
+        &'a self,
+        _sync_ledger: Arc<Mutex<BudgetLedger>>,
+        policy: Option<Arc<PolicyFile>>,
+        request: AuthorizeRequest,
+    ) -> LedgerBackendFuture<'a, AuthorizeDecision> {
+        Box::pin(async move { self.ledger.try_authorize(policy, request).await })
+    }
+
+    fn finalize_reservation<'a>(
+        &'a self,
+        _sync_ledger: Arc<Mutex<BudgetLedger>>,
+        reservation_id: String,
+        payload: FinalizeReservation,
+    ) -> LedgerBackendFuture<'a, Reservation> {
+        Box::pin(async move { self.ledger.finalize(reservation_id, payload).await })
+    }
+
+    fn record_trace_event<'a>(
+        &'a self,
+        _sync_ledger: Arc<Mutex<BudgetLedger>>,
+        event: TraceEvent,
+    ) -> LedgerBackendFuture<'a, ()> {
+        Box::pin(async move { self.ledger.record_event(event).await })
+    }
+
+    fn read_ledger_boxed<'a>(
+        &'a self,
+        _sync_ledger: Arc<Mutex<BudgetLedger>>,
+        read: LedgerReadBox,
+    ) -> LedgerBackendFuture<'a, Box<dyn Any + Send>> {
+        let database_url = self.database_url.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let ledger = BudgetLedger::open_postgres(&database_url)?;
+                read(&ledger)
+            })
+            .await
+            .map_err(|error| {
+                NoetError::InvalidConfig(format!("postgres read task panicked: {error}"))
+            })?
+        })
+    }
+}
+
+async fn spawn_sync_ledger_task<T: Send + 'static>(
+    sync_ledger: Arc<Mutex<BudgetLedger>>,
+    task: impl FnOnce(&mut BudgetLedger) -> Result<T, NoetError> + Send + 'static,
+) -> Result<T, NoetError> {
+    tokio::task::spawn_blocking(move || task(&mut sync_ledger.blocking_lock()))
+        .await
+        .map_err(|error| NoetError::InvalidConfig(format!("ledger task panicked: {error}")))?
 }
 
 #[allow(dead_code)]
@@ -573,7 +868,7 @@ impl AppState {
             policy,
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
-            ledger_backend: LedgerBackend::InMemory,
+            ledger_backend: LedgerBackend::in_memory(),
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -604,10 +899,7 @@ impl AppState {
     }
 
     pub fn postgres_async_finalize_failures(&self) -> Option<u64> {
-        match &self.ledger_backend {
-            LedgerBackend::Postgres { ledger, .. } => Some(ledger.async_finalize_failures()),
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => None,
-        }
+        self.ledger_backend.postgres_async_finalize_failures()
     }
 
     pub async fn authorize_request(
@@ -615,21 +907,9 @@ impl AppState {
         policy: Option<Arc<PolicyFile>>,
         request: AuthorizeRequest,
     ) -> Result<AuthorizeDecision, NoetError> {
-        match &self.ledger_backend {
-            LedgerBackend::Postgres { ledger, .. } => ledger.try_authorize(policy, request).await,
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
-                let ledger = Arc::clone(&self.ledger);
-                tokio::task::spawn_blocking(move || {
-                    ledger
-                        .blocking_lock()
-                        .try_authorize(policy.as_deref(), &request)
-                })
-                .await
-                .map_err(|error| {
-                    NoetError::InvalidConfig(format!("ledger authorize task panicked: {error}"))
-                })?
-            }
-        }
+        self.ledger_backend
+            .authorize_request(Arc::clone(&self.ledger), policy, request)
+            .await
     }
 
     pub async fn finalize_reservation(
@@ -637,35 +917,15 @@ impl AppState {
         reservation_id: String,
         payload: FinalizeReservation,
     ) -> Result<Reservation, NoetError> {
-        match &self.ledger_backend {
-            LedgerBackend::Postgres { ledger, .. } => {
-                ledger.finalize(reservation_id, payload).await
-            }
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
-                let ledger = Arc::clone(&self.ledger);
-                tokio::task::spawn_blocking(move || {
-                    ledger.blocking_lock().finalize(&reservation_id, &payload)
-                })
-                .await
-                .map_err(|error| {
-                    NoetError::InvalidConfig(format!("ledger finalize task panicked: {error}"))
-                })?
-            }
-        }
+        self.ledger_backend
+            .finalize_reservation(Arc::clone(&self.ledger), reservation_id, payload)
+            .await
     }
 
     pub async fn record_trace_event(&self, event: TraceEvent) -> Result<(), NoetError> {
-        match &self.ledger_backend {
-            LedgerBackend::Postgres { ledger, .. } => ledger.record_event(event).await,
-            LedgerBackend::InMemory | LedgerBackend::SQLite { .. } => {
-                let ledger = Arc::clone(&self.ledger);
-                tokio::task::spawn_blocking(move || ledger.blocking_lock().record_event(event))
-                    .await
-                    .map_err(|error| {
-                        NoetError::InvalidConfig(format!("ledger event task panicked: {error}"))
-                    })?
-            }
-        }
+        self.ledger_backend
+            .record_trace_event(Arc::clone(&self.ledger), event)
+            .await
     }
 
     async fn active_policy_source(&self) -> Option<(Option<PathBuf>, String, Arc<PolicyFile>)> {
@@ -683,34 +943,9 @@ impl AppState {
         &self,
         read: impl FnOnce(&BudgetLedger) -> Result<T, NoetError> + Send + 'static,
     ) -> Result<T, NoetError> {
-        match &self.ledger_backend {
-            LedgerBackend::SQLite { path } => {
-                let path = path.clone();
-                tokio::task::spawn_blocking(move || {
-                    let ledger = BudgetLedger::open_sqlite(&path)?;
-                    read(&ledger)
-                })
-                .await
-                .map_err(|error| {
-                    NoetError::InvalidConfig(format!("sqlite read task panicked: {error}"))
-                })?
-            }
-            LedgerBackend::Postgres { database_url, .. } => {
-                let database_url = database_url.clone();
-                tokio::task::spawn_blocking(move || {
-                    let ledger = BudgetLedger::open_postgres(&database_url)?;
-                    read(&ledger)
-                })
-                .await
-                .map_err(|error| {
-                    NoetError::InvalidConfig(format!("postgres read task panicked: {error}"))
-                })?
-            }
-            LedgerBackend::InMemory => {
-                let ledger = self.ledger.lock().await;
-                read(&ledger)
-            }
-        }
+        self.ledger_backend
+            .read_ledger(Arc::clone(&self.ledger), read)
+            .await
     }
 }
 
@@ -781,15 +1016,10 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     state.routes = config.routes;
     if let Some(database_url) = config.database_url {
         if let Some(postgres_ledger) = postgres_ledger {
-            state.ledger_backend = LedgerBackend::Postgres {
-                database_url,
-                ledger: postgres_ledger,
-            };
+            state.ledger_backend = LedgerBackend::postgres(database_url, postgres_ledger);
         }
     } else {
-        state.ledger_backend = LedgerBackend::SQLite {
-            path: config.db_path.clone(),
-        };
+        state.ledger_backend = LedgerBackend::sqlite(config.db_path.clone());
     }
     state.ledger = Arc::new(Mutex::new(ledger));
     let app = build_router(state);
@@ -5526,9 +5756,7 @@ budgets:
         state.ledger = Arc::new(TokioMutex::new(
             BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
         ));
-        state.ledger_backend = LedgerBackend::SQLite {
-            path: db_path.clone(),
-        };
+        state.ledger_backend = LedgerBackend::sqlite(db_path.clone());
         let app = build_router(state);
 
         let response = app
@@ -5586,10 +5814,7 @@ budgets:
             Some(model_locked_policy()),
             DecisionMode::Enforce,
         );
-        state.ledger_backend = LedgerBackend::Postgres {
-            database_url: scoped_url,
-            ledger: postgres_ledger,
-        };
+        state.ledger_backend = LedgerBackend::postgres(scoped_url, postgres_ledger);
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "trace_id".to_owned(),
@@ -5711,10 +5936,7 @@ budgets:
             Some(model_locked_policy()),
             DecisionMode::Enforce,
         );
-        state.ledger_backend = LedgerBackend::Postgres {
-            database_url: scoped_url,
-            ledger: postgres_ledger,
-        };
+        state.ledger_backend = LedgerBackend::postgres(scoped_url, postgres_ledger);
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "trace_id".to_owned(),
