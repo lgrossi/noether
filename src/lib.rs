@@ -1,6 +1,7 @@
 pub mod approval_audit;
 pub mod capture;
 pub mod cli;
+pub mod config;
 pub mod contract;
 pub mod error;
 pub mod fixture;

@@ -308,6 +308,8 @@ pub struct RequestCostLimit {
     pub max_usd: f64,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning_cadence: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -316,6 +318,8 @@ pub struct ContextTokenLimit {
     pub max_tokens: u64,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning_cadence: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -344,6 +348,8 @@ pub struct SpendWindowLimit {
     pub warn_at_fractions: Vec<f64>,
     #[serde(default = "default_limit_action")]
     pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning_cadence: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

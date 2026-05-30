@@ -15,7 +15,7 @@ use crate::ledger::{
     AsyncPostgresLedgerOptions, BudgetLedger, TraceReport, TraceReportItem, UsageReport,
 };
 use crate::local::{
-    DEFAULT_LOCAL_BIND, ensure_local_runtime_layout, read_local_sidecar_owner,
+    DEFAULT_LOCAL_BIND, ensure_local_runtime_layout, load_local_config, read_local_sidecar_owner,
     write_local_sidecar_owner,
 };
 use crate::policy::{load_policy, policy_validation_warnings};
@@ -344,6 +344,7 @@ pub async fn run() -> Result<(), NoetError> {
                 routes,
                 policy_path,
                 policy,
+                noether_config: Default::default(),
                 decision_mode: args.decision_mode,
             })
             .await
@@ -434,6 +435,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
             let layout = ensure_local_runtime_layout(&args.root).await?;
             write_local_sidecar_owner(&layout, &args.bind.to_string()).await?;
             let policy = load_policy(&layout.policy_path).await?;
+            let noether_config = load_local_config(&layout.config_path).await?;
             let routes = match args.routes {
                 Some(path) => load_proxy_routes(&path).await?.routes,
                 None => Vec::new(),
@@ -449,6 +451,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
                 routes,
                 policy_path: Some(layout.policy_path),
                 policy: Some(policy),
+                noether_config,
                 decision_mode: args.decision_mode,
             })
             .await
