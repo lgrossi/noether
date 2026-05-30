@@ -1882,6 +1882,10 @@ impl BudgetLedger {
             });
         }
 
+        if action == PolicyAction::Allow && message_hints.is_empty() {
+            notifications = self.enablement_notifications(policy, request, now);
+        }
+
         let reservation = if action.halts_request() {
             None
         } else {
@@ -1893,10 +1897,6 @@ impl BudgetLedger {
             self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
         }
-        if action == PolicyAction::Allow && message_hints.is_empty() {
-            notifications = self.enablement_notifications(policy, request, now);
-        }
-
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
             outcome: action.decision_outcome(),
@@ -7726,7 +7726,14 @@ fn apply_budget_limits(
                 &projection,
                 DecisionSeverity::Warn,
                 Some(warn_threshold),
-                MessageHintRecommendation::Show,
+                ledger.recommend_message_hint(
+                    request,
+                    &format!("warn.{}", projection.rule_id),
+                    &projection.scope_key,
+                    DecisionSeverity::Warn,
+                    now,
+                    projection.warning_cadence.as_deref(),
+                ),
             ));
         }
         if projection.projected_spend_usd > projection.max_usd {
@@ -9267,6 +9274,22 @@ mod tests {
     }
 
     #[test]
+    fn authorize_computes_enablement_headroom_before_current_reservation() {
+        let policy = policy(1.0, 0.8);
+        let mut request = request(0.45);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(
+            first_notification(&decision).is_some(),
+            "current reservation must not be counted twice when deciding whether headroom exists"
+        );
+    }
+
+    #[test]
     fn authorize_can_extend_enablement_tip_catalog_from_config() {
         let mut config = AdvisoryConfig::default();
         config.enablement_tips.tips = vec![EnablementTipConfig {
@@ -9675,6 +9698,33 @@ mod tests {
         assert_eq!(
             first_message_hint_recommendation(&shown_again).as_deref(),
             Some("show")
+        );
+    }
+
+    #[test]
+    fn spend_threshold_warning_uses_policy_cadence_override() {
+        let mut policy = policy(1.0, 1.0);
+        policy.budgets[0].limits.spend[0].warn_at_fractions = vec![0.5, 0.75];
+        policy.budgets[0].limits.spend[0].warning_cadence = Some("1h".to_owned());
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger
+            .try_authorize_at(Some(&policy), &request(0.50), now)
+            .expect("first threshold");
+        let hidden = ledger
+            .try_authorize_at(Some(&policy), &request(0.26), now + Duration::seconds(10))
+            .expect("second threshold");
+
+        assert_eq!(first.outcome, DecisionOutcome::Warn);
+        assert_eq!(hidden.outcome, DecisionOutcome::Warn);
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&hidden).as_deref(),
+            Some("hide")
         );
     }
 
