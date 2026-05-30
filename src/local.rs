@@ -200,6 +200,23 @@ pub async fn write_local_sidecar_owner(
     Ok(owner)
 }
 
+pub fn write_local_sidecar_owner_sync(
+    layout: &LocalRuntimeLayout,
+    bind: &str,
+) -> Result<LocalSidecarOwner, NoetError> {
+    std_fs::create_dir_all(&layout.sidecar_dir)?;
+    let owner = LocalSidecarOwner {
+        state: "running".to_owned(),
+        pid: std::process::id(),
+        cwd: std::env::current_dir()?,
+        bind: bind.to_owned(),
+        url: format!("http://{bind}"),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    std_fs::write(&layout.owner_path, serde_json::to_vec(&owner)?)?;
+    Ok(owner)
+}
+
 pub async fn read_local_sidecar_owner(root: &Path) -> Result<Option<LocalSidecarOwner>, NoetError> {
     let layout = local_runtime_layout_for_read(root).await?;
     if let Some(owner) = read_local_sidecar_owner_at(&layout.owner_path).await? {

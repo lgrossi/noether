@@ -19,7 +19,7 @@ use crate::ledger::{
 use crate::local::{
     DEFAULT_LOCAL_BIND, DEFAULT_LOCAL_CONFIG, DEFAULT_LOCAL_POLICY, clear_local_sidecar_owner,
     ensure_local_runtime_layout, load_local_config, read_local_sidecar_owner,
-    write_local_sidecar_owner,
+    write_local_sidecar_owner_sync,
 };
 use crate::policy::{load_policy, policy_validation_warnings};
 use crate::proxy::load_proxy_routes;
@@ -474,6 +474,7 @@ pub async fn run() -> Result<(), NoetError> {
                 policy,
                 noether_config: Default::default(),
                 decision_mode: args.decision_mode,
+                on_bound: None,
             })
             .await
         }
@@ -917,9 +918,13 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         Some(path) => load_proxy_routes(&path).await?.routes,
         None => Vec::new(),
     };
-    if let Some(layout) = local_layout.as_ref() {
-        write_local_sidecar_owner(layout, &bind.to_string()).await?;
-    }
+    let on_bound = local_layout.clone().map(|layout| {
+        let bind = bind.to_string();
+        Box::new(move || {
+            write_local_sidecar_owner_sync(&layout, &bind)?;
+            Ok(())
+        }) as Box<dyn FnOnce() -> Result<(), NoetError> + Send>
+    });
     let serve_config = ServeConfig {
         bind,
         fixture_dir,
@@ -933,6 +938,7 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         policy: Some(policy),
         noether_config,
         decision_mode,
+        on_bound,
     };
     let result = tokio::select! {
         result = serve(serve_config) => result,

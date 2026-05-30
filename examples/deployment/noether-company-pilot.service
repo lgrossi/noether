@@ -9,6 +9,7 @@ User=noet
 Group=noet
 StateDirectory=noet
 StateDirectoryMode=0750
+ExecStartPre=+/usr/bin/chown -R noet:noet /etc/noet /var/lib/noet
 ExecStart=/usr/local/bin/noet up --config /etc/noet/config.yaml
 Restart=on-failure
 RestartSec=5

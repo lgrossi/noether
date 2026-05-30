@@ -90,6 +90,8 @@ It assumes:
 - SQLite durable state lives under `/var/lib/noet`, or PostgreSQL state lives in the configured
   database;
 - systemd creates `/var/lib/noet` for the `noet` service user through `StateDirectory=noet`;
+- the example systemd unit chowns `/etc/noet` and `/var/lib/noet` for the `noet` user before start
+  so the app can update the active policy and write state;
 - an external proxy or private network controls access.
 
 ## Sensitive route inventory
