@@ -8,6 +8,17 @@ only pushed `vX.Y.Z` tags publish artifacts.
 The current release lane publishes the core `noet` binary only. SDKs, harness extensions, and
 package-registry publishing are intentionally out of scope.
 
+## Binary artifacts
+
+The supported binary artifacts are:
+
+- Linux x86_64;
+- macOS arm64;
+- Windows x86_64.
+
+macOS x86_64 is not part of the default release matrix. Add it back only when the runner capacity
+and support expectation justify making it release-blocking.
+
 ## Versioning
 
 Before `1.0`, Noether uses the preview-train rules in `rules/update-versioning.md`:
@@ -30,8 +41,8 @@ cargo run -p xtask -- release tag v0.1.0
 git push origin v0.1.0
 ```
 
-The tag push triggers `.github/workflows/release.yml`, which builds Linux, macOS, and Windows
-artifacts, generates checksums and `noether-release.json`, and creates a GitHub prerelease.
+The tag push triggers `.github/workflows/release.yml`, which builds the supported artifacts,
+generates checksums and `noether-release.json`, and creates a GitHub prerelease.
 
 ## Auto-update manifest
 

@@ -19,9 +19,6 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             archive: tar
-          - os: macos-13
-            target: macos-x86_64
-            archive: tar
           - os: macos-14
             target: macos-aarch64
             archive: tar
@@ -128,8 +125,9 @@ jobs:
 
           Preview release of the Noether core `noet` binary.
 
-          This release publishes Linux, macOS, and Windows binaries, checksums, and the
-          machine-readable `noether-release.json` manifest used by `noet update`.
+          This release publishes Linux x86_64, macOS arm64, and Windows x86_64 binaries,
+          checksums, and the machine-readable `noether-release.json` manifest used by
+          `noet update`.
 
           SDKs and harness extensions are included in the source repository but are not published
           as package-registry artifacts by this release.
