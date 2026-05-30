@@ -246,7 +246,7 @@ export function extensionConfig(
 			booleanOverride(env.NOET_PI_AUTO_START_LOCAL, fileConfig.autoStartLocal) ??
 			stripTrailingSlash(env.NOET_URL || fileConfig.noetherUrl || DEFAULT_NOETHER_URL) === DEFAULT_LOCAL_NOETHER_URL,
 		localBin: emptyToUndefined(env.NOET_PI_LOCAL_BIN) || fileConfig.localBin,
-		localRoot: emptyToUndefined(env.NOET_PI_LOCAL_ROOT) || fileConfig.localRoot,
+		localRoot: emptyToUndefined(env.NOET_PI_LOCAL_ROOT) || fileConfig.localRoot || defaultLocalRoot(),
 		localStartTimeoutMs:
 			positiveInteger(env.NOET_PI_LOCAL_START_TIMEOUT_MS) ||
 			fileConfig.localStartTimeoutMs ||
@@ -255,6 +255,10 @@ export function extensionConfig(
 		debugHooks: env.NOET_PI_DEBUG_HOOKS === "raw" || fileConfig.debugHooks || false,
 		debugHookLogDir: emptyToUndefined(env.NOET_PI_DEBUG_HOOK_LOG_DIR) || fileConfig.debugHookLogDir,
 	};
+}
+
+function defaultLocalRoot(): string {
+	return homedir() || process.cwd();
 }
 
 function stripTrailingSlash(value: string): string {

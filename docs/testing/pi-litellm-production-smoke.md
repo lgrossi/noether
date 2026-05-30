@@ -9,7 +9,7 @@ Run Noether behind the company boundary using the company-pilot deployment shape
 SQLite; use `NOET_DATABASE_URL` for PostgreSQL deployments:
 
 ```bash
-noet config init --profile server
+sudo noet config init --profile server
 noet up --config /etc/noet/config.yaml
 ```
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -332,6 +332,7 @@ function deferred() {
 		assert.equal(defaults.failMode, "fail_open");
 		assert.equal(defaults.noetherUrl, "http://127.0.0.1:4051");
 		assert.equal(defaults.autoStartLocal, true);
+		assert.equal(defaults.localRoot, homedir());
 		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
 		assert.equal(persisted.autoStartLocal, true);
 	} finally {

@@ -400,7 +400,7 @@ Configure the extension with environment variables:
 | `NOET_PI_AUTHORIZE_TIMEOUT_MS` | `1000` | Maximum time the hot-path authorization hook waits for Noether. |
 | `NOET_PI_AUTO_START_LOCAL` | auto | When `NOET_URL=http://127.0.0.1:4051`, ensure the local sidecar is running from `session_start`, and stop it on `session_shutdown` only after the last active Pi session releases it. |
 | `NOET_PI_LOCAL_BIN` | auto | Binary used for `noet up`; defaults to `target/debug/noet` under `NOET_PI_LOCAL_ROOT`/cwd when present, otherwise `noet` on `PATH`. |
-| `NOET_PI_LOCAL_ROOT` | current cwd | Root path passed to `noet up --root ...` when local auto-start is used. |
+| `NOET_PI_LOCAL_ROOT` | user home | Root path passed to `noet up --root ...` when local auto-start is used. Defaults to the same managed local home that `noet config init` uses. |
 | `NOET_PI_LOCAL_START_TIMEOUT_MS` | `3000` | How long the extension waits for the auto-started local sidecar to become healthy. |
 | `NOET_PI_QUEUE_MAX_ITEMS` | `100` | Bound applied to both concurrent async deliveries and queued backlog for events, finalization, and debug logs. |
 | `NOET_PI_DEBUG_HOOKS` | unset | Set to `raw` to enable local raw hook dump mode. |

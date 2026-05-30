@@ -23,9 +23,9 @@ new image instead of mutating the binary inside the running container.
 ```bash
 docker run --rm \
   -p 127.0.0.1:4051:4051 \
-  -v "$PWD/examples/deployment/noet-container-config.yaml:/etc/noet/config.yaml:ro" \
-  -v "$PWD/examples/deployment/noet-container-policy.yaml:/etc/noet/policy.yaml:ro" \
-  -v noether-data:/var/lib/noet \
+  -v "$PWD/examples/deployment/noet-container-config.yaml:/etc/noet/config.yaml:rw" \
+  -v "$PWD/examples/deployment/noet-container-policy.yaml:/etc/noet/policy.yaml:rw" \
+  -v noet-data:/var/lib/noet \
   ghcr.io/lgrossi/noether:latest-preview
 ```
 
