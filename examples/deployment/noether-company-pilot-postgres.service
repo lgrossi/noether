@@ -1,0 +1,27 @@
+[Unit]
+Description=Noether company pilot sidecar with PostgreSQL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noet
+Group=noet
+EnvironmentFile=/etc/noet/noether.env
+ExecStart=/usr/local/bin/noet serve \
+  --bind 127.0.0.1:4040 \
+  --policy /etc/noet/policy.noet.yaml \
+  --decision-mode enforce \
+  --fixture-dir /var/lib/noet/fixtures \
+  --simulation-dir /var/lib/noet/simulations \
+  --postgres-profile strict
+Restart=on-failure
+RestartSec=5
+
+# /etc/noet/noether.env should define NOET_DATABASE_URL without committing secrets.
+# Noether is intentionally unauthenticated. Keep this service bound behind an
+# IAP, authenticated reverse proxy, private network, or service mesh policy.
+
+[Install]
+WantedBy=multi-user.target
+

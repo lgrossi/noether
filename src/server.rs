@@ -1039,6 +1039,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/reports/decisions", get(report_decisions))
         .route("/v1/reports/traces/{trace_id}", get(report_trace))
         .route("/v1/reports/observations", get(report_observations))
+        .route("/v1/reports/approval-audit", get(report_approval_audit))
         .route("/v1/reports/updates", get(report_updates_stream))
         .route(
             "/v1/reports/dashboard-data",
@@ -1245,6 +1246,18 @@ async fn report_observations(
                 query.kind.as_deref(),
                 query.trace.as_deref(),
             )?)?))
+        })
+        .await
+}
+
+async fn report_approval_audit(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, NoetError> {
+    state
+        .read_ledger(|ledger| {
+            Ok(Json(serde_json::to_value(
+                reporting::approval_audit_report(ledger)?,
+            )?))
         })
         .await
 }

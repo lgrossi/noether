@@ -19,10 +19,10 @@ durable storage
 Noether remains intentionally unauthenticated internally. The company security layer decides who can
 reach it.
 
-## Current SQLite start command
+## SQLite start command
 
-Today, the concrete checked-in command uses SQLite because that is the current runtime backend. Run
-one Noether process with explicit bind, policy, database, fixture, and simulation paths:
+SQLite remains the default backend when no `--database-url` or `NOET_DATABASE_URL` is configured.
+Run one Noether process with explicit bind, policy, database, fixture, and simulation paths:
 
 ```bash
 noet serve \
@@ -37,18 +37,33 @@ noet serve \
 Bind to localhost when a local reverse proxy or IAP sidecar runs on the same host. Bind to a private
 interface only when the network boundary already prevents untrusted access.
 
-## Storage direction
+## PostgreSQL start command
 
-SQLite is the current local/pilot default. Postgres is the team/company storage direction once the
-storage migration lands. Until then, company-pilot docs should treat storage through this boundary:
+Use PostgreSQL for serverless, multi-instance, or company-operated database deployments:
+
+```bash
+NOET_DATABASE_URL='postgres://noether:REDACTED@postgres.internal/noether' \
+noet serve \
+  --bind 127.0.0.1:4040 \
+  --policy /etc/noet/policy.noet.yaml \
+  --decision-mode enforce \
+  --fixture-dir /var/lib/noet/fixtures \
+  --simulation-dir /var/lib/noet/simulations \
+  --postgres-profile strict
+```
+
+Use `--postgres-profile performance` only when the deployment accepts the durability tradeoffs
+documented in [Storage backends](../storage-backends.md).
+
+## Storage selection
 
 | Backend | Status | Use |
 | --- | --- | --- |
 | SQLite | Current supported backend | Local and early company pilots with one `noet serve` process and a durable volume. |
-| Postgres | Team/company direction | Shared durable storage after the Postgres adapter and deployment contract are available. |
+| PostgreSQL | Current supported backend | Serverless, multi-instance, or company-operated database deployments. |
 
-Do not design new company-readiness features around SQLite-specific SQL. Prefer storage-neutral
-report/domain seams that can be backed by SQLite now and Postgres later.
+Company-readiness report/domain logic should stay storage-neutral. SQLite and PostgreSQL adapters
+provide durable data for those seams.
 
 ## Durable paths for the current SQLite pilot
 
@@ -64,21 +79,25 @@ Recommended layout:
 /var/lib/noet/policy-audit.log     policy enforce/rollback audit log
 ```
 
-The SQLite database is the current pilot source of truth for decisions, reservations, usage
-observations, events, budget windows, and allocation buckets. When the Postgres backend is selected,
-the `/var/lib/noet` artifact paths still matter for policy drafts, rollback snapshots, audit logs,
-fixtures, and generated simulation artifacts.
+The SQLite database is the source of truth for SQLite deployments. When PostgreSQL is selected, the
+database is the source of truth for decisions, reservations, usage observations, events, budget
+windows, and allocation buckets. The `/var/lib/noet` artifact paths still matter for policy drafts,
+rollback snapshots, audit logs, fixtures, and generated simulation artifacts.
 
 ## Example systemd unit
 
 An SQLite pilot unit is available at
 [`examples/deployment/noether-company-pilot.service`](../../examples/deployment/noether-company-pilot.service).
 
+A PostgreSQL pilot unit is available at
+[`examples/deployment/noether-company-pilot-postgres.service`](../../examples/deployment/noether-company-pilot-postgres.service).
+
 It assumes:
 
 - the `noet` binary is installed at `/usr/local/bin/noet`;
 - policy lives at `/etc/noet/policy.noet.yaml`;
-- durable SQLite state lives under `/var/lib/noet`;
+- SQLite durable state lives under `/var/lib/noet`, or PostgreSQL state lives in the configured
+  database;
 - an external proxy or private network controls access.
 
 ## Sensitive route inventory
@@ -106,15 +125,16 @@ After deploying behind the company boundary:
 5. Finalize the returned reservation through `POST /v1/reservations/{id}/finalize`.
 6. Confirm `/runs` and `GET /v1/reports/usage` show the finalized run.
 7. Save a policy draft, run replay, and enforce only after reviewing the replay result.
-8. Confirm the active storage backend is included in the company's backup process. For the current
-   SQLite pilot, that means `/var/lib/noet/noether.sqlite` and its WAL/SHM side files.
+8. Confirm the active storage backend is included in the company's backup process. For SQLite, that
+   means `/var/lib/noet/noether.sqlite` and its WAL/SHM side files. For PostgreSQL, that means the
+   company's PostgreSQL backup mechanism plus Noether policy/artifact paths.
 
 ## Supported pilot boundaries
 
 Supported:
 
 - one `noet serve` process;
-- durable storage using the current SQLite backend;
+- durable storage using SQLite or PostgreSQL;
 - external security boundary;
 - trusted callers;
 - local-first policy file management;
@@ -124,6 +144,6 @@ Not supported yet:
 
 - built-in Noether auth, RBAC, or browser sessions;
 - direct public internet exposure;
-- multi-writer or HA Noether server topology until the shared storage backend is available;
+- multi-writer SQLite;
 - Noether-owned provider routing or provider credential management;
 - central blocking human approval queue.

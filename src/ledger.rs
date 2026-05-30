@@ -23,6 +23,7 @@ use tokio_postgres::{
 };
 use uuid::Uuid;
 
+use crate::approval_audit::{ApprovalAuditEvent, ApprovalAuditStore};
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
     DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction, Reservation,
@@ -1661,6 +1662,12 @@ impl AsyncPostgresLedger {
     }
 }
 
+impl ApprovalAuditStore for BudgetLedger {
+    fn approval_audit_events(&self) -> Result<Vec<ApprovalAuditEvent>, NoetError> {
+        self.approval_audit_events_from_ledger()
+    }
+}
+
 impl BudgetLedger {
     fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
         LedgerPersistenceSnapshot {
@@ -2186,6 +2193,48 @@ impl BudgetLedger {
 
     pub fn event_count(&self) -> usize {
         self.events_count as usize
+    }
+
+    fn approval_audit_events_from_ledger(&self) -> Result<Vec<ApprovalAuditEvent>, NoetError> {
+        match &self.store {
+            LedgerStore::Postgres(pg_conn) => {
+                let rows = pg_conn.0.lock().expect("postgres mutex").query(
+                    "
+                    SELECT id, trace_id, kind, occurred_at, payload_json
+                    FROM events
+                    WHERE kind IN ('approval.self.approved', 'approval.self.rejected', 'pi.authorize')
+                    ORDER BY occurred_at DESC
+                    ",
+                    &[],
+                )?;
+                let events = rows
+                    .into_iter()
+                    .map(trace_event_from_postgres_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(events
+                    .into_iter()
+                    .filter_map(|event| ApprovalAuditEvent::from_trace_event(&event))
+                    .collect())
+            }
+            LedgerStore::Sqlite(conn) => {
+                let mut stmt = conn.prepare(
+                    "
+                    SELECT id, trace_id, kind, occurred_at, payload_json
+                    FROM events
+                    WHERE kind IN ('approval.self.approved', 'approval.self.rejected', 'pi.authorize')
+                    ORDER BY occurred_at DESC
+                    ",
+                )?;
+                let events = stmt
+                    .query_map([], trace_event_from_sqlite_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(events
+                    .into_iter()
+                    .filter_map(|event| ApprovalAuditEvent::from_trace_event(&event))
+                    .collect())
+            }
+            LedgerStore::InMemory => Ok(Vec::new()),
+        }
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {
@@ -7355,6 +7404,31 @@ fn event_report_item_from_postgres_row(row: PostgresRow) -> TraceReportItem {
     }
 }
 
+fn trace_event_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEvent> {
+    let payload_json: String = row.get(4)?;
+    let payload = serde_json::from_str::<Value>(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(TraceEvent {
+        id: row.get(0)?,
+        trace_id: row.get(1)?,
+        kind: row.get(2)?,
+        occurred_at: Some(parse_time(row.get::<_, String>(3)?)),
+        payload,
+    })
+}
+
+fn trace_event_from_postgres_row(row: PostgresRow) -> Result<TraceEvent, NoetError> {
+    let payload_json: String = row.get(4);
+    Ok(TraceEvent {
+        id: row.get(0),
+        trace_id: row.get(1),
+        kind: row.get(2),
+        occurred_at: Some(parse_time(row.get::<_, String>(3))),
+        payload: serde_json::from_str(&payload_json)?,
+    })
+}
+
 fn agent_run_id_from_metadata_json(metadata_json: &str) -> Option<String> {
     serde_json::from_str::<Value>(metadata_json)
         .ok()
@@ -8839,6 +8913,33 @@ mod tests {
             .map(str::to_owned)
     }
 
+    fn approval_audit_trace_event(trace_id: &str) -> TraceEvent {
+        TraceEvent {
+            id: None,
+            trace_id: Some(trace_id.to_owned()),
+            occurred_at: Some(Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap()),
+            kind: "pi.authorize".to_owned(),
+            payload: json!({
+                "request": {
+                    "subject": "user:alice",
+                    "project": "noether",
+                    "estimated_cost_usd": 1.25,
+                    "metadata": {
+                        "request_id": "req-approval",
+                        "agent_run_id": "run-approval"
+                    }
+                },
+                "decision_action": "ask",
+                "policy_action": "approved",
+                "user_approval": "approved",
+                "decision_reason": "tool access requires explicit approval",
+                "explanations": [
+                    { "rule_id": "restricted-tool", "reason": "approval required" }
+                ]
+            }),
+        }
+    }
+
     fn protected_adoption_policy(cap_window: &str) -> PolicyFile {
         PolicyFile {
             version: 0,
@@ -9151,6 +9252,29 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_ledger_exposes_persisted_approval_audit_events() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("approval-audit.sqlite");
+        let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+
+        ledger
+            .record_event(approval_audit_trace_event("trace-approval"))
+            .expect("record approval event");
+        drop(ledger);
+
+        let reopened = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
+        let report =
+            crate::reporting::approval_audit_report(&reopened).expect("approval audit report");
+
+        assert_eq!(report.summary.total, 1);
+        assert_eq!(report.summary.approved, 1);
+        assert_eq!(report.items[0].trace_id.as_deref(), Some("trace-approval"));
+        assert_eq!(report.items[0].subject.as_deref(), Some("user:alice"));
+        assert_eq!(report.items[0].project.as_deref(), Some("noether"));
+        assert_eq!(report.items[0].rule_id.as_deref(), Some("restricted-tool"));
+    }
+
+    #[test]
     #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
     fn postgres_ledger_persists_advisory_cadence_across_reopen() {
         let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
@@ -9284,6 +9408,41 @@ mod tests {
 
         drop(reopened);
         drop(persisted);
+
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .expect("drop test schema");
+    }
+
+    #[test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    fn postgres_ledger_exposes_persisted_approval_audit_events() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_test_{}", Uuid::new_v4().simple());
+        let mut admin =
+            PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+
+        let mut ledger = BudgetLedger::open_postgres(&scoped_url).expect("postgres ledger");
+        ledger
+            .record_event(approval_audit_trace_event("trace-postgres-approval"))
+            .expect("record approval event");
+        let report = crate::reporting::approval_audit_report(&ledger).expect("approval report");
+
+        assert_eq!(report.summary.total, 1);
+        assert_eq!(report.summary.approved, 1);
+        assert_eq!(
+            report.items[0].trace_id.as_deref(),
+            Some("trace-postgres-approval")
+        );
+
+        drop(ledger);
         admin
             .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
             .expect("drop test schema");

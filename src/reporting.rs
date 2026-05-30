@@ -107,6 +107,15 @@ pub fn observations_report(
     ledger.observations_report(observation_kind_prefix(kind), trace_id)
 }
 
+pub fn approval_audit_report(
+    ledger: &BudgetLedger,
+) -> Result<crate::approval_audit::ApprovalAuditReport, NoetError> {
+    crate::approval_audit::approval_audit_report(
+        ledger,
+        crate::approval_audit::ApprovalAuditConfig::default(),
+    )
+}
+
 pub fn dashboard_report(
     ledger: &BudgetLedger,
     requested_trace_id: Option<&str>,
