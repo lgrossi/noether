@@ -5253,6 +5253,9 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
             ON reservation_limit_scopes(reservation_id);
         CREATE INDEX IF NOT EXISTS idx_reservations_decision
             ON reservations(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_reservations_active
+            ON reservations(status)
+            WHERE status = 'active';
         CREATE INDEX IF NOT EXISTS idx_decisions_created_decision
             ON decisions(created_at, decision_id);
 
@@ -5444,6 +5447,10 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations(status) WHERE status = 'active'",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_decisions_created_decision ON decisions(created_at, decision_id)",
         [],
     )?;
@@ -5513,6 +5520,9 @@ fn init_postgres_schema(conn: &mut PostgresClient) -> Result<(), NoetError> {
             allocation_spends_json TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_reservations_decision ON reservations(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_reservations_active
+            ON reservations(status)
+            WHERE status = 'active';
 
         CREATE TABLE IF NOT EXISTS reservation_limit_scopes (
             reservation_id TEXT NOT NULL REFERENCES reservations(id),
@@ -5661,6 +5671,9 @@ async fn init_postgres_schema_async(conn: &AsyncPostgresClient) -> Result<(), No
             allocation_spends_json TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_reservations_decision ON reservations(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_reservations_active
+            ON reservations(status)
+            WHERE status = 'active';
 
         CREATE TABLE IF NOT EXISTS reservation_limit_scopes (
             reservation_id TEXT NOT NULL REFERENCES reservations(id),
@@ -9966,6 +9979,68 @@ mod tests {
             trace_routing.selected_budget_id.as_deref(),
             Some("project-budget")
         );
+    }
+
+    #[test]
+    fn sqlite_schema_indexes_active_reservations() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("active-reservations-index.sqlite");
+        let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
+        let conn = sqlite_conn(&ledger);
+
+        let sql = conn
+            .query_row(
+                "
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'index' AND name = 'idx_reservations_active'
+                ",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("active reservations index");
+
+        assert!(sql.contains("WHERE status = 'active'"));
+    }
+
+    #[test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    fn postgres_schema_indexes_active_reservations() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_test_{}", Uuid::new_v4().simple());
+        let mut admin =
+            PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+
+        let ledger = BudgetLedger::open_postgres(&scoped_url).expect("postgres ledger");
+        drop(ledger);
+
+        let has_index: bool = admin
+            .query_one(
+                "
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE schemaname = $1
+                      AND indexname = 'idx_reservations_active'
+                      AND indexdef LIKE '%WHERE (status = ''active''::text)%'
+                )
+                ",
+                &[&schema],
+            )
+            .expect("query active reservations index")
+            .get(0);
+
+        assert!(has_index);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .expect("drop test schema");
     }
 
     #[test]
