@@ -24,6 +24,7 @@ use tokio_postgres::{
 use uuid::Uuid;
 
 use crate::approval_audit::{ApprovalAuditEvent, ApprovalAuditStore};
+use crate::config::{AdvisoryConfig, TipCatalogMode};
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionExplanation, DecisionOutcome,
     DecisionSeverity, EvalAnnotation, FinalizeReservation, PolicyAction, Reservation,
@@ -33,11 +34,12 @@ use crate::contract::{
 use crate::error::NoetError;
 use crate::policy::{
     PolicyFile, budget_model_allowed, budget_rule_matches, budget_scope_matches,
-    matching_policy_explanations, specificity_order,
+    matching_policy_explanations, parse_limit_window, specificity_order,
 };
 
 #[derive(Default)]
 pub struct BudgetLedger {
+    advisory_config: AdvisoryConfig,
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     advisory_cadence: HashMap<(String, String, String), DateTime<Utc>>,
@@ -51,6 +53,8 @@ pub struct BudgetLedger {
 }
 
 const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
+const ENABLEMENT_NOTIFICATION_COOLDOWN: Duration = Duration::hours(4);
+const ENABLEMENT_UNDER_PACE_FRACTION: f64 = 0.5;
 
 #[derive(Default)]
 enum LedgerStore {
@@ -676,6 +680,7 @@ impl LedgerPersistenceSnapshot {
                 fields.matched_entity =
                     matched_entity_and_rank(rule, request, &specificity_order(policy)).0;
                 let ledger = BudgetLedger {
+                    advisory_config: AdvisoryConfig::default(),
                     limit_windows: self.limit_windows.clone(),
                     allocation_buckets: self.allocation_buckets.clone(),
                     advisory_cadence: HashMap::new(),
@@ -795,6 +800,7 @@ struct SpendWindowProjection {
     projected_spend_usd: f64,
     max_usd: f64,
     warn_at_fractions: Vec<f64>,
+    warning_cadence: Option<String>,
     scope_key: String,
     window_seconds: Duration,
 }
@@ -830,6 +836,15 @@ struct AuthorizeMessageHint {
 enum MessageHintRecommendation {
     Show,
     Hide,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuthorizeNotification {
+    kind: String,
+    key: String,
+    severity: DecisionSeverity,
+    title: String,
+    body: String,
 }
 
 #[derive(Default)]
@@ -1407,6 +1422,10 @@ async fn run_async_postgres_finalize_worker(
 }
 
 impl AsyncPostgresLedger {
+    pub async fn set_advisory_config(&self, config: AdvisoryConfig) {
+        self.ledger.lock().await.set_advisory_config(config);
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self, NoetError> {
         Self::connect_with_options(database_url, AsyncPostgresLedgerOptions::default()).await
     }
@@ -1668,6 +1687,10 @@ impl ApprovalAuditStore for BudgetLedger {
 }
 
 impl BudgetLedger {
+    pub fn set_advisory_config(&mut self, config: AdvisoryConfig) {
+        self.advisory_config = config;
+    }
+
     fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
         LedgerPersistenceSnapshot {
             limit_windows: self.limit_windows.clone(),
@@ -1733,23 +1756,79 @@ impl BudgetLedger {
         scope_key: &str,
         severity: DecisionSeverity,
         now: DateTime<Utc>,
+        configured_cadence: Option<&str>,
     ) -> MessageHintRecommendation {
         if severity != DecisionSeverity::Warn {
             return MessageHintRecommendation::Show;
         }
+        if self.recommend_advisory(
+            &request_user_key(request),
+            advisory_key,
+            scope_key,
+            now,
+            warning_advisory_cooldown(&self.advisory_config, configured_cadence),
+        ) {
+            MessageHintRecommendation::Show
+        } else {
+            MessageHintRecommendation::Hide
+        }
+    }
+
+    fn recommend_advisory(
+        &mut self,
+        user_key: &str,
+        advisory_key: &str,
+        scope_key: &str,
+        now: DateTime<Utc>,
+        cooldown: Duration,
+    ) -> bool {
         let key = (
-            request_user_key(request),
+            user_key.to_owned(),
             advisory_key.to_owned(),
             scope_key.to_owned(),
         );
         if let Some(last_shown_at) = self.advisory_cadence.get(&key)
-            && *last_shown_at + WARN_ADVISORY_COOLDOWN > now
+            && *last_shown_at + cooldown > now
         {
-            return MessageHintRecommendation::Hide;
+            return false;
         }
         self.advisory_cadence.insert(key.clone(), now);
         self.pending_advisory_cadence.insert(key, now);
-        MessageHintRecommendation::Show
+        true
+    }
+
+    fn enablement_notifications(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> Vec<AuthorizeNotification> {
+        let Some(policy) = policy else {
+            return Vec::new();
+        };
+        let Some(reason) = enablement_headroom(policy, self, request, now) else {
+            return Vec::new();
+        };
+        let user_key = request_user_key(request);
+        if !self.recommend_advisory(
+            &user_key,
+            "notification.enablement.headroom",
+            &reason.scope_key,
+            now,
+            ENABLEMENT_NOTIFICATION_COOLDOWN,
+        ) {
+            return Vec::new();
+        }
+        let Some(tip) = enablement_tip(&self.advisory_config, &user_key, now) else {
+            return Vec::new();
+        };
+        vec![AuthorizeNotification {
+            kind: "enablement_tip".to_owned(),
+            key: tip.key,
+            severity: DecisionSeverity::Info,
+            title: "AI budget headroom available".to_owned(),
+            body: tip.body,
+        }]
     }
 
     pub fn try_authorize(
@@ -1775,6 +1854,7 @@ impl BudgetLedger {
         let mut explanations = Vec::new();
         let mut limit_hits = Vec::new();
         let mut message_hints = Vec::new();
+        let mut notifications = Vec::new();
         let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
@@ -1802,6 +1882,10 @@ impl BudgetLedger {
             });
         }
 
+        if action == PolicyAction::Allow && message_hints.is_empty() {
+            notifications = self.enablement_notifications(policy, request, now);
+        }
+
         let reservation = if action.halts_request() {
             None
         } else {
@@ -1813,14 +1897,13 @@ impl BudgetLedger {
             self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
         }
-
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
             outcome: action.decision_outcome(),
             action,
             reservation,
             explanations,
-            metadata: message_hints_metadata(&message_hints),
+            metadata: authorize_metadata(&message_hints, &notifications),
             created_at: now,
         };
         self.persist_decision(
@@ -3686,6 +3769,7 @@ impl BudgetLedger {
         };
         if apply_budget_limits(
             self,
+            policy,
             rule,
             request,
             estimated_cost,
@@ -7507,8 +7591,24 @@ fn is_limit_rule_id(rule_id: &str) -> bool {
         || rule_id.contains(".spend_window.")
 }
 
+fn warning_advisory_cooldown(
+    config: &AdvisoryConfig,
+    configured_cadence: Option<&str>,
+) -> Duration {
+    configured_cadence
+        .and_then(parse_limit_window)
+        .or_else(|| {
+            config
+                .warning_cadence
+                .as_deref()
+                .and_then(parse_limit_window)
+        })
+        .unwrap_or(WARN_ADVISORY_COOLDOWN)
+}
+
 fn apply_budget_limits(
     ledger: &mut BudgetLedger,
+    _policy: &PolicyFile,
     rule: &BudgetRule,
     request: &AuthorizeRequest,
     estimated_cost: f64,
@@ -7545,6 +7645,7 @@ fn apply_budget_limits(
                 "request",
                 limit.action.decision_severity(),
                 now,
+                limit.warning_cadence.as_deref(),
             ),
             limit_type: Some("request_cost".to_owned()),
             window_id: None,
@@ -7589,6 +7690,7 @@ fn apply_budget_limits(
                 "context",
                 limit.action.decision_severity(),
                 now,
+                limit.warning_cadence.as_deref(),
             ),
             limit_type: Some("context_tokens".to_owned()),
             window_id: None,
@@ -7624,7 +7726,14 @@ fn apply_budget_limits(
                 &projection,
                 DecisionSeverity::Warn,
                 Some(warn_threshold),
-                MessageHintRecommendation::Show,
+                ledger.recommend_message_hint(
+                    request,
+                    &format!("warn.{}.threshold", projection.rule_id),
+                    &projection.scope_key,
+                    DecisionSeverity::Warn,
+                    now,
+                    projection.warning_cadence.as_deref(),
+                ),
             ));
         }
         if projection.projected_spend_usd > projection.max_usd {
@@ -7648,6 +7757,7 @@ fn apply_budget_limits(
                     &projection.scope_key,
                     hit.severity,
                     now,
+                    projection.warning_cadence.as_deref(),
                 ),
             ));
             limit_hits.push(hit);
@@ -7661,7 +7771,24 @@ fn apply_budget_limits(
 }
 
 fn message_hints_metadata(message_hints: &[AuthorizeMessageHint]) -> Option<Value> {
-    (!message_hints.is_empty()).then(|| json!({ "message_hints": message_hints }))
+    authorize_metadata(message_hints, &[])
+}
+
+fn authorize_metadata(
+    message_hints: &[AuthorizeMessageHint],
+    notifications: &[AuthorizeNotification],
+) -> Option<Value> {
+    if message_hints.is_empty() && notifications.is_empty() {
+        return None;
+    }
+    let mut metadata = serde_json::Map::new();
+    if !message_hints.is_empty() {
+        metadata.insert("message_hints".to_owned(), json!(message_hints));
+    }
+    if !notifications.is_empty() {
+        metadata.insert("notifications".to_owned(), json!(notifications));
+    }
+    Some(Value::Object(metadata))
 }
 
 fn message_hint_from_projection(
@@ -7783,6 +7910,7 @@ fn spend_window_projections(
                 projected_spend_usd: current_spend + estimated_cost,
                 max_usd: limit.max_usd,
                 warn_at_fractions: limit.warn_at_fractions.clone(),
+                warning_cadence: limit.warning_cadence.clone(),
                 scope_key,
                 window_seconds,
             })
@@ -8002,6 +8130,145 @@ fn first_request_entity(request: &AuthorizeRequest, kind: &str) -> Option<String
         .cloned()
 }
 
+struct EnablementHeadroom {
+    scope_key: String,
+}
+
+struct EnablementTip {
+    key: &'static str,
+    body: &'static str,
+}
+
+struct ResolvedEnablementTip {
+    key: String,
+    body: String,
+}
+
+const ENABLEMENT_TIPS: &[EnablementTip] = &[
+    EnablementTip {
+        key: "workflow.codify_repeated_process",
+        body: "Try codifying a repeated team workflow into a reusable skill or checklist.",
+    },
+    EnablementTip {
+        key: "automation.mechanical_process",
+        body: "Try turning a weekly mechanical process into a script, template, or command.",
+    },
+    EnablementTip {
+        key: "visualization.interactive_html",
+        body: "Try asking for an interactive HTML view of messy logs, reports, or datasets.",
+    },
+    EnablementTip {
+        key: "agentic.background_investigation",
+        body: "Try delegating a low-risk cleanup or investigation to a background agent.",
+    },
+    EnablementTip {
+        key: "agentic.parallel_review",
+        body: "Try parallel reviews of the same diff, one focused on bugs and one on simplification.",
+    },
+    EnablementTip {
+        key: "architecture.design_suggestions",
+        body: "Try asking for codebase architecture suggestions before a large refactor.",
+    },
+    EnablementTip {
+        key: "reflection.workflow_review",
+        body: "Try asking an agent to review your recent commits or logs and identify repeated friction.",
+    },
+    EnablementTip {
+        key: "reflection.automation_patterns",
+        body: "Try giving an agent JSON logs and asking for bottlenecks or missed automation.",
+    },
+];
+
+fn enablement_tip(
+    config: &AdvisoryConfig,
+    user_key: &str,
+    now: DateTime<Utc>,
+) -> Option<ResolvedEnablementTip> {
+    let mut tips: Vec<ResolvedEnablementTip> = match config.enablement_tips.mode {
+        TipCatalogMode::Extend => ENABLEMENT_TIPS
+            .iter()
+            .map(|tip| ResolvedEnablementTip {
+                key: tip.key.to_owned(),
+                body: tip.body.to_owned(),
+            })
+            .collect(),
+        TipCatalogMode::Replace => Vec::new(),
+    };
+    tips.extend(
+        config
+            .enablement_tips
+            .tips
+            .iter()
+            .map(|tip| ResolvedEnablementTip {
+                key: tip.key.clone(),
+                body: tip.body.clone(),
+            }),
+    );
+    if tips.is_empty() {
+        return None;
+    }
+    let bucket = now
+        .timestamp()
+        .div_euclid(ENABLEMENT_NOTIFICATION_COOLDOWN.num_seconds());
+    let seed = stable_hash(user_key).wrapping_add(bucket as u64);
+    Some(tips.swap_remove((seed as usize) % tips.len()))
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+    })
+}
+
+fn enablement_headroom(
+    policy: &PolicyFile,
+    ledger: &BudgetLedger,
+    request: &AuthorizeRequest,
+    now: DateTime<Utc>,
+) -> Option<EnablementHeadroom> {
+    let applicable: Vec<&BudgetRule> = policy
+        .budgets
+        .iter()
+        .filter(|rule| budget_rule_matches(rule, request) && budget_model_allowed(rule, request))
+        .collect();
+    if applicable.is_empty() {
+        return None;
+    }
+
+    let mut underpaced_scope = None;
+    for rule in applicable {
+        let projections =
+            spend_window_projections(ledger, rule, request, request.estimated_cost(), now).ok()?;
+        let has_spend_budget = !projections.is_empty();
+        let has_available_allocation = allocation_bucket_available_usd(ledger, rule, request, now)
+            .is_some_and(|available| available > 0.0);
+        if !has_spend_budget && !has_available_allocation {
+            continue;
+        }
+        let pressure = projections
+            .iter()
+            .map(|projection| projection.projected_spend_usd / projection.max_usd)
+            .fold(0.0, f64::max);
+        let warn_at = rule
+            .limits
+            .spend
+            .iter()
+            .flat_map(|limit| limit.warn_at_fractions.iter().copied())
+            .filter(|fraction| *fraction < 1.0)
+            .fold(1.0, f64::min);
+        if pressure >= warn_at {
+            return None;
+        }
+        if has_available_allocation
+            || (has_spend_budget && pressure <= ENABLEMENT_UNDER_PACE_FRACTION)
+        {
+            underpaced_scope.get_or_insert_with(|| rule.id.clone());
+        }
+    }
+
+    underpaced_scope.map(|scope_key| EnablementHeadroom { scope_key })
+}
+
 fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -> Option<String> {
     let allocation = rule.allocation.as_ref()?;
     if allocation.standard != "protected_adoption_pool" {
@@ -8029,6 +8296,31 @@ fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -
             .cloned(),
         _ => None,
     }
+}
+
+fn allocation_bucket_available_usd(
+    ledger: &BudgetLedger,
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let entity_key = allocation_bucket_entity_key(rule, request)?;
+    let protected_amount_usd = rule
+        .allocation
+        .as_ref()
+        .and_then(|allocation| allocation.protected_amount_usd)?;
+    let bucket = ledger
+        .allocation_buckets
+        .get(&(rule.id.clone(), entity_key))
+        .cloned()
+        .unwrap_or(AllocationBucketState {
+            started_at: now,
+            protected_amount_usd,
+            current_grant_usd: protected_amount_usd,
+            carryover_usd: 0.0,
+        });
+    let bucket = rolled_allocation_bucket_state(rule, bucket, now)?;
+    Some(bucket.current_grant_usd + bucket.carryover_usd)
 }
 
 fn consume_allocation_bucket(
@@ -8765,6 +9057,7 @@ fn summarize_parts_or_kind(parts: Vec<String>, fallback: &str) -> String {
 mod tests {
     use chrono::TimeZone;
 
+    use crate::config::{EnablementTipConfig, EnablementTipsConfig};
     use crate::contract::{
         BudgetLimitPolicy, BudgetModelPolicy, BudgetRule, ContextTokenLimit, RequestCostLimit,
         RuleMatch, SpendWindowBy, SpendWindowLimit, SpendWindowMode, WindowAnchorKind,
@@ -8802,6 +9095,7 @@ mod tests {
                         max_usd: limit_usd,
                         warn_at_fractions: vec![warn_at_fraction],
                         action: PolicyAction::Block,
+                        warning_cadence: None,
                     }],
                     tool_calls: None,
                     agent_steps: None,
@@ -8890,6 +9184,15 @@ mod tests {
         }
     }
 
+    fn first_notification(decision: &AuthorizeDecision) -> Option<&Value> {
+        decision
+            .metadata
+            .as_ref()?
+            .get("notifications")?
+            .as_array()?
+            .first()
+    }
+
     fn protected_adoption_policy(cap_window: &str) -> PolicyFile {
         PolicyFile {
             version: 0,
@@ -8912,6 +9215,7 @@ mod tests {
                         max_usd: 2000.0,
                         warn_at_fractions: vec![1.0],
                         action: PolicyAction::Block,
+                        warning_cadence: None,
                     }],
                     tool_calls: None,
                     agent_steps: None,
@@ -8945,6 +9249,148 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert!(decision.reservation.is_some());
+    }
+
+    #[test]
+    fn authorize_emits_enablement_notification_for_underpaced_budget_headroom() {
+        let policy = policy(10.0, 0.8);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        let notification = first_notification(&decision).expect("enablement notification");
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(notification["kind"], "enablement_tip");
+        assert_eq!(notification["severity"], "info");
+        assert_eq!(notification["title"], "AI budget headroom available");
+        assert!(
+            notification["body"]
+                .as_str()
+                .expect("body")
+                .starts_with("Try ")
+        );
+    }
+
+    #[test]
+    fn authorize_computes_enablement_headroom_before_current_reservation() {
+        let policy = policy(1.0, 0.8);
+        let mut request = request(0.45);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(
+            first_notification(&decision).is_some(),
+            "current reservation must not be counted twice when deciding whether headroom exists"
+        );
+    }
+
+    #[test]
+    fn authorize_can_extend_enablement_tip_catalog_from_config() {
+        let mut config = AdvisoryConfig::default();
+        config.enablement_tips.tips = vec![EnablementTipConfig {
+            key: "custom.deep_dive".to_owned(),
+            body: "Try the custom deep-dive workflow.".to_owned(),
+        }];
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+
+        let custom_tip_is_reachable = (0..32).any(|offset| {
+            enablement_tip(
+                &config,
+                "user:alice",
+                now + ENABLEMENT_NOTIFICATION_COOLDOWN * offset,
+            )
+            .is_some_and(|tip| tip.key == "custom.deep_dive")
+        });
+
+        assert!(custom_tip_is_reachable);
+    }
+
+    #[test]
+    fn authorize_can_replace_enablement_tip_catalog_from_config() {
+        let policy = policy(10.0, 0.8);
+        let mut config = AdvisoryConfig::default();
+        config.enablement_tips = EnablementTipsConfig {
+            mode: TipCatalogMode::Replace,
+            tips: vec![EnablementTipConfig {
+                key: "custom.only_tip".to_owned(),
+                body: "Try only the configured tip.".to_owned(),
+            }],
+        };
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+        ledger.set_advisory_config(config);
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        let notification = first_notification(&decision).expect("enablement notification");
+
+        assert_eq!(notification["key"], "custom.only_tip");
+        assert_eq!(notification["body"], "Try only the configured tip.");
+    }
+
+    #[test]
+    fn authorize_cadences_enablement_notifications_per_user() {
+        let policy = policy(10.0, 0.8);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request);
+        let second = ledger.authorize(Some(&policy), &request);
+
+        assert!(first_notification(&first).is_some());
+        assert!(first_notification(&second).is_none());
+    }
+
+    #[test]
+    fn authorize_suppresses_enablement_notification_when_any_applicable_budget_is_over_pace() {
+        let mut policy = policy(10.0, 0.8);
+        let mut hot_budget = policy.budgets[0].clone();
+        hot_budget.id = "hot-budget".to_owned();
+        hot_budget.limits.spend[0].max_usd = 1.0;
+        policy.budgets.push(hot_budget);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+        ledger.limit_windows.insert(
+            (
+                "hot-budget".to_owned(),
+                "budget-cap".to_owned(),
+                "project:noether".to_owned(),
+            ),
+            WindowState {
+                started_at: Utc::now(),
+                used_usd: 0.80,
+            },
+        );
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(first_notification(&decision).is_none());
+    }
+
+    #[test]
+    fn authorize_suppresses_enablement_notification_when_decision_warns() {
+        let mut policy = policy(10.0, 0.8);
+        policy.budgets[0].limits.request_cost = Some(RequestCostLimit {
+            max_usd: 0.05,
+            action: PolicyAction::Warn,
+            warning_cadence: None,
+        });
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(first_notification(&decision).is_none());
     }
 
     #[test]
@@ -9048,6 +9494,7 @@ mod tests {
             request_cost: Some(RequestCostLimit {
                 max_usd: 0.20,
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }),
             context_tokens: None,
             spend: Vec::new(),
@@ -9076,6 +9523,7 @@ mod tests {
             request_cost: Some(RequestCostLimit {
                 max_usd: 0.20,
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }),
             context_tokens: None,
             spend: Vec::new(),
@@ -9105,6 +9553,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9134,6 +9583,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 100,
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9161,6 +9611,150 @@ mod tests {
     }
 
     #[test]
+    fn budget_limit_uses_noether_config_warning_cadence_fallback() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
+                max_tokens: 100,
+                action: PolicyAction::Warn,
+                warning_cadence: None,
+            }),
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut request = request(0.01);
+        request.subject = Some("user:alice".to_owned());
+        request.estimated_tokens = Some(101);
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+        ledger.set_advisory_config(AdvisoryConfig {
+            warning_cadence: Some("10s".to_owned()),
+            enablement_tips: Default::default(),
+        });
+
+        let first = ledger
+            .try_authorize_at(Some(&policy), &request, now)
+            .expect("first authorize");
+        let hidden = ledger
+            .try_authorize_at(Some(&policy), &request, now + Duration::seconds(5))
+            .expect("second authorize");
+        let shown_again = ledger
+            .try_authorize_at(Some(&policy), &request, now + Duration::seconds(11))
+            .expect("third authorize");
+
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&hidden).as_deref(),
+            Some("hide")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&shown_again).as_deref(),
+            Some("show")
+        );
+    }
+
+    #[test]
+    fn budget_limit_uses_per_warning_policy_cadence_override() {
+        let mut policy = policy(1.0, 0.8);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: Some(ContextTokenLimit {
+                max_tokens: 100,
+                action: PolicyAction::Warn,
+                warning_cadence: Some("10s".to_owned()),
+            }),
+            spend: Vec::new(),
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut request = request(0.01);
+        request.subject = Some("user:alice".to_owned());
+        request.estimated_tokens = Some(101);
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+        ledger.set_advisory_config(AdvisoryConfig {
+            warning_cadence: Some("1h".to_owned()),
+            enablement_tips: Default::default(),
+        });
+
+        let first = ledger
+            .try_authorize_at(Some(&policy), &request, now)
+            .expect("first authorize");
+        let shown_again = ledger
+            .try_authorize_at(Some(&policy), &request, now + Duration::seconds(11))
+            .expect("second authorize");
+
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&shown_again).as_deref(),
+            Some("show")
+        );
+    }
+
+    #[test]
+    fn spend_threshold_warning_uses_policy_cadence_override() {
+        let mut policy = policy(1.0, 1.0);
+        policy.budgets[0].limits.spend[0].warn_at_fractions = vec![0.5, 0.75];
+        policy.budgets[0].limits.spend[0].warning_cadence = Some("1h".to_owned());
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger
+            .try_authorize_at(Some(&policy), &request(0.50), now)
+            .expect("first threshold");
+        let hidden = ledger
+            .try_authorize_at(Some(&policy), &request(0.26), now + Duration::seconds(10))
+            .expect("second threshold");
+
+        assert_eq!(first.outcome, DecisionOutcome::Warn);
+        assert_eq!(hidden.outcome, DecisionOutcome::Warn);
+        assert_eq!(
+            first_message_hint_recommendation(&first).as_deref(),
+            Some("show")
+        );
+        assert_eq!(
+            first_message_hint_recommendation(&hidden).as_deref(),
+            Some("hide")
+        );
+    }
+
+    #[test]
+    fn spend_threshold_cadence_does_not_hide_simultaneous_limit_warning() {
+        let mut policy = policy(1.0, 0.5);
+        policy.budgets[0].limits.spend[0].action = PolicyAction::Warn;
+        policy.budgets[0].limits.spend[0].warning_cadence = Some("1h".to_owned());
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger
+            .try_authorize_at(Some(&policy), &request(1.10), now)
+            .expect("authorize");
+        let hints = decision
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("message_hints"))
+            .and_then(Value::as_array)
+            .expect("message hints");
+        let recommendations: Vec<_> = hints
+            .iter()
+            .filter_map(|hint| hint.get("recommendation").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert_eq!(recommendations, vec!["show", "show"]);
+    }
+
+    #[test]
     fn sqlite_ledger_persists_advisory_cadence_across_reopen() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("advisory-cadence.sqlite");
@@ -9170,6 +9764,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 100,
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9245,6 +9840,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 100,
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9309,6 +9905,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9406,6 +10003,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9436,6 +10034,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -9471,6 +10070,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9506,6 +10106,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9543,6 +10144,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9698,6 +10300,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Warn,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9735,6 +10338,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -9772,6 +10376,7 @@ mod tests {
                     max_usd: 10.0,
                     warn_at_fractions: vec![1.0],
                     action: PolicyAction::Warn,
+                    warning_cadence: None,
                 },
                 SpendWindowLimit {
                     by: SpendWindowBy::Project,
@@ -9782,6 +10387,7 @@ mod tests {
                     max_usd: 10.0,
                     warn_at_fractions: vec![1.0],
                     action: PolicyAction::Warn,
+                    warning_cadence: None,
                 },
             ],
             tool_calls: None,
@@ -9823,6 +10429,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -10219,6 +10826,7 @@ mod tests {
             context_tokens: Some(ContextTokenLimit {
                 max_tokens: 1_000,
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }),
             spend: Vec::new(),
             tool_calls: None,
@@ -10265,7 +10873,7 @@ mod tests {
     fn explicit_budget_window_metadata_is_exposed_in_decision_reports() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("budget-window-report.sqlite");
-        let mut policy = policy(5.0, 1.0);
+        let policy = policy(5.0, 1.0);
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
 
         let decision = ledger.authorize(Some(&policy), &request(0.25));
@@ -10305,6 +10913,7 @@ mod tests {
                 max_usd: 10.0,
                 warn_at_fractions: vec![1.0],
                 action: PolicyAction::Block,
+                warning_cadence: None,
             }],
             tool_calls: None,
             agent_steps: None,
@@ -10814,6 +11423,7 @@ mod tests {
                     max_usd: limit_usd,
                     warn_at_fractions: vec![1.0],
                     action: PolicyAction::Block,
+                    warning_cadence: None,
                 }],
                 tool_calls: None,
                 agent_steps: None,

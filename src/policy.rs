@@ -67,7 +67,6 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
             policy.routing.mode
         ));
     }
-
     for budget in &policy.budgets {
         if budget.id.trim().is_empty() {
             errors.push("budget id must not be empty".to_owned());
@@ -104,6 +103,14 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                     budget.id
                 ));
             }
+            if let Some(cadence) = limit.warning_cadence.as_deref()
+                && parse_limit_window(cadence).is_none()
+            {
+                errors.push(format!(
+                    "budget {} limits.request_cost.warning_cadence must use <number><s|m|h|d>, got {cadence}",
+                    budget.id
+                ));
+            }
         }
         if let Some(limit) = &budget.limits.context_tokens {
             if limit.max_tokens == 0 {
@@ -115,6 +122,14 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
             if !limit_action_is_supported(limit.action) {
                 errors.push(format!(
                     "budget {} limits.context_tokens.action must be warn, ask, or block",
+                    budget.id
+                ));
+            }
+            if let Some(cadence) = limit.warning_cadence.as_deref()
+                && parse_limit_window(cadence).is_none()
+            {
+                errors.push(format!(
+                    "budget {} limits.context_tokens.warning_cadence must use <number><s|m|h|d>, got {cadence}",
                     budget.id
                 ));
             }
@@ -168,6 +183,15 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 errors.push(format!(
                     "budget {} limits.spend.action must be warn, ask, or block",
                     budget.id
+                ));
+            }
+            if let Some(cadence) = limit.warning_cadence.as_deref()
+                && parse_limit_window(cadence).is_none()
+            {
+                errors.push(format!(
+                    "budget {} limits.spend[{}].warning_cadence must use <number><s|m|h|d>, got {cadence}",
+                    budget.id,
+                    spend_window_label(limit)
                 ));
             }
             if let Some(id) = limit.id.as_deref() {
@@ -560,6 +584,7 @@ budgets:
       context_tokens:
         max_tokens: 120000
         action: block
+        warning_cadence: 30m
       spend:
         - id: monthly-cap
           window: 30d
@@ -569,6 +594,7 @@ budgets:
           max_usd: 1.0
           warn_at_fraction: 0.5
           action: block
+          warning_cadence: 1h
         - id: spike-5m
           window: 5m
           mode: rolling
@@ -587,6 +613,20 @@ policies:
         .expect("policy parses");
 
         validate_policy(&policy).expect("policy is valid");
+        assert_eq!(
+            policy.budgets[0]
+                .limits
+                .context_tokens
+                .as_ref()
+                .unwrap()
+                .warning_cadence
+                .as_deref(),
+            Some("30m")
+        );
+        assert_eq!(
+            policy.budgets[0].limits.spend[0].warning_cadence.as_deref(),
+            Some("1h")
+        );
         assert_eq!(policy.budgets.len(), 1);
         assert_eq!(policy.policies.len(), 1);
     }

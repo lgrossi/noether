@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
+use crate::config::{NoetherConfig, validate_noether_config};
 use crate::error::NoetError;
 
 pub const DEFAULT_LOCAL_BIND: &str = "127.0.0.1:4051";
@@ -38,10 +39,14 @@ budgets:
           max_usd: 100
           action: block
 "#;
+const DEFAULT_LOCAL_CONFIG: &str = r#"advisory:
+  warning_cadence: 4h
+"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalRuntimeLayout {
     pub root: PathBuf,
+    pub config_path: PathBuf,
     pub policy_path: PathBuf,
     pub db_path: PathBuf,
     pub fixture_dir: PathBuf,
@@ -54,6 +59,7 @@ impl LocalRuntimeLayout {
     pub fn for_root(root: &Path) -> Self {
         let runtime_root = root.join(LOCAL_RUNTIME_DIR);
         Self {
+            config_path: runtime_root.join("config.yaml"),
             policy_path: runtime_root.join("policy.yaml"),
             db_path: runtime_root.join("noether.sqlite"),
             fixture_dir: runtime_root.join("fixtures"),
@@ -84,7 +90,17 @@ pub async fn ensure_local_runtime_layout(root: &Path) -> Result<LocalRuntimeLayo
     if !fs::try_exists(&layout.policy_path).await? {
         fs::write(&layout.policy_path, DEFAULT_LOCAL_POLICY).await?;
     }
+    if !fs::try_exists(&layout.config_path).await? {
+        fs::write(&layout.config_path, DEFAULT_LOCAL_CONFIG).await?;
+    }
     Ok(layout)
+}
+
+pub async fn load_local_config(path: &Path) -> Result<NoetherConfig, NoetError> {
+    let bytes = fs::read(path).await?;
+    let config: NoetherConfig = serde_yaml::from_slice(&bytes)?;
+    validate_noether_config(&config)?;
+    Ok(config)
 }
 
 pub async fn write_local_sidecar_owner(
@@ -132,7 +148,12 @@ mod tests {
         assert!(layout.fixture_dir.exists());
         assert!(layout.simulation_dir.exists());
         assert!(layout.sidecar_dir.exists());
+        assert!(layout.config_path.exists());
         assert!(layout.policy_path.exists());
+        let config = load_local_config(&layout.config_path)
+            .await
+            .expect("default local config parses");
+        assert_eq!(config.advisory.warning_cadence.as_deref(), Some("4h"));
         let policy = crate::policy::load_policy(&layout.policy_path)
             .await
             .expect("default local policy parses");

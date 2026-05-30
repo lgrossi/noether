@@ -1,6 +1,7 @@
 # Policy v0
 
 Default policy path: `policy.noet.yaml`
+Default local Noether runtime config path: `.noether/config.yaml`
 
 Validate a policy:
 
@@ -19,6 +20,21 @@ Run capture with deny decisions blocking before mock/upstream:
 ```text
 noet serve --policy policy.noet.yaml --decision-mode enforce
 ```
+
+Local runtime config controls Noether-owned defaults that are not policy rules:
+
+```yaml
+advisory:
+  warning_cadence: 4h
+  enablement_tips:
+    mode: extend
+    tips:
+      - key: team.custom_workflow
+        body: Try your team-specific AI workflow.
+```
+
+`enablement_tips.mode: extend` adds configured tips to Noether's built-in catalog.
+`enablement_tips.mode: replace` uses only configured tips.
 
 ## Format
 
@@ -47,6 +63,7 @@ budgets:
           max_usd: 1.00
           warn_at_fraction: 0.8
           action: block
+          warning_cadence: 12h
         - id: spike-5m
           by: project
           window: 5m
@@ -56,6 +73,7 @@ budgets:
       request_cost:
         max_usd: 0.50
         action: warn
+        warning_cadence: 30m
       context_tokens:
         max_tokens: 120000
         action: block
@@ -80,6 +98,9 @@ policies:
 The v0 evaluator is an in-memory fixed-window budget:
 
 - routing defaults to `explicit_then_fallback`;
+- warning limits may define `warning_cadence` next to the limit that emits the warning;
+- omitted warning cadence falls back to Noether runtime config, then 4h;
+- warning cadence uses the same duration syntax as windows: `<number><s|m|h|d>`;
 - when `budget_id` is present, Noether tries that budget first and records why it was rejected
   before falling back;
 - inferred fallback budgets sort by `routing.fallback_order`, higher `priority`, lower projected budget
@@ -129,7 +150,12 @@ The v0 evaluator is an in-memory fixed-window budget:
 - otherwise estimated cost falls back to `estimated_tokens * 0.000001`;
 - `allow` creates a reservation;
 - `warn` creates a reservation and includes an explanation;
-- `deny` does not create a reservation.
+- `deny` does not create a reservation;
+- warn decisions may include `metadata.message_hints[].recommendation` (`show` or `hide`) so
+  integrations can follow Noether's cadence recommendation without losing the underlying decision
+  facts;
+- allow decisions may include `metadata.notifications[]` for Noether-authored enablement tips
+  when applicable budgets have headroom and no applicable budget is near or over pace.
 
 Reservations are finalized through `POST /v1/reservations/{id}/finalize`.
 

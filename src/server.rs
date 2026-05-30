@@ -26,6 +26,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::capture::capture;
+use crate::config::NoetherConfig;
 use crate::contract::{
     AuthorizeDecision, AuthorizeRequest, DecisionMode, DecisionOutcome, FinalizeReservation,
     Reservation, SpendWindowMode, TraceEvent,
@@ -967,6 +968,7 @@ pub struct ServeConfig {
     pub routes: Vec<ProxyRoute>,
     pub policy_path: Option<PathBuf>,
     pub policy: Option<PolicyFile>,
+    pub noether_config: NoetherConfig,
     pub decision_mode: DecisionMode,
 }
 
@@ -989,11 +991,17 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         ),
         None => None,
     };
-    let ledger = if config.database_url.is_some() {
+    if let Some(postgres_ledger) = postgres_ledger.as_ref() {
+        postgres_ledger
+            .set_advisory_config(config.noether_config.advisory.clone())
+            .await;
+    }
+    let mut ledger = if config.database_url.is_some() {
         BudgetLedger::default()
     } else {
         BudgetLedger::open_sqlite(&config.db_path)?
     };
+    ledger.set_advisory_config(config.noether_config.advisory.clone());
     let policy_proposal_path = config
         .simulation_dir
         .parent()
@@ -3377,6 +3385,7 @@ mod tests {
                         max_usd: 0.01,
                         warn_at_fractions: vec![0.8],
                         action: crate::contract::PolicyAction::Block,
+                        warning_cadence: None,
                     }],
                     tool_calls: None,
                     agent_steps: None,
@@ -3421,6 +3430,7 @@ mod tests {
                     context_tokens: Some(crate::contract::ContextTokenLimit {
                         max_tokens: 1_000,
                         action: crate::contract::PolicyAction::Warn,
+                        warning_cadence: None,
                     }),
                     spend: vec![crate::contract::SpendWindowLimit {
                         id: Some("daily-cap".to_owned()),
@@ -3433,6 +3443,7 @@ mod tests {
                         max_usd: 1000.0,
                         warn_at_fractions: vec![1.0],
                         action: crate::contract::PolicyAction::Warn,
+                        warning_cadence: None,
                     }],
                     tool_calls: None,
                     agent_steps: None,
@@ -3477,6 +3488,7 @@ mod tests {
                         max_usd: 1000.0,
                         warn_at_fractions: vec![0.8],
                         action: crate::contract::PolicyAction::Block,
+                        warning_cadence: None,
                     }],
                     tool_calls: None,
                     agent_steps: None,
