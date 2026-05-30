@@ -1,13 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::contract::{
-    AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation, RuleMatch, UsageObservation,
+    AuthorizeDecision, AuthorizeRequest, BudgetRule, DecisionOutcome, FinalizeReservation,
+    RuleMatch, UsageObservation,
 };
 use crate::error::NoetError;
-use crate::ledger::BudgetLedger;
+use crate::ledger::{
+    AsyncPostgresLedgerOptions, BudgetLedger, SimulationLedgerBatch, TraceReportItem, UsageReport,
+    connect_async_postgres_client,
+};
 use crate::policy::{PolicyFile, validate_policy};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -110,6 +118,8 @@ pub struct SimulationComparisonReport {
     pub seed: u64,
     pub horizon_days: u32,
     pub total_requests: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SimulationTimingReport>,
     pub strategies: Vec<SimulationStrategyReport>,
 }
 
@@ -137,9 +147,140 @@ pub struct SimulationStrategyReport {
     pub model_mix: Vec<SimulationModelMixEntry>,
     pub carryover_liability_usd: f64,
     pub exhaustion_day: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<SimulationDatabaseLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SimulationStrategyTimingReport>,
     pub db_path: PathBuf,
     pub usage_report_path: PathBuf,
     pub decisions_report_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SimulationTimingReport {
+    pub total_ms: f64,
+    pub generate_demand_ms: f64,
+    pub strategies_ms: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SimulationStrategyTimingReport {
+    pub total_ms: f64,
+    pub init_ms: f64,
+    pub replay_ms: f64,
+    #[serde(default)]
+    pub persist_ms: f64,
+    pub report_ms: f64,
+    pub artifact_ms: f64,
+}
+
+impl SimulationStrategyReport {
+    pub fn database_location(&self) -> SimulationDatabaseLocation {
+        self.database
+            .clone()
+            .unwrap_or_else(|| SimulationDatabaseLocation::Sqlite {
+                path: self.db_path.clone(),
+            })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum SimulationDatabaseLocation {
+    Sqlite { path: PathBuf },
+    Postgres { url: String },
+}
+
+impl SimulationDatabaseLocation {
+    pub fn cli_lines(&self, out_dir: &Path) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Sqlite { path } => vec![
+                ("db_backend", "sqlite".to_owned()),
+                ("db_path", out_dir.join(path).display().to_string()),
+            ],
+            Self::Postgres { url } => vec![
+                ("db_backend", "postgres".to_owned()),
+                ("db_url", url.clone()),
+            ],
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SimulationDatabase {
+    backend: Arc<dyn SimulationBackend>,
+}
+
+impl std::fmt::Debug for SimulationDatabase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SimulationDatabase")
+            .field("backend", &self.backend.name())
+            .finish()
+    }
+}
+
+impl SimulationDatabase {
+    pub fn sqlite() -> Self {
+        Self {
+            backend: Arc::new(SqliteSimulationBackend),
+        }
+    }
+
+    pub fn postgres(database_url: String, options: AsyncPostgresLedgerOptions) -> Self {
+        Self {
+            backend: Arc::new(PostgresSimulationBackend {
+                database_url,
+                options,
+            }),
+        }
+    }
+}
+
+type SimulationBackendFuture =
+    Pin<Box<dyn Future<Output = Result<SimulationStrategyReport, NoetError>> + Send>>;
+
+trait SimulationBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn run_strategy(&self, context: SimulationStrategyContext) -> SimulationBackendFuture;
+}
+
+struct SimulationStrategyContext {
+    file: Arc<SimulationFile>,
+    strategy: SimulationStrategy,
+    demand: Arc<Vec<SyntheticDemandRequest>>,
+    out_dir: PathBuf,
+    strategy_dir_relative: PathBuf,
+}
+
+struct SqliteSimulationBackend;
+
+struct PostgresSimulationBackend {
+    database_url: String,
+    options: AsyncPostgresLedgerOptions,
+}
+
+impl SimulationBackend for SqliteSimulationBackend {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn run_strategy(&self, context: SimulationStrategyContext) -> SimulationBackendFuture {
+        Box::pin(async move { run_sqlite_strategy(context) })
+    }
+}
+
+impl SimulationBackend for PostgresSimulationBackend {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn run_strategy(&self, context: SimulationStrategyContext) -> SimulationBackendFuture {
+        let database_url = self.database_url.clone();
+        let options = self.options.clone();
+        Box::pin(async move { run_postgres_strategy(context, database_url, options).await })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -327,6 +468,212 @@ pub fn generate_synthetic_demand(
     Ok(requests)
 }
 
+fn initial_strategy_report(
+    strategy: &SimulationStrategy,
+    total_requests: usize,
+    strategy_dir_relative: &Path,
+    database: SimulationDatabaseLocation,
+    db_path: PathBuf,
+) -> SimulationStrategyReport {
+    SimulationStrategyReport {
+        id: strategy.id.clone(),
+        description: strategy.description.clone(),
+        policy_moves: strategy_policy_moves(&strategy.policy),
+        total_requests: total_requests as u64,
+        allowed_requests: 0,
+        warned_requests: 0,
+        denied_requests: 0,
+        fallback_count: 0,
+        limit_hit_count: 0,
+        total_cost_usd: 0.0,
+        unused_budget_usd: 0.0,
+        useful_work_blocked_score: 0,
+        runaway_spend_prevented_usd: 0.0,
+        adoption_coverage: 0.0,
+        fairness_score: 0.0,
+        unused_protected_opportunity_usd: 0.0,
+        low_adopter_count: 0,
+        high_adopter_count: 0,
+        model_mix: Vec::new(),
+        carryover_liability_usd: 0.0,
+        exhaustion_day: None,
+        database: Some(database),
+        timing: None,
+        db_path,
+        usage_report_path: strategy_dir_relative.join("usage-report.json"),
+        decisions_report_path: strategy_dir_relative.join("decisions-report.json"),
+    }
+}
+
+#[derive(Default)]
+struct SimulationStrategyTotals {
+    users_with_access: BTreeSet<String>,
+    user_spend: BTreeMap<String, f64>,
+    model_mix: BTreeMap<String, (u64, f64)>,
+}
+
+fn apply_authorize_decision_to_report(
+    report: &mut SimulationStrategyReport,
+    totals: &mut SimulationStrategyTotals,
+    request: &SyntheticDemandRequest,
+    decision: &AuthorizeDecision,
+) -> bool {
+    let limit_hit_count = decision
+        .explanations
+        .iter()
+        .filter(|explanation| is_limit_rule_id(&explanation.rule_id))
+        .count() as u64;
+    if decision
+        .explanations
+        .iter()
+        .any(|explanation| explanation.reason.starts_with("selected fallback budget"))
+    {
+        report.fallback_count += 1;
+    }
+    report.limit_hit_count += limit_hit_count;
+    match decision.outcome {
+        DecisionOutcome::Allow => {
+            report.allowed_requests += 1;
+            totals.users_with_access.insert(request.subject.clone());
+            true
+        }
+        DecisionOutcome::Warn => {
+            report.warned_requests += 1;
+            totals.users_with_access.insert(request.subject.clone());
+            true
+        }
+        DecisionOutcome::Deny => {
+            report.denied_requests += 1;
+            report.useful_work_blocked_score += request.useful_work_score as u64;
+            if request.loop_risk || limit_hit_count > 0 {
+                report.runaway_spend_prevented_usd += request.estimated_cost_usd;
+            }
+            if report.exhaustion_day.is_none()
+                && decision.explanations.iter().any(|explanation| {
+                    explanation.reason.contains("fixed-window limit")
+                        || explanation.rule_id == "no_fallback_budget"
+                })
+            {
+                report.exhaustion_day = Some(request.day_index);
+            }
+            false
+        }
+    }
+}
+
+fn simulation_finalize_payload(
+    request: &SyntheticDemandRequest,
+    strategy_id: &str,
+) -> FinalizeReservation {
+    FinalizeReservation {
+        reservation_id: None,
+        outcome: crate::contract::FinalizeOutcome::Success,
+        usage: Some(UsageObservation {
+            provider: Some(request.provider.clone()),
+            model: Some(request.model.clone()),
+            input_tokens: Some(request.estimated_tokens * 3 / 5),
+            output_tokens: Some(request.estimated_tokens * 2 / 5),
+            total_tokens: Some(request.estimated_tokens),
+            cost_usd: Some(request.estimated_cost_usd),
+            latency_ms: Some(500 + request.tool_call_count as u64 * 50),
+            stop_reason: Some("stop".to_owned()),
+        }),
+        actual_cost_usd: Some(request.estimated_cost_usd),
+        metadata: BTreeMap::from([
+            (
+                "trace_id".to_owned(),
+                serde_json::Value::String(format!("{}:{}", strategy_id, request.request_id)),
+            ),
+            (
+                "request_id".to_owned(),
+                serde_json::Value::String(request.request_id.clone()),
+            ),
+            (
+                "source".to_owned(),
+                serde_json::Value::String("simulation".to_owned()),
+            ),
+        ]),
+    }
+}
+
+fn record_finalized_simulation_usage(
+    totals: &mut SimulationStrategyTotals,
+    request: &SyntheticDemandRequest,
+) {
+    *totals
+        .user_spend
+        .entry(request.subject.clone())
+        .or_insert(0.0) += request.estimated_cost_usd;
+    let entry = totals
+        .model_mix
+        .entry(request.model_id.clone())
+        .or_insert((0_u64, 0.0_f64));
+    entry.0 += 1;
+    entry.1 += request.estimated_cost_usd;
+}
+
+fn finish_strategy_report(
+    file: &SimulationFile,
+    strategy: &SimulationStrategy,
+    report: &mut SimulationStrategyReport,
+    usage: &UsageReport,
+    totals: SimulationStrategyTotals,
+) {
+    report.total_cost_usd = usage.total_cost_usd;
+    report.unused_budget_usd = (strategy
+        .policy
+        .budgets
+        .iter()
+        .filter_map(budget_total_cap_usd)
+        .sum::<f64>()
+        - usage.total_cost_usd)
+        .max(0.0);
+    report.adoption_coverage = if file.company.users.is_empty() {
+        0.0
+    } else {
+        totals.users_with_access.len() as f64 / file.company.users.len() as f64
+    };
+    report.fairness_score = fairness_score(&file.company.users, &totals.user_spend);
+    report.model_mix = totals
+        .model_mix
+        .into_iter()
+        .map(
+            |(model_id, (requests, total_cost_usd))| SimulationModelMixEntry {
+                model_id,
+                requests,
+                total_cost_usd,
+            },
+        )
+        .collect();
+    report.model_mix.sort_by(|left, right| {
+        right
+            .total_cost_usd
+            .partial_cmp(&left.total_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    report.carryover_liability_usd = usage
+        .protected_adoption
+        .as_ref()
+        .map(|adoption| adoption.carryover_liability_usd)
+        .unwrap_or_default();
+    report.unused_protected_opportunity_usd = usage
+        .protected_adoption
+        .as_ref()
+        .map(|adoption| adoption.unused_protected_opportunity_usd)
+        .unwrap_or_default();
+    report.low_adopter_count = usage
+        .protected_adoption
+        .as_ref()
+        .map(|adoption| adoption.low_adopters.len() as u64)
+        .unwrap_or_default();
+    report.high_adopter_count = usage
+        .protected_adoption
+        .as_ref()
+        .map(|adoption| adoption.high_adopters.len() as u64)
+        .unwrap_or_default();
+}
+
 pub fn compare_strategies(
     file: &SimulationFile,
     out_dir: &Path,
@@ -334,211 +681,349 @@ pub fn compare_strategies(
     validate_simulation(file)?;
     std::fs::create_dir_all(out_dir)?;
 
+    let total_started = std::time::Instant::now();
+    let demand_started = std::time::Instant::now();
     let demand = generate_synthetic_demand(file)?;
+    let generate_demand_ms = elapsed_ms(demand_started);
+    let strategies_started = std::time::Instant::now();
     let strategies_dir = out_dir.join("strategies");
     std::fs::create_dir_all(&strategies_dir)?;
     let mut strategies = Vec::new();
+    let file = Arc::new(file.clone());
+    let demand = Arc::new(demand);
 
     for strategy in &file.strategies {
         let strategy_slug = encode_path_component(&strategy.id, "simulation");
         let strategy_dir_relative = PathBuf::from("strategies").join(&strategy_slug);
-        let strategy_dir = out_dir.join(&strategy_dir_relative);
-        std::fs::create_dir_all(&strategy_dir)?;
-        let db_path = strategy_dir.join("simulation.sqlite");
-        if db_path.exists() {
-            std::fs::remove_file(&db_path)?;
-        }
-
-        let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
-        let mut report = SimulationStrategyReport {
-            id: strategy.id.clone(),
-            description: strategy.description.clone(),
-            policy_moves: strategy_policy_moves(&strategy.policy),
-            total_requests: demand.len() as u64,
-            allowed_requests: 0,
-            warned_requests: 0,
-            denied_requests: 0,
-            fallback_count: 0,
-            limit_hit_count: 0,
-            total_cost_usd: 0.0,
-            unused_budget_usd: 0.0,
-            useful_work_blocked_score: 0,
-            runaway_spend_prevented_usd: 0.0,
-            adoption_coverage: 0.0,
-            fairness_score: 0.0,
-            unused_protected_opportunity_usd: 0.0,
-            low_adopter_count: 0,
-            high_adopter_count: 0,
-            model_mix: Vec::new(),
-            carryover_liability_usd: 0.0,
-            exhaustion_day: None,
-            db_path: strategy_dir_relative.join("simulation.sqlite"),
-            usage_report_path: strategy_dir_relative.join("usage-report.json"),
-            decisions_report_path: strategy_dir_relative.join("decisions-report.json"),
-        };
-        let mut users_with_access = BTreeSet::new();
-        let mut user_spend = BTreeMap::new();
-        let mut model_mix = BTreeMap::new();
-
-        for request in &demand {
-            let authorize = synthetic_authorize_request(request, &strategy.id);
-            let decision = ledger.try_authorize(Some(&strategy.policy), &authorize)?;
-            let limit_hit_count = decision
-                .explanations
-                .iter()
-                .filter(|explanation| is_limit_rule_id(&explanation.rule_id))
-                .count() as u64;
-            if decision
-                .explanations
-                .iter()
-                .any(|explanation| explanation.reason.starts_with("selected fallback budget"))
-            {
-                report.fallback_count += 1;
-            }
-            report.limit_hit_count += limit_hit_count;
-            match decision.outcome {
-                DecisionOutcome::Allow => {
-                    report.allowed_requests += 1;
-                    users_with_access.insert(request.subject.clone());
-                }
-                DecisionOutcome::Warn => {
-                    report.warned_requests += 1;
-                    users_with_access.insert(request.subject.clone());
-                }
-                DecisionOutcome::Deny => {
-                    report.denied_requests += 1;
-                    report.useful_work_blocked_score += request.useful_work_score as u64;
-                    if request.loop_risk || limit_hit_count > 0 {
-                        report.runaway_spend_prevented_usd += request.estimated_cost_usd;
-                    }
-                    if report.exhaustion_day.is_none()
-                        && decision.explanations.iter().any(|explanation| {
-                            explanation.reason.contains("fixed-window limit")
-                                || explanation.rule_id == "no_fallback_budget"
-                        })
-                    {
-                        report.exhaustion_day = Some(request.day_index);
-                    }
-                    continue;
-                }
-            }
-
-            if let Some(reservation) = &decision.reservation {
-                let finalize = FinalizeReservation {
-                    reservation_id: None,
-                    outcome: crate::contract::FinalizeOutcome::Success,
-                    usage: Some(UsageObservation {
-                        provider: Some(request.provider.clone()),
-                        model: Some(request.model.clone()),
-                        input_tokens: Some(request.estimated_tokens * 3 / 5),
-                        output_tokens: Some(request.estimated_tokens * 2 / 5),
-                        total_tokens: Some(request.estimated_tokens),
-                        cost_usd: Some(request.estimated_cost_usd),
-                        latency_ms: Some(500 + request.tool_call_count as u64 * 50),
-                        stop_reason: Some("stop".to_owned()),
-                    }),
-                    actual_cost_usd: Some(request.estimated_cost_usd),
-                    metadata: BTreeMap::from([
-                        (
-                            "trace_id".to_owned(),
-                            serde_json::Value::String(format!(
-                                "{}:{}",
-                                strategy.id, request.request_id
-                            )),
-                        ),
-                        (
-                            "request_id".to_owned(),
-                            serde_json::Value::String(request.request_id.clone()),
-                        ),
-                        (
-                            "source".to_owned(),
-                            serde_json::Value::String("simulation".to_owned()),
-                        ),
-                    ]),
-                };
-                let _ = ledger.finalize(&reservation.id, &finalize)?;
-                *user_spend.entry(request.subject.clone()).or_insert(0.0) +=
-                    request.estimated_cost_usd;
-                let entry = model_mix
-                    .entry(request.model_id.clone())
-                    .or_insert((0_u64, 0.0_f64));
-                entry.0 += 1;
-                entry.1 += request.estimated_cost_usd;
-            }
-        }
-
-        let usage = ledger.usage_report()?;
-        let decisions = ledger.decisions_report()?;
-        report.total_cost_usd = usage.total_cost_usd;
-        report.unused_budget_usd = (strategy
-            .policy
-            .budgets
-            .iter()
-            .filter_map(budget_total_cap_usd)
-            .sum::<f64>()
-            - usage.total_cost_usd)
-            .max(0.0);
-        report.adoption_coverage = if file.company.users.is_empty() {
-            0.0
-        } else {
-            users_with_access.len() as f64 / file.company.users.len() as f64
-        };
-        report.fairness_score = fairness_score(&file.company.users, &user_spend);
-        report.model_mix = model_mix
-            .into_iter()
-            .map(
-                |(model_id, (requests, total_cost_usd))| SimulationModelMixEntry {
-                    model_id,
-                    requests,
-                    total_cost_usd,
-                },
-            )
-            .collect();
-        report.model_mix.sort_by(|left, right| {
-            right
-                .total_cost_usd
-                .partial_cmp(&left.total_cost_usd)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.model_id.cmp(&right.model_id))
-        });
-        report.carryover_liability_usd = usage
-            .protected_adoption
-            .as_ref()
-            .map(|adoption| adoption.carryover_liability_usd)
-            .unwrap_or_default();
-        report.unused_protected_opportunity_usd = usage
-            .protected_adoption
-            .as_ref()
-            .map(|adoption| adoption.unused_protected_opportunity_usd)
-            .unwrap_or_default();
-        report.low_adopter_count = usage
-            .protected_adoption
-            .as_ref()
-            .map(|adoption| adoption.low_adopters.len() as u64)
-            .unwrap_or_default();
-        report.high_adopter_count = usage
-            .protected_adoption
-            .as_ref()
-            .map(|adoption| adoption.high_adopters.len() as u64)
-            .unwrap_or_default();
-        std::fs::write(
-            out_dir.join(&report.usage_report_path),
-            serde_json::to_vec_pretty(&usage)?,
-        )?;
-        std::fs::write(
-            out_dir.join(&report.decisions_report_path),
-            serde_json::to_vec_pretty(&decisions)?,
-        )?;
-        strategies.push(report);
+        strategies.push(run_sqlite_strategy(SimulationStrategyContext {
+            file: Arc::clone(&file),
+            strategy: strategy.clone(),
+            demand: Arc::clone(&demand),
+            out_dir: out_dir.to_path_buf(),
+            strategy_dir_relative,
+        })?);
     }
+    let strategies_ms = elapsed_ms(strategies_started);
 
     Ok(SimulationComparisonReport {
         name: file.name.clone(),
         seed: file.seed,
         horizon_days: file.horizon_days,
         total_requests: demand.len() as u64,
+        timing: Some(SimulationTimingReport {
+            total_ms: elapsed_ms(total_started),
+            generate_demand_ms,
+            strategies_ms,
+        }),
         strategies,
     })
+}
+
+pub async fn compare_strategies_with_database(
+    file: &SimulationFile,
+    out_dir: &Path,
+    database: SimulationDatabase,
+) -> Result<SimulationComparisonReport, NoetError> {
+    validate_simulation(file)?;
+    std::fs::create_dir_all(out_dir)?;
+
+    let total_started = std::time::Instant::now();
+    let demand_started = std::time::Instant::now();
+    let demand = generate_synthetic_demand(file)?;
+    let generate_demand_ms = elapsed_ms(demand_started);
+    let strategies_started = std::time::Instant::now();
+    let strategies_dir = out_dir.join("strategies");
+    std::fs::create_dir_all(&strategies_dir)?;
+    let file = Arc::new(file.clone());
+    let demand = Arc::new(demand);
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (index, strategy) in file.strategies.iter().cloned().enumerate() {
+        let strategy_slug = encode_path_component(&strategy.id, "simulation");
+        let strategy_dir_relative = PathBuf::from("strategies").join(&strategy_slug);
+        let backend = Arc::clone(&database.backend);
+        let file = Arc::clone(&file);
+        let demand = Arc::clone(&demand);
+        let out_dir = out_dir.to_path_buf();
+        tasks.spawn(async move {
+            let report = backend
+                .run_strategy(SimulationStrategyContext {
+                    file,
+                    strategy,
+                    demand,
+                    out_dir,
+                    strategy_dir_relative,
+                })
+                .await?;
+            Ok::<_, NoetError>((index, report))
+        });
+    }
+
+    let mut strategies = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        strategies.push(result.map_err(|error| {
+            NoetError::InvalidConfig(format!("simulation strategy task failed: {error}"))
+        })??);
+    }
+    strategies.sort_by_key(|(index, _)| *index);
+    let strategies = strategies
+        .into_iter()
+        .map(|(_, strategy)| strategy)
+        .collect::<Vec<_>>();
+    let strategies_ms = elapsed_ms(strategies_started);
+
+    Ok(SimulationComparisonReport {
+        name: file.name.clone(),
+        seed: file.seed,
+        horizon_days: file.horizon_days,
+        total_requests: demand.len() as u64,
+        timing: Some(SimulationTimingReport {
+            total_ms: elapsed_ms(total_started),
+            generate_demand_ms,
+            strategies_ms,
+        }),
+        strategies,
+    })
+}
+
+fn elapsed_ms(started: std::time::Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn run_sqlite_strategy(
+    context: SimulationStrategyContext,
+) -> Result<SimulationStrategyReport, NoetError> {
+    let total_started = std::time::Instant::now();
+    let init_started = std::time::Instant::now();
+    let strategy_dir = context.out_dir.join(&context.strategy_dir_relative);
+    std::fs::create_dir_all(&strategy_dir)?;
+    let db_path = strategy_dir.join("simulation.sqlite");
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)?;
+    }
+
+    let mut ledger = BudgetLedger::open_sqlite(&db_path)?;
+    let init_ms = elapsed_ms(init_started);
+    let mut report = initial_strategy_report(
+        &context.strategy,
+        context.demand.len(),
+        &context.strategy_dir_relative,
+        SimulationDatabaseLocation::Sqlite {
+            path: context.strategy_dir_relative.join("simulation.sqlite"),
+        },
+        context.strategy_dir_relative.join("simulation.sqlite"),
+    );
+    let mut totals = SimulationStrategyTotals::default();
+
+    let replay_started = std::time::Instant::now();
+    for request in context.demand.iter() {
+        let authorize = synthetic_authorize_request(request, &context.strategy.id);
+        let decision = ledger.try_authorize(Some(&context.strategy.policy), &authorize)?;
+        if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
+            continue;
+        }
+
+        if let Some(reservation) = &decision.reservation {
+            let finalize = simulation_finalize_payload(request, &context.strategy.id);
+            let _ = ledger.finalize(&reservation.id, &finalize)?;
+            record_finalized_simulation_usage(&mut totals, request);
+        }
+    }
+    let replay_ms = elapsed_ms(replay_started);
+
+    let report_started = std::time::Instant::now();
+    let usage = ledger.usage_report()?;
+    let decisions = ledger.decisions_report()?;
+    finish_strategy_report(
+        &context.file,
+        &context.strategy,
+        &mut report,
+        &usage,
+        totals,
+    );
+    let report_ms = elapsed_ms(report_started);
+    let artifact_started = std::time::Instant::now();
+    write_strategy_artifacts(&context.out_dir, &report, &usage, &decisions)?;
+    let artifact_ms = elapsed_ms(artifact_started);
+    report.timing = Some(SimulationStrategyTimingReport {
+        total_ms: elapsed_ms(total_started),
+        init_ms,
+        replay_ms,
+        persist_ms: 0.0,
+        report_ms,
+        artifact_ms,
+    });
+    Ok(report)
+}
+
+async fn run_postgres_strategy(
+    context: SimulationStrategyContext,
+    database_url: String,
+    options: AsyncPostgresLedgerOptions,
+) -> Result<SimulationStrategyReport, NoetError> {
+    let total_started = std::time::Instant::now();
+    let init_started = std::time::Instant::now();
+    let strategy_slug = encode_path_component(&context.strategy.id, "simulation");
+    let strategy_dir = context.out_dir.join(&context.strategy_dir_relative);
+    std::fs::create_dir_all(&strategy_dir)?;
+
+    let schema = simulation_postgres_schema(&strategy_slug);
+    create_postgres_schema(&database_url, &schema).await?;
+    let scoped_url = postgres_url_with_search_path(&database_url, &schema);
+    tokio::task::spawn_blocking(move || {
+        let mut ledger = BudgetLedger::default();
+        let mut batch = SimulationLedgerBatch::default();
+        let init_ms = elapsed_ms(init_started);
+        let mut report = initial_strategy_report(
+            &context.strategy,
+            context.demand.len(),
+            &context.strategy_dir_relative,
+            SimulationDatabaseLocation::Postgres {
+                url: redact_database_url(&scoped_url),
+            },
+            context.strategy_dir_relative.join("postgres"),
+        );
+        let mut totals = SimulationStrategyTotals::default();
+
+        let replay_started = std::time::Instant::now();
+        for request in context.demand.iter() {
+            let authorize = synthetic_authorize_request(request, &context.strategy.id);
+            let decision = ledger.try_authorize(Some(&context.strategy.policy), &authorize)?;
+            ledger.capture_simulation_decision(
+                &mut batch,
+                Some(&context.strategy.policy),
+                &authorize,
+                &decision,
+            )?;
+            if !apply_authorize_decision_to_report(&mut report, &mut totals, request, &decision) {
+                continue;
+            }
+
+            if let Some(reservation) = &decision.reservation {
+                let finalize = simulation_finalize_payload(request, &context.strategy.id);
+                let reservation = ledger.finalize(&reservation.id, &finalize)?;
+                ledger.capture_simulation_finalization(&mut batch, &reservation, &finalize)?;
+                record_finalized_simulation_usage(&mut totals, request);
+            }
+        }
+        let replay_ms = elapsed_ms(replay_started);
+
+        let persist_started = std::time::Instant::now();
+        ledger.persist_simulation_batch_to_postgres_with_options(&scoped_url, &batch, &options)?;
+        let persist_ms = elapsed_ms(persist_started);
+
+        let report_started = std::time::Instant::now();
+        let report_ledger = BudgetLedger::open_postgres(&scoped_url)?;
+        let usage = report_ledger.usage_report()?;
+        let decisions = report_ledger.decisions_report()?;
+        finish_strategy_report(
+            &context.file,
+            &context.strategy,
+            &mut report,
+            &usage,
+            totals,
+        );
+        let report_ms = elapsed_ms(report_started);
+        let artifact_started = std::time::Instant::now();
+        write_strategy_artifacts(&context.out_dir, &report, &usage, &decisions)?;
+        let artifact_ms = elapsed_ms(artifact_started);
+        report.timing = Some(SimulationStrategyTimingReport {
+            total_ms: elapsed_ms(total_started),
+            init_ms,
+            replay_ms,
+            persist_ms,
+            report_ms,
+            artifact_ms,
+        });
+        Ok(report)
+    })
+    .await
+    .map_err(|err| NoetError::InvalidConfig(format!("Postgres simulation task failed: {err}")))?
+}
+
+fn write_strategy_artifacts(
+    out_dir: &Path,
+    report: &SimulationStrategyReport,
+    usage: &UsageReport,
+    decisions: &[TraceReportItem],
+) -> Result<(), NoetError> {
+    std::fs::write(
+        out_dir.join(&report.usage_report_path),
+        serde_json::to_vec_pretty(usage)?,
+    )?;
+    std::fs::write(
+        out_dir.join(&report.decisions_report_path),
+        serde_json::to_vec_pretty(decisions)?,
+    )?;
+    Ok(())
+}
+
+async fn create_postgres_schema(database_url: &str, schema: &str) -> Result<(), NoetError> {
+    let client = connect_async_postgres_client(database_url)
+        .await
+        .map_err(|err| NoetError::InvalidConfig(format!("PostgreSQL connection failed: {err}")))?;
+    client
+        .execute(
+            &format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                postgres_ident_literal(schema)
+            ),
+            &[],
+        )
+        .await
+        .map_err(|err| {
+            NoetError::InvalidConfig(format!("PostgreSQL schema creation failed: {err}"))
+        })?;
+    drop(client);
+    Ok(())
+}
+
+fn simulation_postgres_schema(strategy_slug: &str) -> String {
+    const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
+    const SCHEMA_PREFIX: &str = "noet_sim";
+
+    let normalized = strategy_slug
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let suffix = Uuid::new_v4().as_simple().to_string();
+    let max_slug_len = POSTGRES_IDENTIFIER_MAX_BYTES - SCHEMA_PREFIX.len() - suffix.len() - 2;
+    let mut slug = normalized.trim_matches('_').to_owned();
+    if slug.len() > max_slug_len {
+        slug.truncate(max_slug_len);
+        slug = slug.trim_matches('_').to_owned();
+    }
+    if slug.is_empty() {
+        slug = "strategy".to_owned();
+    }
+    format!("{SCHEMA_PREFIX}_{slug}_{suffix}")
+}
+
+fn postgres_url_with_search_path(database_url: &str, schema: &str) -> String {
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    format!("{database_url}{separator}options=-csearch_path%3D{schema}")
+}
+
+fn postgres_ident_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn redact_database_url(database_url: &str) -> String {
+    match url::Url::parse(database_url) {
+        Ok(mut url) => {
+            if url.password().is_some() {
+                let _ = url.set_password(Some("redacted"));
+            }
+            url.to_string()
+        }
+        Err(_) => database_url.to_owned(),
+    }
 }
 
 fn strategy_policy_moves(policy: &PolicyFile) -> Vec<String> {
@@ -958,6 +1443,16 @@ mod tests {
     }
 
     #[test]
+    fn postgres_simulation_schema_preserves_unique_suffix_with_long_strategy_ids() {
+        let schema = simulation_postgres_schema(&"very-long-strategy-id-".repeat(8));
+
+        assert!(schema.len() <= 63);
+        let suffix = schema.rsplit('_').next().expect("uuid suffix");
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn parses_and_validates_simulation_schema_v1() {
         let simulation: SimulationFile = serde_yaml::from_str(
             r#"
@@ -1283,6 +1778,14 @@ strategies:
 
         let report = compare_strategies(&simulation, tempdir.path()).expect("compare strategies");
         assert_eq!(report.strategies.len(), 2);
+        assert!(matches!(
+            report.strategies[0].database,
+            Some(SimulationDatabaseLocation::Sqlite { .. })
+        ));
+        assert!(matches!(
+            report.strategies[1].database,
+            Some(SimulationDatabaseLocation::Sqlite { .. })
+        ));
         assert_ne!(report.strategies[0].db_path, report.strategies[1].db_path);
         assert!(report.strategies[0].db_path.is_relative());
         assert!(report.strategies[1].db_path.is_relative());
@@ -1298,5 +1801,74 @@ strategies:
         );
         assert!(report.strategies[0].decisions_report_path.is_relative());
         assert!(report.strategies[1].decisions_report_path.is_relative());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    async fn compare_strategies_supports_postgres_backend() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let simulation =
+            parse_checked_in_simulation("examples/simulations/synthetic-company.noet.yaml");
+        let tempdir = tempfile::tempdir().expect("tempdir");
+
+        let report = compare_strategies_with_database(
+            &simulation,
+            tempdir.path(),
+            SimulationDatabase::postgres(
+                database_url.clone(),
+                AsyncPostgresLedgerOptions::strict(),
+            ),
+        )
+        .await
+        .expect("postgres simulation comparison succeeds");
+
+        assert_eq!(report.total_requests, 337);
+        assert_eq!(report.strategies.len(), simulation.strategies.len());
+        for strategy in &report.strategies {
+            let Some(SimulationDatabaseLocation::Postgres { url }) = &strategy.database else {
+                panic!("strategy should report postgres database location");
+            };
+            if let Ok(original_url) = url::Url::parse(&database_url)
+                && original_url.password().is_some()
+            {
+                let reported_url = url::Url::parse(url).expect("reported database URL parses");
+                assert_ne!(reported_url.password(), original_url.password());
+            }
+            assert!(tempdir.path().join(&strategy.usage_report_path).exists());
+            assert!(
+                tempdir
+                    .path()
+                    .join(&strategy.decisions_report_path)
+                    .exists()
+            );
+            cleanup_postgres_simulation_schema(&database_url, url).await;
+        }
+    }
+
+    async fn cleanup_postgres_simulation_schema(database_url: &str, report_url: &str) {
+        let Some(schema) = postgres_schema_from_report_url(report_url) else {
+            return;
+        };
+        let Ok(admin) = connect_async_postgres_client(database_url).await else {
+            return;
+        };
+        let _ = admin
+            .batch_execute(&format!(
+                r#"
+                SET lock_timeout = '2s';
+                DROP SCHEMA IF EXISTS {} CASCADE;
+                "#,
+                postgres_ident_literal(&schema)
+            ))
+            .await;
+    }
+
+    fn postgres_schema_from_report_url(report_url: &str) -> Option<String> {
+        let url = url::Url::parse(report_url).ok()?;
+        url.query_pairs().find_map(|(key, value)| {
+            (key == "options")
+                .then(|| value.strip_prefix("-csearch_path=").map(str::to_owned))
+                .flatten()
+        })
     }
 }

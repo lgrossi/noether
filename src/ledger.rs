@@ -9,7 +9,8 @@ use std::time::Instant;
 use chrono::{DateTime, Duration, Utc};
 use native_tls::TlsConnector;
 use postgres::{
-    Client as PostgresClient, NoTls, Row as PostgresRow, types::ToSql as PostgresToSql,
+    Client as PostgresClient, NoTls, Row as PostgresRow, Transaction as PostgresTransaction,
+    types::ToSql as PostgresToSql,
 };
 use postgres_native_tls::MakeTlsConnector as PostgresTls;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -44,12 +45,19 @@ pub struct BudgetLedger {
     reservations: HashMap<String, StoredReservation>,
     last_selected_budget_id: Option<String>,
     last_limit_hits: Vec<DecisionLimitHitReport>,
-    events: Vec<TraceEvent>,
-    conn: Option<Connection>,
-    pg_conn: Option<Arc<SyncPostgresClient>>,
+    events_count: u64,
+    store: LedgerStore,
 }
 
 const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
+
+#[derive(Default)]
+enum LedgerStore {
+    #[default]
+    InMemory,
+    Sqlite(Connection),
+    Postgres(Arc<SyncPostgresClient>),
+}
 
 #[derive(Clone, Default)]
 struct LedgerPersistenceSnapshot {
@@ -60,6 +68,582 @@ struct LedgerPersistenceSnapshot {
     reservations: HashMap<String, StoredReservation>,
     selected_budget_id: Option<String>,
     limit_hits: Vec<DecisionLimitHitReport>,
+}
+
+#[derive(Default)]
+pub struct SimulationLedgerBatch {
+    decisions: Vec<SimulationDecisionRow>,
+    reservations: Vec<SimulationReservationRow>,
+    reservation_index: HashMap<String, usize>,
+    reservation_scopes: Vec<SimulationReservationScopeRow>,
+    usage_observations: Vec<SimulationUsageObservationRow>,
+}
+
+struct SimulationDecisionRow {
+    decision_id: String,
+    trace_id: Option<String>,
+    session_id: Option<String>,
+    request_id: Option<String>,
+    subject: Option<String>,
+    project: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    estimated_tokens: Option<i64>,
+    estimated_cost_usd: Option<f64>,
+    outcome: &'static str,
+    action: &'static str,
+    explanations_json: String,
+    metadata_json: String,
+    entities_json: String,
+    selected_budget_id: Option<String>,
+    matched_entity: Option<String>,
+    selection_reason: Option<String>,
+    rejected_budget_id: Option<String>,
+    rejected_budget_reason: Option<String>,
+    model_check: Option<String>,
+    budget_window_remaining_usd: Option<f64>,
+    routing_json: String,
+    limit_hits_json: String,
+    max_tool_calls: Option<i64>,
+    max_agent_steps: Option<i64>,
+    max_retries: Option<i64>,
+    app_run_key: String,
+    created_at: String,
+}
+
+struct SimulationReservationRow {
+    id: String,
+    decision_id: String,
+    trace_id: Option<String>,
+    amount_usd: f64,
+    estimated_amount_usd: f64,
+    actual_amount_usd: Option<f64>,
+    currency: String,
+    status: &'static str,
+    created_at: String,
+    expires_at: String,
+    finalized_at: Option<String>,
+    budget_rule_ids_json: String,
+    limit_window_spends_json: String,
+    allocation_spends_json: String,
+}
+
+struct SimulationReservationScopeRow {
+    reservation_id: String,
+    rule_id: String,
+    limit_id: String,
+    scope_key: String,
+    amount_usd: f64,
+    created_at: String,
+}
+
+struct SimulationUsageObservationRow {
+    id: String,
+    reservation_id: String,
+    trace_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    cost_usd: Option<f64>,
+    latency_ms: Option<i64>,
+    stop_reason: Option<String>,
+    source: &'static str,
+    metadata_json: String,
+    created_at: String,
+}
+
+fn insert_simulation_decisions_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationDecisionRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let decision_ids = rows
+        .iter()
+        .map(|row| row.decision_id.clone())
+        .collect::<Vec<_>>();
+    let trace_ids = rows
+        .iter()
+        .map(|row| row.trace_id.clone())
+        .collect::<Vec<_>>();
+    let session_ids = rows
+        .iter()
+        .map(|row| row.session_id.clone())
+        .collect::<Vec<_>>();
+    let request_ids = rows
+        .iter()
+        .map(|row| row.request_id.clone())
+        .collect::<Vec<_>>();
+    let subjects = rows
+        .iter()
+        .map(|row| row.subject.clone())
+        .collect::<Vec<_>>();
+    let projects = rows
+        .iter()
+        .map(|row| row.project.clone())
+        .collect::<Vec<_>>();
+    let providers = rows
+        .iter()
+        .map(|row| row.provider.clone())
+        .collect::<Vec<_>>();
+    let models = rows.iter().map(|row| row.model.clone()).collect::<Vec<_>>();
+    let estimated_tokens = rows
+        .iter()
+        .map(|row| row.estimated_tokens)
+        .collect::<Vec<_>>();
+    let estimated_costs = rows
+        .iter()
+        .map(|row| row.estimated_cost_usd)
+        .collect::<Vec<_>>();
+    let outcomes = rows
+        .iter()
+        .map(|row| row.outcome.to_owned())
+        .collect::<Vec<_>>();
+    let actions = rows
+        .iter()
+        .map(|row| row.action.to_owned())
+        .collect::<Vec<_>>();
+    let explanations = rows
+        .iter()
+        .map(|row| row.explanations_json.clone())
+        .collect::<Vec<_>>();
+    let metadata = rows
+        .iter()
+        .map(|row| row.metadata_json.clone())
+        .collect::<Vec<_>>();
+    let entities = rows
+        .iter()
+        .map(|row| row.entities_json.clone())
+        .collect::<Vec<_>>();
+    let selected_budget_ids = rows
+        .iter()
+        .map(|row| row.selected_budget_id.clone())
+        .collect::<Vec<_>>();
+    let matched_entities = rows
+        .iter()
+        .map(|row| row.matched_entity.clone())
+        .collect::<Vec<_>>();
+    let selection_reasons = rows
+        .iter()
+        .map(|row| row.selection_reason.clone())
+        .collect::<Vec<_>>();
+    let rejected_budget_ids = rows
+        .iter()
+        .map(|row| row.rejected_budget_id.clone())
+        .collect::<Vec<_>>();
+    let rejected_budget_reasons = rows
+        .iter()
+        .map(|row| row.rejected_budget_reason.clone())
+        .collect::<Vec<_>>();
+    let model_checks = rows
+        .iter()
+        .map(|row| row.model_check.clone())
+        .collect::<Vec<_>>();
+    let budget_remaining = rows
+        .iter()
+        .map(|row| row.budget_window_remaining_usd)
+        .collect::<Vec<_>>();
+    let routing_json = rows
+        .iter()
+        .map(|row| row.routing_json.clone())
+        .collect::<Vec<_>>();
+    let limit_hits_json = rows
+        .iter()
+        .map(|row| row.limit_hits_json.clone())
+        .collect::<Vec<_>>();
+    let max_tool_calls = rows
+        .iter()
+        .map(|row| row.max_tool_calls)
+        .collect::<Vec<_>>();
+    let max_agent_steps = rows
+        .iter()
+        .map(|row| row.max_agent_steps)
+        .collect::<Vec<_>>();
+    let max_retries = rows.iter().map(|row| row.max_retries).collect::<Vec<_>>();
+    let app_run_keys = rows
+        .iter()
+        .map(|row| row.app_run_key.clone())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+
+    tx.execute(
+        "
+        INSERT INTO decisions (
+            decision_id, trace_id, session_id, request_id, subject, project, provider, model,
+            estimated_tokens, estimated_cost_usd, outcome, action, explanations_json, metadata_json,
+            entities_json, selected_budget_id, matched_entity, selection_reason, rejected_budget_id,
+            rejected_budget_reason, model_check, budget_window_remaining_usd, routing_json,
+            limit_hits_json, max_tool_calls, max_agent_steps, max_retries, app_run_key, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+            $8::text[], $9::bigint[], $10::double precision[], $11::text[], $12::text[],
+            $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[],
+            $19::text[], $20::text[], $21::text[], $22::double precision[], $23::text[],
+            $24::text[], $25::bigint[], $26::bigint[], $27::bigint[], $28::text[], $29::text[]
+        )
+        ",
+        &[
+            &decision_ids,
+            &trace_ids,
+            &session_ids,
+            &request_ids,
+            &subjects,
+            &projects,
+            &providers,
+            &models,
+            &estimated_tokens,
+            &estimated_costs,
+            &outcomes,
+            &actions,
+            &explanations,
+            &metadata,
+            &entities,
+            &selected_budget_ids,
+            &matched_entities,
+            &selection_reasons,
+            &rejected_budget_ids,
+            &rejected_budget_reasons,
+            &model_checks,
+            &budget_remaining,
+            &routing_json,
+            &limit_hits_json,
+            &max_tool_calls,
+            &max_agent_steps,
+            &max_retries,
+            &app_run_keys,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_reservations_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationReservationRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let decision_ids = rows
+        .iter()
+        .map(|row| row.decision_id.clone())
+        .collect::<Vec<_>>();
+    let amounts = rows.iter().map(|row| row.amount_usd).collect::<Vec<_>>();
+    let estimated_amounts = rows
+        .iter()
+        .map(|row| row.estimated_amount_usd)
+        .collect::<Vec<_>>();
+    let actual_amounts = rows
+        .iter()
+        .map(|row| row.actual_amount_usd)
+        .collect::<Vec<_>>();
+    let currencies = rows
+        .iter()
+        .map(|row| row.currency.clone())
+        .collect::<Vec<_>>();
+    let statuses = rows
+        .iter()
+        .map(|row| row.status.to_owned())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    let expires_at = rows
+        .iter()
+        .map(|row| row.expires_at.clone())
+        .collect::<Vec<_>>();
+    let finalized_at = rows
+        .iter()
+        .map(|row| row.finalized_at.clone())
+        .collect::<Vec<_>>();
+    let budget_rule_ids = rows
+        .iter()
+        .map(|row| row.budget_rule_ids_json.clone())
+        .collect::<Vec<_>>();
+    let limit_window_spends = rows
+        .iter()
+        .map(|row| row.limit_window_spends_json.clone())
+        .collect::<Vec<_>>();
+    let allocation_spends = rows
+        .iter()
+        .map(|row| row.allocation_spends_json.clone())
+        .collect::<Vec<_>>();
+
+    tx.execute(
+        "
+        INSERT INTO reservations (
+            id, decision_id, amount_usd, estimated_amount_usd, actual_amount_usd, currency, status,
+            created_at, expires_at, finalized_at, budget_rule_ids_json, limit_window_spends_json,
+            allocation_spends_json
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::double precision[], $4::double precision[],
+            $5::double precision[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+            $11::text[], $12::text[], $13::text[]
+        )
+        ",
+        &[
+            &ids,
+            &decision_ids,
+            &amounts,
+            &estimated_amounts,
+            &actual_amounts,
+            &currencies,
+            &statuses,
+            &created_at,
+            &expires_at,
+            &finalized_at,
+            &budget_rule_ids,
+            &limit_window_spends,
+            &allocation_spends,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_reservation_scopes_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationReservationScopeRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let reservation_ids = rows
+        .iter()
+        .map(|row| row.reservation_id.clone())
+        .collect::<Vec<_>>();
+    let rule_ids = rows
+        .iter()
+        .map(|row| row.rule_id.clone())
+        .collect::<Vec<_>>();
+    let limit_ids = rows
+        .iter()
+        .map(|row| row.limit_id.clone())
+        .collect::<Vec<_>>();
+    let scope_keys = rows
+        .iter()
+        .map(|row| row.scope_key.clone())
+        .collect::<Vec<_>>();
+    let amounts = rows.iter().map(|row| row.amount_usd).collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO reservation_limit_scopes (
+            reservation_id, rule_id, limit_id, scope_key, amount_usd, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[], $6::text[]
+        )
+        ",
+        &[
+            &reservation_ids,
+            &rule_ids,
+            &limit_ids,
+            &scope_keys,
+            &amounts,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_simulation_usage_observations_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    rows: &[SimulationUsageObservationRow],
+) -> Result<(), NoetError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let reservation_ids = rows
+        .iter()
+        .map(|row| row.reservation_id.clone())
+        .collect::<Vec<_>>();
+    let trace_ids = rows
+        .iter()
+        .map(|row| row.trace_id.clone())
+        .collect::<Vec<_>>();
+    let providers = rows
+        .iter()
+        .map(|row| row.provider.clone())
+        .collect::<Vec<_>>();
+    let models = rows.iter().map(|row| row.model.clone()).collect::<Vec<_>>();
+    let input_tokens = rows.iter().map(|row| row.input_tokens).collect::<Vec<_>>();
+    let output_tokens = rows.iter().map(|row| row.output_tokens).collect::<Vec<_>>();
+    let total_tokens = rows.iter().map(|row| row.total_tokens).collect::<Vec<_>>();
+    let costs = rows.iter().map(|row| row.cost_usd).collect::<Vec<_>>();
+    let latency = rows.iter().map(|row| row.latency_ms).collect::<Vec<_>>();
+    let stop_reasons = rows
+        .iter()
+        .map(|row| row.stop_reason.clone())
+        .collect::<Vec<_>>();
+    let sources = rows
+        .iter()
+        .map(|row| row.source.to_owned())
+        .collect::<Vec<_>>();
+    let metadata = rows
+        .iter()
+        .map(|row| row.metadata_json.clone())
+        .collect::<Vec<_>>();
+    let created_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect::<Vec<_>>();
+    tx.execute(
+        "
+        INSERT INTO usage_observations (
+            id, reservation_id, trace_id, provider, model, input_tokens, output_tokens,
+            total_tokens, cost_usd, latency_ms, stop_reason, source, metadata_json, created_at
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[],
+            $7::bigint[], $8::bigint[], $9::double precision[], $10::bigint[], $11::text[],
+            $12::text[], $13::text[], $14::text[]
+        )
+        ",
+        &[
+            &ids,
+            &reservation_ids,
+            &trace_ids,
+            &providers,
+            &models,
+            &input_tokens,
+            &output_tokens,
+            &total_tokens,
+            &costs,
+            &latency,
+            &stop_reasons,
+            &sources,
+            &metadata,
+            &created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_simulation_limit_windows_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    windows: &HashMap<(String, String, String), WindowState>,
+) -> Result<(), NoetError> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let mut rule_ids = Vec::with_capacity(windows.len());
+    let mut limit_ids = Vec::with_capacity(windows.len());
+    let mut scope_keys = Vec::with_capacity(windows.len());
+    let mut started_at = Vec::with_capacity(windows.len());
+    let mut used_usd = Vec::with_capacity(windows.len());
+    for ((rule_id, limit_id, scope_key), window) in windows {
+        rule_ids.push(rule_id.clone());
+        limit_ids.push(limit_id.clone());
+        scope_keys.push(scope_key.clone());
+        started_at.push(window.started_at.to_rfc3339());
+        used_usd.push(window.used_usd);
+    }
+    tx.execute(
+        "
+        INSERT INTO limit_window_states (rule_id, limit_id, scope_key, started_at, used_usd)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[])
+        ON CONFLICT(rule_id, limit_id, scope_key) DO UPDATE SET
+            started_at = EXCLUDED.started_at,
+            used_usd = EXCLUDED.used_usd
+        ",
+        &[&rule_ids, &limit_ids, &scope_keys, &started_at, &used_usd],
+    )?;
+    Ok(())
+}
+
+fn upsert_simulation_rolling_spend_buckets_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    buckets: &HashMap<(String, String, String, DateTime<Utc>), f64>,
+) -> Result<(), NoetError> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let mut rule_ids = Vec::with_capacity(buckets.len());
+    let mut limit_ids = Vec::with_capacity(buckets.len());
+    let mut scope_keys = Vec::with_capacity(buckets.len());
+    let mut bucket_starts = Vec::with_capacity(buckets.len());
+    let mut amounts = Vec::with_capacity(buckets.len());
+    for ((rule_id, limit_id, scope_key, bucket_start), amount) in buckets {
+        rule_ids.push(rule_id.clone());
+        limit_ids.push(limit_id.clone());
+        scope_keys.push(scope_key.clone());
+        bucket_starts.push(bucket_start.to_rfc3339());
+        amounts.push(*amount);
+    }
+    tx.execute(
+        "
+        INSERT INTO rolling_spend_buckets (rule_id, limit_id, scope_key, bucket_start, amount_usd)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::double precision[]
+        )
+        ON CONFLICT(rule_id, limit_id, scope_key, bucket_start) DO UPDATE SET
+            amount_usd = EXCLUDED.amount_usd
+        ",
+        &[&rule_ids, &limit_ids, &scope_keys, &bucket_starts, &amounts],
+    )?;
+    Ok(())
+}
+
+fn upsert_simulation_allocation_buckets_postgres(
+    tx: &mut PostgresTransaction<'_>,
+    buckets: &HashMap<(String, String), AllocationBucketState>,
+) -> Result<(), NoetError> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let mut rule_ids = Vec::with_capacity(buckets.len());
+    let mut entity_keys = Vec::with_capacity(buckets.len());
+    let mut started_at = Vec::with_capacity(buckets.len());
+    let mut protected_amounts = Vec::with_capacity(buckets.len());
+    let mut current_grants = Vec::with_capacity(buckets.len());
+    let mut carryovers = Vec::with_capacity(buckets.len());
+    for ((rule_id, entity_key), bucket) in buckets {
+        rule_ids.push(rule_id.clone());
+        entity_keys.push(entity_key.clone());
+        started_at.push(bucket.started_at.to_rfc3339());
+        protected_amounts.push(bucket.protected_amount_usd);
+        current_grants.push(bucket.current_grant_usd);
+        carryovers.push(bucket.carryover_usd);
+    }
+    tx.execute(
+        "
+        INSERT INTO budget_allocation_buckets (
+            rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::double precision[], $5::double precision[],
+            $6::double precision[]
+        )
+        ON CONFLICT(rule_id, entity_key) DO UPDATE SET
+            started_at = EXCLUDED.started_at,
+            protected_amount_usd = EXCLUDED.protected_amount_usd,
+            current_grant_usd = EXCLUDED.current_grant_usd,
+            carryover_usd = EXCLUDED.carryover_usd
+        ",
+        &[
+            &rule_ids,
+            &entity_keys,
+            &started_at,
+            &protected_amounts,
+            &current_grants,
+            &carryovers,
+        ],
+    )?;
+    Ok(())
 }
 
 impl LedgerPersistenceSnapshot {
@@ -99,9 +683,8 @@ impl LedgerPersistenceSnapshot {
                     reservations: self.reservations.clone(),
                     last_selected_budget_id: self.selected_budget_id.clone(),
                     last_limit_hits: self.limit_hits.clone(),
-                    events: Vec::new(),
-                    conn: None,
-                    pg_conn: None,
+                    events_count: 0,
+                    store: LedgerStore::InMemory,
                 };
                 if let Some(projection) = biggest_spend_window_projection(
                     &ledger,
@@ -266,7 +849,7 @@ struct RoutingPersistenceFields {
     retries: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct UsageReport {
     pub total_cost_usd: f64,
     pub rows: Vec<UsageReportRow>,
@@ -274,7 +857,7 @@ pub struct UsageReport {
     pub protected_adoption: Option<ProtectedAdoptionReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct UsageReportRow {
     pub subject: Option<String>,
     pub project: Option<String>,
@@ -373,7 +956,7 @@ pub struct SpendScopeTotal {
     pub amount_usd: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtectedAdoptionReport {
     pub unused_protected_opportunity_usd: f64,
     pub carryover_liability_usd: f64,
@@ -381,7 +964,7 @@ pub struct ProtectedAdoptionReport {
     pub high_adopters: Vec<ProtectedAdoptionEntityReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtectedAdoptionEntityReport {
     pub budget_id: String,
     pub entity_key: String,
@@ -391,13 +974,13 @@ pub struct ProtectedAdoptionEntityReport {
     pub used_current_grant_usd: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceReport {
     pub trace_id: String,
     pub items: Vec<TraceReportItem>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TraceReportItem {
     pub occurred_at: DateTime<Utc>,
     pub kind: String,
@@ -723,7 +1306,7 @@ fn postgres_url_requires_tls(database_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn connect_async_postgres_client(
+pub(crate) async fn connect_async_postgres_client(
     database_url: &str,
 ) -> Result<AsyncPostgresClient, NoetError> {
     if postgres_url_requires_tls(database_url) {
@@ -784,8 +1367,9 @@ async fn run_async_postgres_finalize_worker(
     mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
 ) {
     while let Some(write) = rx.recv().await {
-        let mut last_error = None;
-        for attempt in 1..=3 {
+        let mut attempt = 0_u64;
+        loop {
+            attempt += 1;
             let mut connection = connection.lock().await;
             let statements = connection.statements.clone();
             let result = async {
@@ -804,23 +1388,20 @@ async fn run_async_postgres_finalize_worker(
                         .lock()
                         .await
                         .remove(&write.reservation.id);
-                    last_error = None;
                     break;
                 }
                 Err(error) => {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    let retry_delay_ms = (25 * attempt).min(1_000);
                     tracing::warn!(
                         error = %error,
                         attempt,
-                        "postgres async finalize persistence attempt failed"
+                        retry_delay_ms,
+                        "postgres async finalize persistence attempt failed; retrying"
                     );
-                    last_error = Some(error);
-                    tokio::time::sleep(std::time::Duration::from_millis(25 * attempt)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 }
             }
-        }
-        if let Some(error) = last_error {
-            failures.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %error, "postgres async finalize persistence failed permanently");
         }
     }
 }
@@ -1104,7 +1685,7 @@ impl BudgetLedger {
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         init_schema(&conn)?;
         let mut ledger = Self::default();
-        ledger.conn = Some(conn);
+        ledger.store = LedgerStore::Sqlite(conn);
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
@@ -1122,7 +1703,7 @@ impl BudgetLedger {
         };
         init_postgres_schema(&mut pg_conn)?;
         let mut ledger = Self::default();
-        ledger.pg_conn = Some(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn))));
+        ledger.store = LedgerStore::Postgres(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn))));
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
@@ -1179,10 +1760,10 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
-        if self.pg_conn.is_some() {
-            self.load_advisory_cadence_postgres()?;
-        } else if self.conn.is_some() {
-            self.load_advisory_cadence_sqlite()?;
+        match &self.store {
+            LedgerStore::Postgres(_) => self.load_advisory_cadence_postgres()?,
+            LedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite()?,
+            LedgerStore::InMemory => {}
         }
         let mut action = PolicyAction::Allow;
         let mut explanations = Vec::new();
@@ -1320,6 +1901,13 @@ impl BudgetLedger {
                 entry.used_usd += seed.amount_usd;
             }
             SpendWindowMode::Rolling => {
+                let bucket_key = (
+                    seed.rule_id.clone(),
+                    seed.limit_id.clone(),
+                    seed.scope_key.clone(),
+                    rolling_bucket_start(seed.seeded_at),
+                );
+                *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += seed.amount_usd;
                 let id = format!(
                     "replay-seed-{}-{}-{}-{}",
                     seed.rule_id,
@@ -1397,19 +1985,211 @@ impl BudgetLedger {
         Ok(reservation)
     }
 
+    pub fn capture_simulation_decision(
+        &self,
+        batch: &mut SimulationLedgerBatch,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        decision: &AuthorizeDecision,
+    ) -> Result<(), NoetError> {
+        let trace_id = string_metadata(request, "trace_id");
+        let session_id = string_metadata(request, "session_id");
+        let request_id = string_metadata(request, "request_id");
+        let routing = self.routing_persistence_fields(
+            policy,
+            request,
+            decision,
+            self.last_selected_budget_id.as_deref(),
+        );
+        let outcome = outcome_text(decision.outcome);
+        let app_run_key = decision_app_run_key(
+            trace_id.as_deref(),
+            request.provider.as_deref(),
+            request.model.as_deref(),
+            outcome,
+            routing.selected_budget_id.as_deref(),
+            &request.metadata,
+            decision.created_at,
+        );
+        let routing_report = decision_routing_report(
+            routing.selected_budget_id.clone(),
+            routing.matched_entity.clone(),
+            routing.selection_reason.clone(),
+            routing.rejected_budget_id.clone(),
+            routing.rejected_budget_reason.clone(),
+            routing.model_check.clone(),
+            routing.budget_window_remaining_usd,
+            routing.budget_window_mode.clone(),
+            routing.budget_window_started_at,
+            routing.budget_window_ends_at,
+        );
+        batch.decisions.push(SimulationDecisionRow {
+            decision_id: decision.decision_id.clone(),
+            trace_id: trace_id.clone(),
+            session_id,
+            request_id,
+            subject: request.subject.clone(),
+            project: request.project.clone(),
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            estimated_tokens: request.estimated_tokens.map(|value| value as i64),
+            estimated_cost_usd: request.estimated_cost_usd,
+            outcome,
+            action: action_text(decision.action),
+            explanations_json: serde_json::to_string(&decision.explanations)?,
+            metadata_json: serde_json::to_string(&request.metadata)?,
+            entities_json: serde_json::to_string(&request.entities)?,
+            selected_budget_id: routing.selected_budget_id,
+            matched_entity: routing.matched_entity,
+            selection_reason: routing.selection_reason,
+            rejected_budget_id: routing.rejected_budget_id,
+            rejected_budget_reason: routing.rejected_budget_reason,
+            model_check: routing.model_check,
+            budget_window_remaining_usd: routing.budget_window_remaining_usd,
+            routing_json: serde_json::to_string(&routing_report)?,
+            limit_hits_json: serde_json::to_string(&self.last_limit_hits)?,
+            max_tool_calls: routing.tool_calls.map(|value| value as i64),
+            max_agent_steps: routing.agent_steps.map(|value| value as i64),
+            max_retries: routing.retries.map(|value| value as i64),
+            app_run_key,
+            created_at: decision.created_at.to_rfc3339(),
+        });
+
+        if let Some(reservation) = &decision.reservation
+            && let Some(stored) = self.reservations.get(&reservation.id)
+        {
+            batch
+                .reservation_index
+                .insert(reservation.id.clone(), batch.reservations.len());
+            batch.reservations.push(SimulationReservationRow {
+                id: reservation.id.clone(),
+                decision_id: decision.decision_id.clone(),
+                trace_id,
+                amount_usd: reservation.amount_usd,
+                estimated_amount_usd: stored.estimated_cost_usd,
+                actual_amount_usd: None,
+                currency: reservation.currency.clone(),
+                status: reservation_status_text(reservation.status),
+                created_at: reservation.created_at.to_rfc3339(),
+                expires_at: reservation.expires_at.to_rfc3339(),
+                finalized_at: None,
+                budget_rule_ids_json: serde_json::to_string(&stored.budget_rule_ids)?,
+                limit_window_spends_json: serde_json::to_string(&stored.limit_window_spends)?,
+                allocation_spends_json: serde_json::to_string(&stored.allocation_spends)?,
+            });
+            for spend in &stored.limit_window_spends {
+                batch
+                    .reservation_scopes
+                    .push(SimulationReservationScopeRow {
+                        reservation_id: reservation.id.clone(),
+                        rule_id: spend.rule_id.clone(),
+                        limit_id: spend.limit_id.clone(),
+                        scope_key: spend.scope_key.clone(),
+                        amount_usd: reservation.amount_usd,
+                        created_at: reservation.created_at.to_rfc3339(),
+                    });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn capture_simulation_finalization(
+        &self,
+        batch: &mut SimulationLedgerBatch,
+        reservation: &Reservation,
+        payload: &FinalizeReservation,
+    ) -> Result<(), NoetError> {
+        let now = Utc::now().to_rfc3339();
+        let trace_id = batch
+            .reservation_index
+            .get(&reservation.id)
+            .and_then(|index| batch.reservations.get_mut(*index))
+            .and_then(|row| {
+                row.amount_usd = reservation.amount_usd;
+                row.actual_amount_usd = Some(reservation.amount_usd);
+                row.status = reservation_status_text(reservation.status);
+                row.finalized_at = Some(now.clone());
+                row.trace_id.clone()
+            })
+            .or_else(|| string_value(&payload.metadata, "trace_id"));
+
+        if let Some(usage) = &payload.usage {
+            batch
+                .usage_observations
+                .push(SimulationUsageObservationRow {
+                    id: Uuid::new_v4().to_string(),
+                    reservation_id: reservation.id.clone(),
+                    trace_id,
+                    provider: usage.provider.clone(),
+                    model: usage.model.clone(),
+                    input_tokens: usage.input_tokens.map(|value| value as i64),
+                    output_tokens: usage.output_tokens.map(|value| value as i64),
+                    total_tokens: usage.total_tokens.map(|value| value as i64),
+                    cost_usd: usage.cost_usd.or(Some(reservation.amount_usd)),
+                    latency_ms: usage.latency_ms.map(|value| value as i64),
+                    stop_reason: usage.stop_reason.clone(),
+                    source: "reservation.finalize",
+                    metadata_json: serde_json::to_string(&payload.metadata)?,
+                    created_at: now,
+                });
+        }
+        Ok(())
+    }
+
+    pub fn persist_simulation_batch_to_postgres(
+        &self,
+        database_url: &str,
+        batch: &SimulationLedgerBatch,
+    ) -> Result<(), NoetError> {
+        self.persist_simulation_batch_to_postgres_with_options(
+            database_url,
+            batch,
+            &AsyncPostgresLedgerOptions::strict(),
+        )
+    }
+
+    pub fn persist_simulation_batch_to_postgres_with_options(
+        &self,
+        database_url: &str,
+        batch: &SimulationLedgerBatch,
+        options: &AsyncPostgresLedgerOptions,
+    ) -> Result<(), NoetError> {
+        let target = Self::open_postgres(database_url)?;
+        let LedgerStore::Postgres(pg_conn) = &target.store else {
+            return Ok(());
+        };
+        let mut pg = pg_conn.0.lock().expect("postgres mutex");
+        let mut tx = pg.transaction()?;
+        if let Some(value) = options.synchronous_commit.as_deref() {
+            let value = normalized_synchronous_commit(value)?;
+            tx.batch_execute(&format!("SET LOCAL synchronous_commit TO {value}"))?;
+        }
+
+        insert_simulation_decisions_postgres(&mut tx, &batch.decisions)?;
+        insert_simulation_reservations_postgres(&mut tx, &batch.reservations)?;
+        insert_simulation_reservation_scopes_postgres(&mut tx, &batch.reservation_scopes)?;
+        insert_simulation_usage_observations_postgres(&mut tx, &batch.usage_observations)?;
+        upsert_simulation_limit_windows_postgres(&mut tx, &self.limit_windows)?;
+        upsert_simulation_rolling_spend_buckets_postgres(&mut tx, &self.rolling_spend_buckets)?;
+        upsert_simulation_allocation_buckets_postgres(&mut tx, &self.allocation_buckets)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn record_event(&mut self, event: TraceEvent) -> Result<(), NoetError> {
         validate_event_payload(&event)?;
         self.persist_event(&event)?;
-        self.events.push(event);
+        self.events_count = self.events_count.saturating_add(1);
         Ok(())
     }
 
     pub fn event_count(&self) -> usize {
-        self.events.len()
+        self.events_count as usize
     }
 
     pub fn usage_report(&self) -> Result<UsageReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT d.subject, d.project, COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
@@ -1473,7 +2253,7 @@ impl BudgetLedger {
                 protected_adoption: protected_adoption_report_postgres(pg_conn)?,
             });
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(UsageReport {
                 total_cost_usd: 0.0,
                 rows: Vec::new(),
@@ -1537,7 +2317,7 @@ impl BudgetLedger {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 WITH run_page AS (
@@ -1564,7 +2344,7 @@ impl BudgetLedger {
                 .map(decision_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
@@ -1603,7 +2383,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<RunTotalsReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let since = since.map(|since| since.to_rfc3339());
             let mut totals = RunTotalsReport {
@@ -1690,7 +2470,7 @@ impl BudgetLedger {
             totals.spend_usd = row.get(1);
             return Ok(totals);
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(RunTotalsReport::default());
         };
         let since = since.map(|since| since.to_rfc3339());
@@ -1798,7 +2578,7 @@ impl BudgetLedger {
     }
 
     pub fn rule_stats_report(&self) -> Result<Vec<RuleStatsReport>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut stats = HashMap::<String, RuleStatsReport>::new();
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let rows = pg.query(
@@ -1883,7 +2663,7 @@ impl BudgetLedger {
             stats.sort_by(|left, right| left.rule.cmp(&right.rule));
             return Ok(stats);
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut stats = HashMap::<String, RuleStatsReport>::new();
@@ -1978,7 +2758,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut sql = "
                 SELECT created_at, outcome, decision_id, trace_id, request_id, provider, model,
                        action,
@@ -2007,7 +2787,7 @@ impl BudgetLedger {
                 .map(decision_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2045,7 +2825,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut sql = "
                 SELECT created_at, decision_id, outcome, metadata_json, entities_json, subject, project,
                        provider, model, estimated_tokens, estimated_cost_usd, metadata_json
@@ -2070,7 +2850,7 @@ impl BudgetLedger {
                 .map(historical_authorize_request_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2126,7 +2906,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<usize, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let count: i64 = if let Some(since) = since {
                 pg_conn.0.lock().expect("postgres mutex").query_one(
                     "SELECT COUNT(*)::BIGINT FROM decisions WHERE created_at >= $1",
@@ -2142,7 +2922,7 @@ impl BudgetLedger {
             .get(0);
             return Ok(count.max(0) as usize);
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(0);
         };
         let count = if let Some(since) = since {
@@ -2164,7 +2944,7 @@ impl BudgetLedger {
         since: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<HistoricalAuthorizeRequest>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -2202,7 +2982,7 @@ impl BudgetLedger {
                 .map(historical_authorize_request_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         if limit == 0 {
@@ -2246,7 +3026,7 @@ impl BudgetLedger {
         since: DateTime<Utc>,
         before: DateTime<Utc>,
     ) -> Result<Vec<SpendScopeTotal>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT scope_key, COALESCE(SUM(amount_usd), 0)::DOUBLE PRECISION
@@ -2273,7 +3053,7 @@ impl BudgetLedger {
                 })
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
@@ -2309,7 +3089,7 @@ impl BudgetLedger {
         &self,
         agent_run_ids: &[String],
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             if agent_run_ids.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2358,7 +3138,7 @@ impl BudgetLedger {
                 .map(usage_activity_record_from_postgres_row)
                 .collect());
         }
-        if self.conn.is_none() {
+        if !matches!(&self.store, LedgerStore::Sqlite(_)) {
             return Ok(Vec::new());
         }
         if agent_run_ids.is_empty() {
@@ -2397,7 +3177,7 @@ impl BudgetLedger {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut sql = "
                 SELECT u.created_at, COALESCE(u.trace_id, d.trace_id), d.subject, d.project,
                        COALESCE(u.provider, d.provider), COALESCE(u.model, d.model),
@@ -2440,7 +3220,7 @@ impl BudgetLedger {
                 .map(usage_activity_record_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut sql = "
@@ -2479,7 +3259,7 @@ impl BudgetLedger {
         sql: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<UsageActivityRecord>, NoetError> {
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(sql)?;
@@ -2493,7 +3273,7 @@ impl BudgetLedger {
         kind_prefix: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<Vec<TraceReportItem>, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut sql = "SELECT occurred_at, kind, payload_json, trace_id FROM events".to_owned();
             let mut clauses = Vec::new();
             if kind_prefix.is_some() {
@@ -2535,7 +3315,7 @@ impl BudgetLedger {
                 .map(event_report_item_from_postgres_row)
                 .collect());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut sql = "SELECT occurred_at, kind, payload_json, trace_id FROM events".to_owned();
@@ -2589,7 +3369,7 @@ impl BudgetLedger {
     }
 
     pub fn trace_report(&self, trace_id: &str) -> Result<TraceReport, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             let mut items = Vec::new();
             let decisions = pg.query(
@@ -2685,7 +3465,7 @@ impl BudgetLedger {
                 items,
             });
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(TraceReport {
                 trace_id: trace_id.to_owned(),
                 items: Vec::new(),
@@ -3098,6 +3878,14 @@ impl BudgetLedger {
                     };
                     self.limit_window(rule, &limit_id, window, &scope_key, now)
                         .used_usd += amount_usd;
+                } else if matches!(limit.mode, Some(SpendWindowMode::Rolling)) {
+                    let bucket_key = (
+                        rule.id.clone(),
+                        limit_id.clone(),
+                        scope_key.clone(),
+                        rolling_bucket_start(now),
+                    );
+                    *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += amount_usd;
                 }
                 limit_window_spends.push(LimitWindowReservationSpend {
                     rule_id: rule.id.clone(),
@@ -3168,6 +3956,14 @@ impl BudgetLedger {
                     };
                     self.limit_window(rule, &limit_id, window, &scope_key, now)
                         .used_usd += amount_usd;
+                } else if matches!(limit.mode, Some(SpendWindowMode::Rolling)) {
+                    let bucket_key = (
+                        rule.id.clone(),
+                        limit_id.clone(),
+                        scope_key.clone(),
+                        rolling_bucket_start(now),
+                    );
+                    *self.rolling_spend_buckets.entry(bucket_key).or_insert(0.0) += amount_usd;
                 }
                 limit_window_spends.push(LimitWindowReservationSpend {
                     rule_id: rule.id.clone(),
@@ -3249,20 +4045,24 @@ impl BudgetLedger {
         selected_budget_id: Option<&str>,
         limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
-        if self.pg_conn.is_some() {
-            let result = self.persist_decision_postgres(
-                policy,
-                request,
-                decision,
-                selected_budget_id,
-                limit_hits,
-            );
-            if result.is_ok() {
-                self.pending_advisory_cadence.clear();
+        match &self.store {
+            LedgerStore::Postgres(_) => {
+                let result = self.persist_decision_postgres(
+                    policy,
+                    request,
+                    decision,
+                    selected_budget_id,
+                    limit_hits,
+                );
+                if result.is_ok() {
+                    self.pending_advisory_cadence.clear();
+                }
+                return result;
             }
-            return result;
+            LedgerStore::Sqlite(_) => {}
+            LedgerStore::InMemory => return Ok(()),
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let trace_id = string_metadata(request, "trace_id");
@@ -3423,7 +4223,7 @@ impl BudgetLedger {
         selected_budget_id: Option<&str>,
         limit_hits: &[DecisionLimitHitReport],
     ) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let LedgerStore::Postgres(pg_conn) = &self.store else {
             return Ok(());
         };
         let trace_id = string_metadata(request, "trace_id");
@@ -3665,7 +4465,7 @@ impl BudgetLedger {
         &self,
         trace_id: &str,
     ) -> Result<Option<Vec<TraceReportItem>>, NoetError> {
-        let config = if let Some(pg_conn) = &self.pg_conn {
+        let config = if let LedgerStore::Postgres(pg_conn) = &self.store {
             pg_conn
                 .0
                 .lock()
@@ -3692,7 +4492,7 @@ impl BudgetLedger {
                     )
                 })
         } else {
-            let Some(conn) = &self.conn else {
+            let LedgerStore::Sqlite(conn) = &self.store else {
                 return Ok(None);
             };
             conn.query_row(
@@ -3783,7 +4583,7 @@ impl BudgetLedger {
     }
 
     fn event_count_for_trace(&self, trace_id: &str, kind: &str) -> Result<u64, NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let count: i64 = pg_conn
                 .0
                 .lock()
@@ -3799,7 +4599,7 @@ impl BudgetLedger {
                 .get(0);
             return Ok(count.max(0) as u64);
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(0);
         };
         conn.query_row(
@@ -3819,10 +4619,14 @@ impl BudgetLedger {
         reservation: &Reservation,
         payload: &FinalizeReservation,
     ) -> Result<(), NoetError> {
-        if self.pg_conn.is_some() {
-            return self.persist_finalization_postgres(reservation, payload);
+        match &self.store {
+            LedgerStore::Postgres(_) => {
+                return self.persist_finalization_postgres(reservation, payload);
+            }
+            LedgerStore::Sqlite(_) => {}
+            LedgerStore::InMemory => return Ok(()),
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let now = Utc::now();
@@ -3889,7 +4693,7 @@ impl BudgetLedger {
         reservation: &Reservation,
         payload: &FinalizeReservation,
     ) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let LedgerStore::Postgres(pg_conn) = &self.store else {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
@@ -3958,7 +4762,7 @@ impl BudgetLedger {
     }
 
     fn persist_event(&self, event: &TraceEvent) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
             let source = event
                 .payload
@@ -3987,7 +4791,7 @@ impl BudgetLedger {
             )?;
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let occurred_at = event.occurred_at.unwrap_or_else(Utc::now);
@@ -4022,7 +4826,7 @@ impl BudgetLedger {
     }
 
     fn persist_limit_windows(&self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
                 pg.execute(
@@ -4044,7 +4848,7 @@ impl BudgetLedger {
             }
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         for ((rule_id, limit_id, scope_key), window) in &self.limit_windows {
@@ -4069,7 +4873,7 @@ impl BudgetLedger {
     }
 
     fn persist_allocation_buckets(&self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let mut pg = pg_conn.0.lock().expect("postgres mutex");
             for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
                 pg.execute(
@@ -4095,7 +4899,7 @@ impl BudgetLedger {
             }
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         for ((rule_id, entity_key), bucket) in &self.allocation_buckets {
@@ -4128,7 +4932,7 @@ impl BudgetLedger {
     }
 
     fn load_limit_windows(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT rule_id, limit_id, scope_key, started_at, used_usd
@@ -4150,7 +4954,7 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let mut stmt = conn.prepare(
@@ -4175,7 +4979,7 @@ impl BudgetLedger {
     }
 
     fn load_allocation_buckets(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT rule_id, entity_key, started_at, protected_amount_usd, current_grant_usd, carryover_usd
@@ -4202,7 +5006,7 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let mut stmt = conn.prepare(
@@ -4232,7 +5036,7 @@ impl BudgetLedger {
     }
 
     fn load_advisory_cadence_sqlite(&mut self) -> Result<(), NoetError> {
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let mut stmt = conn.prepare(
@@ -4254,7 +5058,7 @@ impl BudgetLedger {
     }
 
     fn load_advisory_cadence_postgres(&mut self) -> Result<(), NoetError> {
-        let Some(pg_conn) = &self.pg_conn else {
+        let LedgerStore::Postgres(pg_conn) = &self.store else {
             return Ok(());
         };
         let rows = pg_conn.0.lock().expect("postgres mutex").query(
@@ -4277,7 +5081,7 @@ impl BudgetLedger {
     }
 
     fn load_active_reservations(&mut self) -> Result<(), NoetError> {
-        if let Some(pg_conn) = &self.pg_conn {
+        if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
                 SELECT id, amount_usd, estimated_amount_usd, currency, status, created_at, expires_at,
@@ -4319,7 +5123,7 @@ impl BudgetLedger {
                 .collect();
             return Ok(());
         }
-        let Some(conn) = &self.conn else {
+        let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(());
         };
         let mut stmt = conn.prepare(
@@ -7256,47 +8060,49 @@ fn recent_spend_usd(
     since: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> f64 {
-    if let Some(pg_conn) = &ledger.pg_conn {
-        let bucket_since = rolling_bucket_start(since).to_rfc3339();
-        let bucket_now = rolling_bucket_start(now).to_rfc3339();
-        let value = pg_conn.0.lock().expect("postgres mutex").query_one(
-            "
-            SELECT COALESCE(SUM(amount_usd), 0)
-            FROM rolling_spend_buckets
-            WHERE rule_id = $1
-              AND limit_id = $2
-              AND scope_key = $3
-              AND bucket_start >= $4
-              AND bucket_start <= $5
-            ",
-            &[&rule_id, &limit_id, &scope_key, &bucket_since, &bucket_now],
-        );
-        return value.map(|row| row.get::<_, f64>(0)).unwrap_or(0.0);
-    }
-
-    if let Some(conn) = &ledger.conn {
-        let bucket_since = rolling_bucket_start(since);
-        let bucket_now = rolling_bucket_start(now);
-        let value = conn.query_row(
-            "
-            SELECT COALESCE(SUM(amount_usd), 0)
-            FROM rolling_spend_buckets
-            WHERE rule_id = ?1
-              AND limit_id = ?2
-              AND scope_key = ?3
-              AND bucket_start >= ?4
-              AND bucket_start <= ?5
-            ",
-            params![
-                rule_id,
-                limit_id,
-                scope_key,
-                bucket_since.to_rfc3339(),
-                bucket_now.to_rfc3339()
-            ],
-            |row| row.get::<_, f64>(0),
-        );
-        return value.unwrap_or(0.0);
+    match &ledger.store {
+        LedgerStore::Postgres(pg_conn) => {
+            let bucket_since = rolling_bucket_start(since).to_rfc3339();
+            let bucket_now = rolling_bucket_start(now).to_rfc3339();
+            let value = pg_conn.0.lock().expect("postgres mutex").query_one(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = $1
+                  AND limit_id = $2
+                  AND scope_key = $3
+                  AND bucket_start >= $4
+                  AND bucket_start <= $5
+                ",
+                &[&rule_id, &limit_id, &scope_key, &bucket_since, &bucket_now],
+            );
+            return value.map(|row| row.get::<_, f64>(0)).unwrap_or(0.0);
+        }
+        LedgerStore::Sqlite(conn) => {
+            let bucket_since = rolling_bucket_start(since);
+            let bucket_now = rolling_bucket_start(now);
+            let value = conn.query_row(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = ?1
+                  AND limit_id = ?2
+                  AND scope_key = ?3
+                  AND bucket_start >= ?4
+                  AND bucket_start <= ?5
+                ",
+                params![
+                    rule_id,
+                    limit_id,
+                    scope_key,
+                    bucket_since.to_rfc3339(),
+                    bucket_now.to_rfc3339()
+                ],
+                |row| row.get::<_, f64>(0),
+            );
+            return value.unwrap_or(0.0);
+        }
+        LedgerStore::InMemory => {}
     }
 
     if !ledger.rolling_spend_buckets.is_empty() {
@@ -7930,6 +8736,13 @@ mod tests {
 
     use super::*;
 
+    fn sqlite_conn(ledger: &BudgetLedger) -> &Connection {
+        let LedgerStore::Sqlite(conn) = &ledger.store else {
+            panic!("expected sqlite ledger store");
+        };
+        conn
+    }
+
     fn policy(limit_usd: f64, warn_at_fraction: f64) -> PolicyFile {
         PolicyFile {
             version: 0,
@@ -8382,6 +9195,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NOET_TEST_POSTGRES_URL and an isolated PostgreSQL database"]
+    fn postgres_simulation_batch_persists_rolling_spend_buckets() {
+        let database_url = std::env::var("NOET_TEST_POSTGRES_URL").expect("NOET_TEST_POSTGRES_URL");
+        let schema = format!("noether_test_{}", Uuid::new_v4().simple());
+        let mut admin =
+            PostgresClient::connect(&database_url, NoTls).expect("postgres admin connection");
+        admin
+            .batch_execute(&format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; CREATE SCHEMA "{schema}";"#
+            ))
+            .expect("create test schema");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
+
+        let mut policy = policy(20.0, 1.0);
+        policy.budgets[0].limits = BudgetLimitPolicy {
+            request_cost: None,
+            context_tokens: None,
+            spend: vec![SpendWindowLimit {
+                by: SpendWindowBy::Project,
+                id: Some("rolling".to_owned()),
+                window: "7d".to_owned(),
+                mode: Some(SpendWindowMode::Rolling),
+                anchor: None,
+                max_usd: 10.0,
+                warn_at_fractions: vec![1.0],
+                action: PolicyAction::Block,
+            }],
+            tool_calls: None,
+            agent_steps: None,
+            retries: None,
+        };
+        let mut ledger = BudgetLedger::default();
+        let mut batch = SimulationLedgerBatch::default();
+        let first_request = request(6.0);
+        let first = ledger
+            .try_authorize(Some(&policy), &first_request)
+            .expect("first authorize");
+        assert_eq!(first.outcome, DecisionOutcome::Allow);
+        ledger
+            .capture_simulation_decision(&mut batch, Some(&policy), &first_request, &first)
+            .expect("capture decision");
+
+        ledger
+            .persist_simulation_batch_to_postgres_with_options(
+                &scoped_url,
+                &batch,
+                &AsyncPostgresLedgerOptions::strict(),
+            )
+            .expect("persist simulation batch");
+
+        let mut persisted =
+            PostgresClient::connect(&scoped_url, NoTls).expect("postgres scoped connection");
+        let bucket_amount = persisted
+            .query_one(
+                "
+                SELECT COALESCE(SUM(amount_usd), 0)
+                FROM rolling_spend_buckets
+                WHERE rule_id = 'dev-budget'
+                  AND limit_id = 'rolling'
+                  AND scope_key = 'project:noether'
+                ",
+                &[],
+            )
+            .expect("rolling bucket row")
+            .get::<_, f64>(0);
+        assert_eq!(bucket_amount, 6.0);
+
+        let mut reopened = BudgetLedger::open_postgres(&scoped_url).expect("reopen postgres");
+        let second = reopened
+            .try_authorize(Some(&policy), &request(5.0))
+            .expect("second authorize");
+        assert_eq!(second.outcome, DecisionOutcome::Deny);
+
+        drop(reopened);
+        drop(persisted);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#))
+            .expect("drop test schema");
+    }
+
+    #[test]
     fn budget_limit_denies_large_context_estimate_when_enforced() {
         let mut policy = policy(1.0, 0.8);
         policy.budgets[0].limits = BudgetLimitPolicy {
@@ -8538,7 +9433,7 @@ mod tests {
 
         assert_eq!(first.outcome, DecisionOutcome::Allow);
         assert_eq!(second.outcome, DecisionOutcome::Deny);
-        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let conn = sqlite_conn(&ledger);
         let row = conn
             .query_row(
                 "
@@ -8573,7 +9468,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("rolling-edges.sqlite");
         let ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
-        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let conn = sqlite_conn(&ledger);
         let rule_id = "dev-budget";
         let limit_id = "rolling";
         let scope_key = "project:noether";
@@ -8815,10 +9710,7 @@ mod tests {
 
         let first = ledger.authorize(Some(&policy), &request(6.0));
         assert_eq!(first.outcome, DecisionOutcome::Allow);
-        let persisted = ledger
-            .conn
-            .as_ref()
-            .expect("sqlite conn")
+        let persisted = sqlite_conn(&ledger)
             .query_row(
                 "
                 SELECT used_usd
@@ -8987,7 +9879,7 @@ mod tests {
 
         let decision = ledger.authorize(Some(&policy), &request);
 
-        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let conn = sqlite_conn(&ledger);
         let row = conn
             .query_row(
                 "
@@ -9394,7 +10286,7 @@ mod tests {
         let decision = ledger.authorize(Some(&policy), &request);
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
 
-        let conn = ledger.conn.as_ref().expect("sqlite conn");
+        let conn = sqlite_conn(&ledger);
         let row = conn
             .query_row(
                 "
@@ -9421,7 +10313,7 @@ mod tests {
         drop(ledger);
 
         let reopened = BudgetLedger::open_sqlite(&db_path).expect("reopen sqlite");
-        let conn = reopened.conn.as_ref().expect("reopened sqlite conn");
+        let conn = sqlite_conn(&reopened);
         let persisted = conn
             .query_row(
                 "
@@ -9474,10 +10366,7 @@ mod tests {
         let mut initial_request = request(0.25);
         initial_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
         ledger.authorize(Some(&policy), &initial_request);
-        ledger
-            .conn
-            .as_ref()
-            .expect("sqlite conn")
+        sqlite_conn(&ledger)
             .execute(
                 "
                 UPDATE budget_allocation_buckets
@@ -9513,10 +10402,7 @@ mod tests {
         let mut initial_request = request(0.25);
         initial_request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
         ledger.authorize(Some(&policy), &initial_request);
-        ledger
-            .conn
-            .as_ref()
-            .expect("sqlite conn")
+        sqlite_conn(&ledger)
             .execute(
                 "
                 UPDATE budget_allocation_buckets
@@ -9555,10 +10441,7 @@ mod tests {
         bob_request.entities = vec!["org:example".to_owned(), "user:bob".to_owned()];
         ledger.authorize(Some(&policy), &alice_request);
         ledger.authorize(Some(&policy), &bob_request);
-        ledger
-            .conn
-            .as_ref()
-            .expect("sqlite conn")
+        sqlite_conn(&ledger)
             .execute(
                 "
                 UPDATE budget_allocation_buckets

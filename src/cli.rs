@@ -27,7 +27,9 @@ use crate::scenario::{
     ScenarioRequest, validate_scenario,
 };
 use crate::server::{ServeConfig, serve};
-use crate::simulation::{SimulationFile, compare_strategies, validate_simulation};
+use crate::simulation::{
+    SimulationDatabase, SimulationFile, compare_strategies_with_database, validate_simulation,
+};
 
 #[derive(Parser)]
 #[command(name = "noet")]
@@ -266,6 +268,12 @@ struct SimulateCommand {
     /// Directory where simulation artifacts are written.
     #[arg(long)]
     out_dir: Option<PathBuf>,
+    /// PostgreSQL connection URL. When set, simulation strategies execute on PostgreSQL.
+    #[arg(long, env = "NOET_DATABASE_URL")]
+    database_url: Option<String>,
+    /// PostgreSQL durability/latency profile: strict or performance.
+    #[arg(long, env = "NOET_POSTGRES_PROFILE", default_value = "strict")]
+    postgres_profile: String,
 }
 
 pub async fn run() -> Result<(), NoetError> {
@@ -557,10 +565,15 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         .name
         .clone()
         .unwrap_or_else(|| simulation_output_slug(&command.path));
-    let out_dir = command.out_dir.unwrap_or_else(|| {
+    let out_dir = command.out_dir.clone().unwrap_or_else(|| {
         PathBuf::from(".noet/simulations").join(simulation_output_slug(&command.path))
     });
-    let report = compare_strategies(&simulation, &out_dir)?;
+    let report = compare_strategies_with_database(
+        &simulation,
+        &out_dir,
+        simulation_database_from_command(&command)?,
+    )
+    .await?;
     let report_path = out_dir.join("simulation-report.json");
     write_json_file(&report_path, &report).await?;
     let simulation_dashboard_path = out_dir.join("simulation-dashboard.html");
@@ -576,24 +589,42 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         "simulation_dashboard\t{}",
         simulation_dashboard_path.display()
     );
+    if let Some(timing) = &report.timing {
+        println!("timing_total_ms\t{:.2}", timing.total_ms);
+        println!(
+            "timing_generate_demand_ms\t{:.2}",
+            timing.generate_demand_ms
+        );
+        println!("timing_strategies_ms\t{:.2}", timing.strategies_ms);
+    }
     for strategy in &report.strategies {
-        let strategy_db_path = out_dir.join(&strategy.db_path);
         let strategy_usage_report_path = out_dir.join(&strategy.usage_report_path);
         let strategy_decisions_report_path = out_dir.join(&strategy.decisions_report_path);
-        let strategy_dashboard_path = strategy_db_path
+        let strategy_dashboard_path = strategy_usage_report_path
             .parent()
             .unwrap_or(&out_dir)
             .join("noether-dashboard.html");
-        let ledger = BudgetLedger::open_sqlite(&strategy_db_path)?;
-        let usage = ledger.usage_report()?;
-        let decisions = ledger.decisions_report()?;
+        let usage: UsageReport =
+            serde_json::from_slice(&fs::read(&strategy_usage_report_path).await?)?;
+        let decisions: Vec<TraceReportItem> =
+            serde_json::from_slice(&fs::read(&strategy_decisions_report_path).await?)?;
         fs::write(
             &strategy_dashboard_path,
             render_dashboard(&usage, &decisions, None, &[]),
         )
         .await?;
         println!("strategy\t{}", strategy.id);
-        println!("db_path\t{}", strategy_db_path.display());
+        for (key, value) in strategy.database_location().cli_lines(&out_dir) {
+            println!("{key}\t{value}");
+        }
+        if let Some(timing) = &strategy.timing {
+            println!("timing_strategy_total_ms\t{:.2}", timing.total_ms);
+            println!("timing_strategy_init_ms\t{:.2}", timing.init_ms);
+            println!("timing_strategy_replay_ms\t{:.2}", timing.replay_ms);
+            println!("timing_strategy_persist_ms\t{:.2}", timing.persist_ms);
+            println!("timing_strategy_report_ms\t{:.2}", timing.report_ms);
+            println!("timing_strategy_artifact_ms\t{:.2}", timing.artifact_ms);
+        }
         println!("usage_report\t{}", strategy_usage_report_path.display());
         println!(
             "decisions_report\t{}",
@@ -602,6 +633,19 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         println!("dashboard\t{}", strategy_dashboard_path.display());
     }
     Ok(())
+}
+
+fn simulation_database_from_command(
+    command: &SimulateCommand,
+) -> Result<SimulationDatabase, NoetError> {
+    command
+        .database_url
+        .clone()
+        .map(|database_url| {
+            AsyncPostgresLedgerOptions::from_profile(&command.postgres_profile)
+                .map(|options| SimulationDatabase::postgres(database_url, options))
+        })
+        .unwrap_or_else(|| Ok(SimulationDatabase::sqlite()))
 }
 
 struct ScenarioArtifacts {
@@ -4561,6 +4605,8 @@ requests:
         run_simulate(SimulateCommand {
             path: PathBuf::from("examples/simulations/synthetic-company.noet.yaml"),
             out_dir: Some(out_dir.clone()),
+            database_url: None,
+            postgres_profile: "strict".to_owned(),
         })
         .await
         .expect("simulation run succeeds");
