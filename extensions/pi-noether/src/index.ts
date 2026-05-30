@@ -199,6 +199,7 @@ type LocalSidecarOwner =
 	| {
 			state: "running";
 			pid: number;
+			owner_pid?: number;
 			cwd: string;
 			bind: string;
 			url: string;
@@ -2050,6 +2051,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 								await writeLocalSidecarOwner(cwd, {
 									state: "running",
 									pid: sidecarPid,
+									owner_pid: process.pid,
 									cwd,
 									bind,
 									url: config.noetherUrl,
@@ -2107,6 +2109,9 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		}
 		const bind = localNoetherBindForUrl(config.noetherUrl);
 		if (!bind) {
+			return;
+		}
+		if (owner.owner_pid !== process.pid) {
 			return;
 		}
 		if (config.stopLocalNoether) {

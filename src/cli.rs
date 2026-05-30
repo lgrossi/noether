@@ -91,7 +91,7 @@ struct ServeArgs {
     simulation_dir: PathBuf,
 
     /// SQLite ledger path for durable local state.
-    #[arg(long, default_value = ".noet/noet.sqlite")]
+    #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
 
     /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
@@ -328,7 +328,7 @@ enum FixturesSubcommand {
 #[derive(Parser)]
 struct ReportCommand {
     /// SQLite ledger path.
-    #[arg(long, default_value = ".noet/noet.sqlite")]
+    #[arg(long, default_value = ".noet/noether.sqlite")]
     db_path: PathBuf,
 
     /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
@@ -912,14 +912,14 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         AsyncPostgresLedgerOptions::default()
     };
 
-    if let Some(layout) = local_layout.as_ref() {
-        write_local_sidecar_owner(layout, &bind.to_string()).await?;
-    }
     let policy = load_policy(&policy_path).await?;
     let routes = match args.routes {
         Some(path) => load_proxy_routes(&path).await?.routes,
         None => Vec::new(),
     };
+    if let Some(layout) = local_layout.as_ref() {
+        write_local_sidecar_owner(layout, &bind.to_string()).await?;
+    }
     let serve_config = ServeConfig {
         bind,
         fixture_dir,
@@ -4842,7 +4842,7 @@ mod tests {
                 assert_eq!(args.bind.to_string(), "127.0.0.1:4040");
                 assert_eq!(args.fixture_dir, PathBuf::from(".noet/fixtures"));
                 assert_eq!(args.simulation_dir, PathBuf::from(".noet/simulations"));
-                assert_eq!(args.db_path, PathBuf::from(".noet/noet.sqlite"));
+                assert_eq!(args.db_path, PathBuf::from(".noet/noether.sqlite"));
                 assert!(args.upstream.is_none());
                 assert!(args.routes.is_none());
                 assert!(args.policy.is_none());
