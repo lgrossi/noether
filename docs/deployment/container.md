@@ -23,11 +23,14 @@ new image instead of mutating the binary inside the running container.
 ```bash
 docker run --rm \
   -p 127.0.0.1:4051:4051 \
-  -v "$PWD/examples/deployment/noet-container-config.yaml:/etc/noet/config.yaml:rw" \
-  -v "$PWD/examples/deployment/noet-container-policy.yaml:/etc/noet/policy.yaml:rw" \
   -v noet-data:/var/lib/noet \
   ghcr.io/lgrossi/noether:latest-preview
 ```
+
+The image includes `/etc/noet/config.yaml` and `/etc/noet/policy.yaml` owned by the `noet` user so
+runtime policy proposal/enforcement flows can write the active policy. If you override those files
+with bind mounts, ensure the mounted files are writable by the container's `noet` user or bake a
+derived image with your policy/config copied in with `--chown=noet:noet`.
 
 ## Run with Compose
 

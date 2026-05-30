@@ -10,7 +10,7 @@ SQLite; use `NOET_DATABASE_URL` for PostgreSQL deployments:
 
 ```bash
 sudo noet config init --profile server
-noet up --config /etc/noet/config.yaml
+sudo noet up --config /etc/noet/config.yaml
 ```
 
 Before testing:

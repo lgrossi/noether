@@ -5,8 +5,6 @@ services:
     ports:
       - "127.0.0.1:4051:4051"
     volumes:
-      - ./noet-container-config.yaml:/etc/noet/config.yaml:rw
-      - ./noet-container-policy.yaml:/etc/noet/policy.yaml:rw
       - noet-data:/var/lib/noet
     restart: unless-stopped
 
