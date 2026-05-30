@@ -131,9 +131,6 @@ async fn migrate_legacy_runtime_if_needed(
     root: &Path,
     layout: &LocalRuntimeLayout,
 ) -> Result<(), NoetError> {
-    if fs::try_exists(&layout.root).await? {
-        return Ok(());
-    }
     let legacy = LocalRuntimeLayout::legacy_for_root(root);
     if !fs::try_exists(&legacy.root).await? {
         return Ok(());
@@ -143,6 +140,16 @@ async fn migrate_legacy_runtime_if_needed(
     copy_if_present(&legacy.config_path, &layout.config_path).await?;
     copy_if_present(&legacy.policy_path, &layout.policy_path).await?;
     copy_if_present(&legacy.db_path, &layout.db_path).await?;
+    copy_if_present(
+        &path_with_suffix(&legacy.db_path, "-wal"),
+        &path_with_suffix(&layout.db_path, "-wal"),
+    )
+    .await?;
+    copy_if_present(
+        &path_with_suffix(&legacy.db_path, "-shm"),
+        &path_with_suffix(&layout.db_path, "-shm"),
+    )
+    .await?;
     copy_dir_if_present(&legacy.fixture_dir, &layout.fixture_dir)?;
     copy_dir_if_present(&legacy.simulation_dir, &layout.simulation_dir)?;
     Ok(())
@@ -153,6 +160,10 @@ async fn copy_if_present(source: &Path, destination: &Path) -> Result<(), NoetEr
         fs::copy(source, destination).await?;
     }
     Ok(())
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), suffix))
 }
 
 fn copy_dir_if_present(source: &Path, destination: &Path) -> Result<(), NoetError> {
@@ -345,6 +356,12 @@ mod tests {
         fs::write(&legacy.db_path, b"legacy-db")
             .await
             .expect("write legacy db");
+        fs::write(path_with_suffix(&legacy.db_path, "-wal"), b"legacy-wal")
+            .await
+            .expect("write legacy db wal");
+        fs::write(path_with_suffix(&legacy.db_path, "-shm"), b"legacy-shm")
+            .await
+            .expect("write legacy db shm");
         fs::create_dir_all(&legacy.fixture_dir)
             .await
             .expect("create legacy fixture dir");
@@ -357,6 +374,10 @@ mod tests {
         fs::write(legacy.simulation_dir.join("simulation.json"), b"{}")
             .await
             .expect("write legacy simulation");
+        let partial = LocalRuntimeLayout::for_root(tempdir.path());
+        fs::create_dir_all(&partial.sidecar_dir)
+            .await
+            .expect("create partial noet sidecar dir");
 
         let layout = ensure_local_runtime_layout(tempdir.path())
             .await
@@ -371,6 +392,18 @@ mod tests {
         assert_eq!(
             fs::read(&layout.db_path).await.expect("read migrated db"),
             b"legacy-db"
+        );
+        assert_eq!(
+            fs::read(path_with_suffix(&layout.db_path, "-wal"))
+                .await
+                .expect("read migrated wal"),
+            b"legacy-wal"
+        );
+        assert_eq!(
+            fs::read(path_with_suffix(&layout.db_path, "-shm"))
+                .await
+                .expect("read migrated shm"),
+            b"legacy-shm"
         );
         assert!(layout.fixture_dir.join("fixture.json").exists());
         assert!(layout.simulation_dir.join("simulation.json").exists());
