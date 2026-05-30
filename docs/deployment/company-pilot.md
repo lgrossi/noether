@@ -37,9 +37,10 @@ interface only when the network boundary already prevents untrusted access.
 Use PostgreSQL for serverless, multi-instance, or company-operated database deployments:
 
 ```bash
-NOET_DATABASE_URL='postgres://noether:REDACTED@postgres.internal/noether' \
-NOET_POSTGRES_PROFILE=strict \
-noet up --config /etc/noet/config.yaml
+sudo env \
+  NOET_DATABASE_URL='postgres://noether:REDACTED@postgres.internal/noether' \
+  NOET_POSTGRES_PROFILE=strict \
+  noet up --config /etc/noet/config.yaml
 ```
 
 Use `--postgres-profile performance` only when the deployment accepts the durability tradeoffs

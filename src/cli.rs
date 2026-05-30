@@ -961,7 +961,13 @@ async fn run_update_on_start_if_configured(
         .manifest_url
         .as_deref()
         .unwrap_or(DEFAULT_UPDATE_MANIFEST_URL);
-    let plan = fetch_update_plan(manifest_url).await?;
+    let plan = match fetch_update_plan(manifest_url).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("update\tskipped check failed: {error}");
+            return Ok(());
+        }
+    };
     if !plan.auto_update_allowed || plan.artifact.is_none() {
         print_update_on_start_status(&plan);
         return Ok(());
