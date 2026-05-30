@@ -12,8 +12,8 @@ declare const process: {
 	kill: (pid: number, signal?: string | number) => boolean;
 };
 
-const DEFAULT_NOETHER_URL = "http://127.0.0.1:4040";
 const DEFAULT_LOCAL_NOETHER_URL = "http://127.0.0.1:4051";
+const DEFAULT_NOETHER_URL = DEFAULT_LOCAL_NOETHER_URL;
 const EXTENSION_NAME = "noether-pi";
 const DEFAULT_FAIL_MODE = "fail_open";
 const DEFAULT_AUTHORIZE_TIMEOUT_MS = 1_000;
@@ -311,6 +311,10 @@ function processExists(pid: number): boolean {
 }
 
 function localSidecarStateDir(root: string): string {
+	return join(root, ".noet", "pi-sidecar");
+}
+
+function legacyLocalSidecarStateDir(root: string): string {
 	return join(root, ".noether", "pi-sidecar");
 }
 
@@ -322,17 +326,23 @@ function localSidecarOwnerPath(root: string): string {
 	return join(localSidecarStateDir(root), "owner.json");
 }
 
+function legacyLocalSidecarOwnerPath(root: string): string {
+	return join(legacyLocalSidecarStateDir(root), "owner.json");
+}
+
 function localSidecarLeasePath(root: string, sessionId: string): string {
 	return join(localSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
 }
 
 function readLocalSidecarOwner(root: string): LocalSidecarOwner | undefined {
 	const path = localSidecarOwnerPath(root);
-	if (!existsSync(path)) {
+	const legacyPath = legacyLocalSidecarOwnerPath(root);
+	const ownerPath = existsSync(path) ? path : legacyPath;
+	if (!existsSync(ownerPath)) {
 		return undefined;
 	}
 	try {
-		return JSON.parse(readFileSync(path, "utf8")) as LocalSidecarOwner;
+		return JSON.parse(readFileSync(ownerPath, "utf8")) as LocalSidecarOwner;
 	} catch {
 		return undefined;
 	}
@@ -368,7 +378,9 @@ function normalizeSyntheticConfig(
 function loadPersistedConfig(cwd: string): PersistedNoetherConfig {
 	return mergePersistedConfigs(
 		readPersistedConfig(join(homedir(), ".pi/agent/noether.json")),
+		readPersistedConfig(join(homedir(), ".pi/agent/noet.json")),
 		readPersistedConfig(join(cwd, ".pi/noether.json")),
+		readPersistedConfig(join(cwd, ".pi/noet.json")),
 	);
 }
 
@@ -927,7 +939,7 @@ async function noetherHealthcheck(noetherUrl: string, timeoutMs: number, signal?
 
 async function spawnLocalNoether(params: { cwd: string; bind: string; command: string }): Promise<number> {
 	return await new Promise<number>((resolve, reject) => {
-		const child = spawn(params.command, ["local", "up", "--root", params.cwd, "--bind", params.bind], {
+		const child = spawn(params.command, ["up", "--root", params.cwd, "--bind", params.bind], {
 			cwd: params.cwd,
 			detached: true,
 			stdio: "ignore",
@@ -977,6 +989,7 @@ async function tryWriteStartingLocalSidecarOwner(root: string, owner: LocalSidec
 
 async function clearLocalSidecarOwner(root: string): Promise<void> {
 	await rm(localSidecarOwnerPath(root), { force: true });
+	await rm(legacyLocalSidecarOwnerPath(root), { force: true });
 }
 
 async function listActiveLocalSidecarLeases(root: string): Promise<string[]> {

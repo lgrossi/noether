@@ -330,8 +330,41 @@ function deferred() {
 		const persisted = extension.extensionConfig({}, { cwd: configRoot });
 
 		assert.equal(defaults.failMode, "fail_open");
-		assert.equal(defaults.autoStartLocal, false);
+		assert.equal(defaults.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(defaults.autoStartLocal, true);
 		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(persisted.autoStartLocal, true);
+	} finally {
+		await rm(configRoot, { recursive: true, force: true });
+	}
+}
+
+{
+	const configRoot = await mkdtemp(resolve(tmpdir(), "pi-noet-config-"));
+
+	try {
+		await mkdir(resolve(configRoot, ".pi"), { recursive: true });
+		await writeFile(
+			resolve(configRoot, ".pi/noether.json"),
+			JSON.stringify({
+				noetherUrl: "http://127.0.0.1:4040",
+				failMode: "fail_open",
+			}),
+			"utf8",
+		);
+		await writeFile(
+			resolve(configRoot, ".pi/noet.json"),
+			JSON.stringify({
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_closed",
+			}),
+			"utf8",
+		);
+
+		const persisted = extension.extensionConfig({}, { cwd: configRoot });
+
+		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(persisted.failMode, "fail_closed");
 		assert.equal(persisted.autoStartLocal, true);
 	} finally {
 		await rm(configRoot, { recursive: true, force: true });

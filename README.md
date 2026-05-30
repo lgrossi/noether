@@ -20,9 +20,52 @@ integration owns provider transport. Noether decides, records, reconciles, and e
 
 ## Getting started
 
-Prerequisite: Rust/Cargo.
+Install the `noet` binary from a GitHub release, from the container image, or from source with
+Rust/Cargo.
 
-### 1. Run the end-to-end local proof
+### 1. Initialize local config
+
+```bash
+noet config init
+noet config show
+```
+
+This creates the standard local runtime home:
+
+```text
+~/.noet/config.yaml
+~/.noet/policy.yaml
+~/.noet/noet.sqlite
+```
+
+### 2. Start the sidecar
+
+Foreground mode is the default and is the right shape for terminals, systemd, Docker, and
+Kubernetes:
+
+```bash
+noet up
+```
+
+Detached local mode is explicit:
+
+```bash
+noet up -d
+noet status
+noet open policy
+noet down
+```
+
+Open:
+
+```text
+http://127.0.0.1:4051/policy
+http://127.0.0.1:4051/runs
+http://127.0.0.1:4051/replay
+http://127.0.0.1:4051/docs
+```
+
+### 3. Run the end-to-end local proof from source
 
 ```bash
 ./examples/vertical-mvp-demo.sh
@@ -30,14 +73,13 @@ Prerequisite: Rust/Cargo.
 
 That script starts a temporary sidecar, authorizes a request, reserves budget, finalizes observed
 usage, records trace/tool/eval events, and prints usage, decision, trace, and observation reports.
-
 It writes the demo ledger here:
 
 ```text
 .noet/demo/vertical-mvp.sqlite
 ```
 
-### 2. Open the app against that ledger
+You can inspect that specific demo ledger with the low-level server primitive:
 
 ```bash
 cargo run --bin noet -- serve \
@@ -46,22 +88,10 @@ cargo run --bin noet -- serve \
   --db-path .noet/demo/vertical-mvp.sqlite
 ```
 
-Open:
+`noet serve` remains available for debugging and explicit process-manager setups. The primary
+runtime entrypoint is `noet up`.
 
-```text
-http://127.0.0.1:4040/policy
-http://127.0.0.1:4040/runs
-http://127.0.0.1:4040/replay
-http://127.0.0.1:4040/docs
-```
-
-Check that the sidecar is healthy:
-
-```bash
-curl -fsS http://127.0.0.1:4040/health
-```
-
-### 3. Replay a policy scenario
+### 4. Replay a policy scenario
 
 ```bash
 cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
@@ -71,6 +101,72 @@ Open the generated artifact:
 
 ```text
 .noet/scenarios/runaway-agent-limit/noether-dashboard.html
+```
+
+## Production paths
+
+Server and container deployments use service paths instead of hidden dot directories:
+
+```text
+/etc/noet/config.yaml
+/etc/noet/policy.yaml
+/var/lib/noet/noet.sqlite
+```
+
+Initialize a server profile:
+
+```bash
+sudo noet config init --profile server
+sudo noet up --config /etc/noet/config.yaml
+```
+
+The container image is `ghcr.io/lgrossi/noether` and runs:
+
+```bash
+noet up --config /etc/noet/config.yaml
+```
+
+Container auto-update is disabled; update containers by pulling a new image. See
+[`docs/deployment/container.md`](docs/deployment/container.md).
+
+Check that the sidecar is healthy:
+
+```bash
+curl -fsS http://127.0.0.1:4051/health
+```
+
+For eligible patch updates of the binary install:
+
+```bash
+noet update check
+noet update apply --yes
+```
+
+Config-driven update-on-start is available through `updates.auto: patch` and
+`updates.check_on_start: true`; it is off in server/container profiles by default.
+
+### Low-level server primitive
+
+```bash
+noet serve \
+  --policy /etc/noet/policy.yaml \
+  --decision-mode enforce \
+  --db-path /var/lib/noet/noet.sqlite
+```
+
+`serve` intentionally exposes flags directly and does not manage config, owner files, logs, or
+update-on-start.
+
+### From source
+
+```bash
+cargo run --bin noet -- config init
+cargo run --bin noet -- up
+```
+Or use source commands for demos and reports:
+
+```bash
+cargo run --bin noet -- scenario run examples/scenarios/runaway-agent-limit.noet.yaml
 ```
 
 ## How to use Noether
@@ -564,7 +660,7 @@ That is the boundary:
 
 Today it includes:
 
-- local `noet` sidecar and repo-local `.noether/` runtime
+- local `noet` sidecar and `.noet/` or `~/.noet/` runtime
 - OpenAPI spec served at `/openapi.json`
 - human API docs served at `/docs`
 - `POST /v1/authorize`

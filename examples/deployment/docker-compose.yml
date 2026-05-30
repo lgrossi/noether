@@ -1,0 +1,14 @@
+services:
+  noether:
+    image: ghcr.io/lgrossi/noether:latest-preview
+    command: ["up", "--config", "/etc/noet/config.yaml"]
+    ports:
+      - "127.0.0.1:4051:4051"
+    volumes:
+      - ./noet-container-config.yaml:/etc/noet/config.yaml:ro
+      - ./noet-container-policy.yaml:/etc/noet/policy.yaml:ro
+      - noether-data:/var/lib/noet
+    restart: unless-stopped
+
+volumes:
+  noether-data:

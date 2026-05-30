@@ -6,7 +6,8 @@ only pushed `vX.Y.Z` tags publish artifacts.
 ## Scope
 
 The current release lane publishes the core `noet` binary only. SDKs, harness extensions, and
-package-registry publishing are intentionally out of scope.
+package-registry publishing are intentionally out of scope. The same tag workflow also publishes the
+core container image as `ghcr.io/lgrossi/noether`.
 
 ## Binary artifacts
 
@@ -42,7 +43,8 @@ git push origin v0.1.0
 ```
 
 The tag push triggers `.github/workflows/release.yml`, which builds the supported artifacts,
-generates checksums and `noether-release.json`, and creates a GitHub prerelease.
+generates checksums and `noether-release.json`, publishes the container image, and creates a GitHub
+prerelease.
 
 ## Auto-update manifest
 

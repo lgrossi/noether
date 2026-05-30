@@ -46,6 +46,10 @@ pub struct StorageConfig {
     pub sqlite_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,6 +59,8 @@ pub struct UpdatesConfig {
     pub auto: AutoUpdateMode,
     #[serde(default, skip_serializing_if = "is_false")]
     pub check_on_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,9 +199,12 @@ policy:
   decision_mode: enforce
 storage:
   sqlite_path: noet.sqlite
+  fixture_dir: fixtures
+  simulation_dir: simulations
 updates:
   auto: patch
   check_on_start: true
+  manifest_url: file:///tmp/noether-release.json
 advisory:
   warning_cadence: 30m
   enablement_tips:
@@ -217,8 +226,20 @@ advisory:
             config.storage.sqlite_path.as_deref(),
             Some(Path::new("noet.sqlite"))
         );
+        assert_eq!(
+            config.storage.fixture_dir.as_deref(),
+            Some(Path::new("fixtures"))
+        );
+        assert_eq!(
+            config.storage.simulation_dir.as_deref(),
+            Some(Path::new("simulations"))
+        );
         assert_eq!(config.updates.auto, AutoUpdateMode::Patch);
         assert!(config.updates.check_on_start);
+        assert_eq!(
+            config.updates.manifest_url.as_deref(),
+            Some("file:///tmp/noether-release.json")
+        );
         assert_eq!(config.advisory.warning_cadence.as_deref(), Some("30m"));
         assert_eq!(
             config.advisory.enablement_tips.mode,

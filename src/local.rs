@@ -8,7 +8,7 @@ use crate::error::NoetError;
 pub const DEFAULT_LOCAL_BIND: &str = "127.0.0.1:4051";
 const LOCAL_RUNTIME_DIR: &str = ".noet";
 const LEGACY_LOCAL_RUNTIME_DIR: &str = ".noether";
-const DEFAULT_LOCAL_POLICY: &str = r#"version: 0
+pub const DEFAULT_LOCAL_POLICY: &str = r#"version: 0
 routing:
   mode: explicit_then_fallback
   fallback_order: [project, user, team, group, org, global]
@@ -40,13 +40,15 @@ budgets:
           max_usd: 100
           action: block
 "#;
-const DEFAULT_LOCAL_CONFIG: &str = r#"server:
+pub const DEFAULT_LOCAL_CONFIG: &str = r#"server:
   bind: 127.0.0.1:4051
 policy:
   path: policy.yaml
   decision_mode: enforce
 storage:
   sqlite_path: noet.sqlite
+  fixture_dir: fixtures
+  simulation_dir: simulations
 updates:
   auto: patch
   check_on_start: false

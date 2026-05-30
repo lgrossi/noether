@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tokio::fs;
 
+use crate::config::AutoUpdateMode;
 use crate::contract::{AuthorizeDecision, DecisionMode, FinalizeReservation, TraceEvent};
 use crate::error::NoetError;
 use crate::fixture::{list_fixture_paths, read_fixture};
@@ -16,8 +17,9 @@ use crate::ledger::{
     AsyncPostgresLedgerOptions, BudgetLedger, TraceReport, TraceReportItem, UsageReport,
 };
 use crate::local::{
-    DEFAULT_LOCAL_BIND, clear_local_sidecar_owner, ensure_local_runtime_layout, load_local_config,
-    read_local_sidecar_owner, write_local_sidecar_owner,
+    DEFAULT_LOCAL_BIND, DEFAULT_LOCAL_CONFIG, DEFAULT_LOCAL_POLICY, clear_local_sidecar_owner,
+    ensure_local_runtime_layout, load_local_config, read_local_sidecar_owner,
+    write_local_sidecar_owner,
 };
 use crate::policy::{load_policy, policy_validation_warnings};
 use crate::proxy::load_proxy_routes;
@@ -31,7 +33,7 @@ use crate::server::{ServeConfig, serve};
 use crate::simulation::{
     SimulationDatabase, SimulationFile, compare_strategies_with_database, validate_simulation,
 };
-use crate::update::{DEFAULT_UPDATE_MANIFEST_URL, apply_update, fetch_update_plan};
+use crate::update::{DEFAULT_UPDATE_MANIFEST_URL, UpdatePlan, apply_update, fetch_update_plan};
 
 #[derive(Parser)]
 #[command(name = "noet")]
@@ -89,7 +91,7 @@ struct ServeArgs {
     simulation_dir: PathBuf,
 
     /// SQLite ledger path for durable local state.
-    #[arg(long, default_value = ".noet/noether.sqlite")]
+    #[arg(long, default_value = ".noet/noet.sqlite")]
     db_path: PathBuf,
 
     /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
@@ -143,6 +145,10 @@ struct ServeArgs {
 
 #[derive(Parser)]
 struct UpArgs {
+    /// Config file to run. When omitted, noet uses the standard local config.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Directory that should contain the `.noet/` runtime home. Defaults to the user's home.
     #[arg(long)]
     root: Option<PathBuf>,
@@ -205,6 +211,17 @@ struct ConfigPathArgs {
     /// Directory that should contain the `.noet/` runtime home. Defaults to the user's home.
     #[arg(long)]
     root: Option<PathBuf>,
+
+    /// Config profile to initialize or resolve.
+    #[arg(long, value_enum, default_value_t = ConfigProfile::Local)]
+    profile: ConfigProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum ConfigProfile {
+    Local,
+    Server,
+    Container,
 }
 
 #[derive(Parser)]
@@ -311,7 +328,7 @@ enum FixturesSubcommand {
 #[derive(Parser)]
 struct ReportCommand {
     /// SQLite ledger path.
-    #[arg(long, default_value = ".noet/noether.sqlite")]
+    #[arg(long, default_value = ".noet/noet.sqlite")]
     db_path: PathBuf,
 
     /// PostgreSQL connection URL. When set, this replaces the SQLite ledger path.
@@ -512,6 +529,32 @@ fn postgres_options_from_serve_args(
     Ok(options)
 }
 
+fn postgres_options_from_runtime_env() -> Result<AsyncPostgresLedgerOptions, NoetError> {
+    let profile = std::env::var("NOET_POSTGRES_PROFILE").unwrap_or_else(|_| "strict".to_owned());
+    let mut options = AsyncPostgresLedgerOptions::from_profile(&profile)?;
+    if let Some(pool_size) = parse_env_usize_option("NOET_POSTGRES_POOL_SIZE")? {
+        options.pool_size = pool_size.max(1);
+    }
+    if let Some(async_finalize) = parse_env_bool_option("NOET_POSTGRES_ASYNC_FINALIZE")? {
+        options.async_finalize = async_finalize;
+    }
+    if let Some(finalize_queue_capacity) =
+        parse_env_usize_option("NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY")?
+    {
+        options.finalize_queue_capacity = finalize_queue_capacity.max(1);
+    }
+    if let Some(synchronous_commit) = std::env::var("NOET_POSTGRES_SYNCHRONOUS_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        options.synchronous_commit = Some(synchronous_commit);
+    }
+    if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING")? {
+        options.stage_timing = stage_timing;
+    }
+    Ok(options)
+}
+
 fn parse_env_usize_option(name: &str) -> Result<Option<usize>, NoetError> {
     let Some(value) = std::env::var(name)
         .ok()
@@ -544,6 +587,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
     match command.command {
         LocalSubcommand::Up(args) => {
             run_runtime(RuntimeArgs {
+                config_path: None,
                 root: args.root,
                 bind: Some(args.bind),
                 detach: false,
@@ -559,6 +603,7 @@ async fn run_local(command: LocalCommand) -> Result<(), NoetError> {
 
 async fn run_up(args: UpArgs) -> Result<(), NoetError> {
     run_runtime(RuntimeArgs {
+        config_path: args.config,
         root: resolve_noet_root(args.root),
         bind: args.bind,
         detach: args.detach,
@@ -591,25 +636,25 @@ async fn run_status(args: StatusArgs) -> Result<(), NoetError> {
 async fn run_config(command: ConfigCommand) -> Result<(), NoetError> {
     match command.command {
         ConfigSubcommand::Path(args) => {
-            let layout = crate::local::LocalRuntimeLayout::for_root(&resolve_noet_root(args.root));
+            let layout = config_layout(args.profile, args.root);
             println!("{}", layout.config_path.display());
             Ok(())
         }
         ConfigSubcommand::Init(args) => {
-            let layout = ensure_local_runtime_layout(&resolve_noet_root(args.root)).await?;
+            let layout = ensure_config_layout(args.profile, args.root).await?;
             println!("config\t{}", layout.config_path.display());
             println!("policy\t{}", layout.policy_path.display());
             println!("db\t{}", layout.db_path.display());
             Ok(())
         }
         ConfigSubcommand::Show(args) => {
-            let layout = ensure_local_runtime_layout(&resolve_noet_root(args.root)).await?;
+            let layout = ensure_config_layout(args.profile, args.root).await?;
             let config = load_local_config(&layout.config_path).await?;
             println!("{}", serde_yaml::to_string(&config)?);
             Ok(())
         }
         ConfigSubcommand::Edit(args) => {
-            let layout = ensure_local_runtime_layout(&resolve_noet_root(args.root)).await?;
+            let layout = ensure_config_layout(args.profile, args.root).await?;
             open_config_editor(&layout.config_path)?;
             Ok(())
         }
@@ -655,7 +700,101 @@ impl OpenSurface {
     }
 }
 
+struct ConfigLayout {
+    config_path: PathBuf,
+    policy_path: PathBuf,
+    db_path: PathBuf,
+}
+
+fn config_layout(profile: ConfigProfile, root: Option<PathBuf>) -> ConfigLayout {
+    match profile {
+        ConfigProfile::Local => {
+            let layout = crate::local::LocalRuntimeLayout::for_root(&resolve_noet_root(root));
+            ConfigLayout {
+                config_path: layout.config_path,
+                policy_path: layout.policy_path,
+                db_path: layout.db_path,
+            }
+        }
+        ConfigProfile::Server | ConfigProfile::Container => ConfigLayout {
+            config_path: PathBuf::from("/etc/noet/config.yaml"),
+            policy_path: PathBuf::from("/etc/noet/policy.yaml"),
+            db_path: PathBuf::from("/var/lib/noet/noet.sqlite"),
+        },
+    }
+}
+
+async fn ensure_config_layout(
+    profile: ConfigProfile,
+    root: Option<PathBuf>,
+) -> Result<ConfigLayout, NoetError> {
+    if profile == ConfigProfile::Local {
+        let layout = ensure_local_runtime_layout(&resolve_noet_root(root)).await?;
+        return Ok(ConfigLayout {
+            config_path: layout.config_path,
+            policy_path: layout.policy_path,
+            db_path: layout.db_path,
+        });
+    }
+
+    let layout = config_layout(profile, root);
+    if let Some(parent) = layout.config_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    if let Some(parent) = layout.db_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    if !fs::try_exists(&layout.policy_path).await? {
+        fs::write(&layout.policy_path, DEFAULT_LOCAL_POLICY).await?;
+    }
+    if !fs::try_exists(&layout.config_path).await? {
+        fs::write(&layout.config_path, profile_config_yaml(profile)).await?;
+    }
+    Ok(layout)
+}
+
+fn profile_config_yaml(profile: ConfigProfile) -> &'static str {
+    match profile {
+        ConfigProfile::Local => DEFAULT_LOCAL_CONFIG,
+        ConfigProfile::Server => {
+            r#"server:
+  bind: 127.0.0.1:4051
+policy:
+  path: /etc/noet/policy.yaml
+  decision_mode: enforce
+storage:
+  sqlite_path: /var/lib/noet/noet.sqlite
+  fixture_dir: /var/lib/noet/fixtures
+  simulation_dir: /var/lib/noet/simulations
+updates:
+  auto: patch
+  check_on_start: false
+advisory:
+  warning_cadence: 4h
+"#
+        }
+        ConfigProfile::Container => {
+            r#"server:
+  bind: 0.0.0.0:4051
+policy:
+  path: /etc/noet/policy.yaml
+  decision_mode: enforce
+storage:
+  sqlite_path: /var/lib/noet/noet.sqlite
+  fixture_dir: /var/lib/noet/fixtures
+  simulation_dir: /var/lib/noet/simulations
+updates:
+  auto: off
+  check_on_start: false
+advisory:
+  warning_cadence: 4h
+"#
+        }
+    }
+}
+
 struct RuntimeArgs {
+    config_path: Option<PathBuf>,
     root: PathBuf,
     bind: Option<SocketAddr>,
     detach: bool,
@@ -665,16 +804,39 @@ struct RuntimeArgs {
 }
 
 async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
-    let layout = ensure_local_runtime_layout(&args.root).await?;
+    if args.config_path.is_some() && args.detach {
+        return Err(NoetError::InvalidConfig(
+            "`noet up --config` runs in the foreground; use process manager or container runtime to detach"
+                .to_owned(),
+        ));
+    }
+    let local_layout = if args.config_path.is_some() {
+        None
+    } else {
+        Some(ensure_local_runtime_layout(&args.root).await?)
+    };
     if args.detach {
-        spawn_detached_runtime(&args, &layout)?;
+        let layout = local_layout
+            .as_ref()
+            .expect("detached runtime has local layout");
+        spawn_detached_runtime(&args, layout)?;
         println!("state\tstarting");
         println!("log\t{}", layout.log_path.display());
         return Ok(());
     }
 
-    let noether_config = load_local_config(&layout.config_path).await?;
-    let config_dir = layout.config_path.parent().unwrap_or(&layout.root);
+    let config_path = args
+        .config_path
+        .clone()
+        .or_else(|| {
+            local_layout
+                .as_ref()
+                .map(|layout| layout.config_path.clone())
+        })
+        .ok_or_else(|| NoetError::InvalidConfig("missing noet config path".to_owned()))?;
+    let noether_config = load_local_config(&config_path).await?;
+    run_update_on_start_if_configured(&noether_config).await?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let bind =
         args.bind
             .or(noether_config.server.bind)
@@ -688,19 +850,59 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         .path
         .as_ref()
         .map(|path| resolve_config_path(config_dir, path))
-        .unwrap_or_else(|| layout.policy_path.clone());
+        .or_else(|| {
+            local_layout
+                .as_ref()
+                .map(|layout| layout.policy_path.clone())
+        })
+        .unwrap_or_else(|| config_dir.join("policy.yaml"));
     let db_path = noether_config
         .storage
         .sqlite_path
         .as_ref()
         .map(|path| resolve_config_path(config_dir, path))
-        .unwrap_or_else(|| layout.db_path.clone());
+        .or_else(|| local_layout.as_ref().map(|layout| layout.db_path.clone()))
+        .unwrap_or_else(|| config_dir.join("noet.sqlite"));
+    let fixture_dir = noether_config
+        .storage
+        .fixture_dir
+        .as_ref()
+        .map(|path| resolve_config_path(config_dir, path))
+        .or_else(|| {
+            local_layout
+                .as_ref()
+                .map(|layout| layout.fixture_dir.clone())
+        })
+        .unwrap_or_else(|| db_path.parent().unwrap_or(config_dir).join("fixtures"));
+    let simulation_dir = noether_config
+        .storage
+        .simulation_dir
+        .as_ref()
+        .map(|path| resolve_config_path(config_dir, path))
+        .or_else(|| {
+            local_layout
+                .as_ref()
+                .map(|layout| layout.simulation_dir.clone())
+        })
+        .unwrap_or_else(|| db_path.parent().unwrap_or(config_dir).join("simulations"));
     let decision_mode = args
         .decision_mode
         .or(noether_config.policy.decision_mode)
         .unwrap_or(DecisionMode::Enforce);
+    let database_url = noether_config.storage.database_url.clone().or_else(|| {
+        std::env::var("NOET_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let postgres_options = if database_url.is_some() {
+        postgres_options_from_runtime_env()?
+    } else {
+        AsyncPostgresLedgerOptions::default()
+    };
 
-    write_local_sidecar_owner(&layout, &bind.to_string()).await?;
+    if let Some(layout) = local_layout.as_ref() {
+        write_local_sidecar_owner(layout, &bind.to_string()).await?;
+    }
     let policy = load_policy(&policy_path).await?;
     let routes = match args.routes {
         Some(path) => load_proxy_routes(&path).await?.routes,
@@ -708,11 +910,11 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
     };
     let serve_config = ServeConfig {
         bind,
-        fixture_dir: layout.fixture_dir,
-        simulation_dir: layout.simulation_dir,
+        fixture_dir,
+        simulation_dir,
         db_path,
-        database_url: noether_config.storage.database_url.clone(),
-        postgres_options: AsyncPostgresLedgerOptions::default(),
+        database_url,
+        postgres_options,
         upstream: args.upstream,
         routes,
         policy_path: Some(policy_path),
@@ -724,8 +926,48 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         result = serve(serve_config) => result,
         signal = wait_for_shutdown_signal() => signal,
     };
-    clear_local_sidecar_owner(&args.root).await?;
+    if local_layout.is_some() {
+        clear_local_sidecar_owner(&args.root).await?;
+    }
     result
+}
+
+async fn run_update_on_start_if_configured(
+    config: &crate::config::NoetherConfig,
+) -> Result<(), NoetError> {
+    if config.updates.auto != AutoUpdateMode::Patch || !config.updates.check_on_start {
+        return Ok(());
+    }
+    let manifest_url = config
+        .updates
+        .manifest_url
+        .as_deref()
+        .unwrap_or(DEFAULT_UPDATE_MANIFEST_URL);
+    let plan = fetch_update_plan(manifest_url).await?;
+    if !plan.auto_update_allowed || plan.artifact.is_none() {
+        print_update_on_start_status(&plan);
+        return Ok(());
+    }
+    let installed = apply_update(&plan).await?;
+    println!("updated\t{} -> {}", plan.current, plan.latest);
+    println!("binary\t{}", installed.display());
+    Ok(())
+}
+
+fn print_update_on_start_status(plan: &UpdatePlan) {
+    if plan.latest <= plan.current {
+        println!("update\tcurrent {}", plan.current);
+    } else if plan.artifact.is_none() {
+        println!(
+            "update\tskipped release {} has no artifact for {}",
+            plan.latest, plan.target
+        );
+    } else {
+        println!(
+            "update\tskipped release {} is not auto-update eligible from {}",
+            plan.latest, plan.current
+        );
+    }
 }
 
 async fn print_runtime_status(root: &Path) -> Result<(), NoetError> {
@@ -1162,7 +1404,7 @@ async fn replay_scenario_file(
     }
     fs::create_dir_all(&traces_dir).await?;
 
-    let db_path = output_dir.join("noether.sqlite");
+    let db_path = output_dir.join("noet.sqlite");
     if fs::try_exists(&db_path).await? {
         fs::remove_file(&db_path).await?;
     }
@@ -4531,7 +4773,7 @@ mod tests {
                 assert_eq!(args.bind.to_string(), "127.0.0.1:4040");
                 assert_eq!(args.fixture_dir, PathBuf::from(".noet/fixtures"));
                 assert_eq!(args.simulation_dir, PathBuf::from(".noet/simulations"));
-                assert_eq!(args.db_path, PathBuf::from(".noet/noether.sqlite"));
+                assert_eq!(args.db_path, PathBuf::from(".noet/noet.sqlite"));
                 assert!(args.upstream.is_none());
                 assert!(args.routes.is_none());
                 assert!(args.policy.is_none());
