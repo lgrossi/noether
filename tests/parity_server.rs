@@ -34,6 +34,7 @@ fn strict_policy() -> PolicyFile {
                     max_usd: 0.01,
                     warn_at_fractions: vec![0.8],
                     action: PolicyAction::Block,
+                    warning_cadence: None,
                 }],
                 tool_calls: None,
                 agent_steps: None,

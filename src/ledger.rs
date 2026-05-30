@@ -10847,7 +10847,7 @@ mod tests {
     fn explicit_budget_window_metadata_is_exposed_in_decision_reports() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db_path = tempdir.path().join("budget-window-report.sqlite");
-        let mut policy = policy(5.0, 1.0);
+        let policy = policy(5.0, 1.0);
         let mut ledger = BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger");
 
         let decision = ledger.authorize(Some(&policy), &request(0.25));
