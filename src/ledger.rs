@@ -7728,7 +7728,7 @@ fn apply_budget_limits(
                 Some(warn_threshold),
                 ledger.recommend_message_hint(
                     request,
-                    &format!("warn.{}", projection.rule_id),
+                    &format!("warn.{}.threshold", projection.rule_id),
                     &projection.scope_key,
                     DecisionSeverity::Warn,
                     now,
@@ -9726,6 +9726,32 @@ mod tests {
             first_message_hint_recommendation(&hidden).as_deref(),
             Some("hide")
         );
+    }
+
+    #[test]
+    fn spend_threshold_cadence_does_not_hide_simultaneous_limit_warning() {
+        let mut policy = policy(1.0, 0.5);
+        policy.budgets[0].limits.spend[0].action = PolicyAction::Warn;
+        policy.budgets[0].limits.spend[0].warning_cadence = Some("1h".to_owned());
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 8, 0, 0).unwrap();
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger
+            .try_authorize_at(Some(&policy), &request(1.10), now)
+            .expect("authorize");
+        let hints = decision
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("message_hints"))
+            .and_then(Value::as_array)
+            .expect("message hints");
+        let recommendations: Vec<_> = hints
+            .iter()
+            .filter_map(|hint| hint.get("recommendation").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert_eq!(recommendations, vec!["show", "show"]);
     }
 
     #[test]
