@@ -21,17 +21,12 @@ reach it.
 
 ## SQLite start command
 
-SQLite remains the default backend when no `--database-url` or `NOET_DATABASE_URL` is configured.
-Run one Noether process with explicit bind, policy, database, fixture, and simulation paths:
+SQLite remains the default backend when no `NOET_DATABASE_URL` is configured. Initialize service
+config and run one foreground Noether process:
 
 ```bash
-noet serve \
-  --bind 127.0.0.1:4040 \
-  --policy /etc/noet/policy.noet.yaml \
-  --decision-mode enforce \
-  --db-path /var/lib/noet/noether.sqlite \
-  --fixture-dir /var/lib/noet/fixtures \
-  --simulation-dir /var/lib/noet/simulations
+sudo noet config init --profile server
+sudo noet up --config /etc/noet/config.yaml
 ```
 
 Bind to localhost when a local reverse proxy or IAP sidecar runs on the same host. Bind to a private
@@ -42,14 +37,10 @@ interface only when the network boundary already prevents untrusted access.
 Use PostgreSQL for serverless, multi-instance, or company-operated database deployments:
 
 ```bash
-NOET_DATABASE_URL='postgres://noether:REDACTED@postgres.internal/noether' \
-noet serve \
-  --bind 127.0.0.1:4040 \
-  --policy /etc/noet/policy.noet.yaml \
-  --decision-mode enforce \
-  --fixture-dir /var/lib/noet/fixtures \
-  --simulation-dir /var/lib/noet/simulations \
-  --postgres-profile strict
+sudo env \
+  NOET_DATABASE_URL='postgres://noether:REDACTED@postgres.internal/noether' \
+  NOET_POSTGRES_PROFILE=strict \
+  noet up --config /etc/noet/config.yaml
 ```
 
 Use `--postgres-profile performance` only when the deployment accepts the durability tradeoffs
@@ -59,7 +50,7 @@ documented in [Storage backends](../storage-backends.md).
 
 | Backend | Status | Use |
 | --- | --- | --- |
-| SQLite | Current supported backend | Local and early company pilots with one `noet serve` process and a durable volume. |
+| SQLite | Current supported backend | Local and early company pilots with one `noet up` process and a durable volume. |
 | PostgreSQL | Current supported backend | Serverless, multi-instance, or company-operated database deployments. |
 
 Company-readiness report/domain logic should stay storage-neutral. SQLite and PostgreSQL adapters
@@ -70,8 +61,9 @@ provide durable data for those seams.
 Recommended layout:
 
 ```text
-/etc/noet/policy.noet.yaml        active policy managed as config
-/var/lib/noet/noether.sqlite      durable ledger
+/etc/noet/config.yaml             active runtime config
+/etc/noet/policy.yaml             active policy managed as config
+/var/lib/noet/noet.sqlite         durable ledger
 /var/lib/noet/fixtures            controlled debug capture artifacts
 /var/lib/noet/simulations         generated simulation artifacts
 /var/lib/noet/policy.proposed.yaml local policy draft used by the app
@@ -95,9 +87,12 @@ A PostgreSQL pilot unit is available at
 It assumes:
 
 - the `noet` binary is installed at `/usr/local/bin/noet`;
-- policy lives at `/etc/noet/policy.noet.yaml`;
+- policy lives at `/etc/noet/policy.yaml`;
 - SQLite durable state lives under `/var/lib/noet`, or PostgreSQL state lives in the configured
   database;
+- systemd creates `/var/lib/noet` for the `noet` service user through `StateDirectory=noet`;
+- the example systemd unit chowns `/etc/noet` and `/var/lib/noet` for the `noet` user before start
+  so the app can update the active policy and write state;
 - an external proxy or private network controls access.
 
 ## Sensitive route inventory
@@ -126,14 +121,14 @@ After deploying behind the company boundary:
 6. Confirm `/runs` and `GET /v1/reports/usage` show the finalized run.
 7. Save a policy draft, run replay, and enforce only after reviewing the replay result.
 8. Confirm the active storage backend is included in the company's backup process. For SQLite, that
-   means `/var/lib/noet/noether.sqlite` and its WAL/SHM side files. For PostgreSQL, that means the
+   means `/var/lib/noet/noet.sqlite` and its WAL/SHM side files. For PostgreSQL, that means the
    company's PostgreSQL backup mechanism plus Noether policy/artifact paths.
 
 ## Supported pilot boundaries
 
 Supported:
 
-- one `noet serve` process;
+- one `noet up` process;
 - durable storage using SQLite or PostgreSQL;
 - external security boundary;
 - trusted callers;

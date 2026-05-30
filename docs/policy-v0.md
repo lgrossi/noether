@@ -1,7 +1,8 @@
 # Policy v0
 
 Default policy path: `policy.noet.yaml`
-Default local Noether runtime config path: `.noether/config.yaml`
+Default managed local config path: `~/.noet/config.yaml`
+Default project-local runtime config path: `.noet/config.yaml`
 
 Validate a policy:
 

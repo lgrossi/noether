@@ -6,16 +6,11 @@ Local mocks and unit tests are useful, but they are not enough for the readiness
 ## Shared setup
 
 Run Noether behind the company boundary using the company-pilot deployment shape. This example uses
-SQLite; use `--database-url`/`NOET_DATABASE_URL` for PostgreSQL deployments:
+SQLite; use `NOET_DATABASE_URL` for PostgreSQL deployments:
 
 ```bash
-noet serve \
-  --bind 127.0.0.1:4040 \
-  --policy /etc/noet/policy.noet.yaml \
-  --decision-mode enforce \
-  --db-path /var/lib/noet/noether.sqlite \
-  --fixture-dir /var/lib/noet/fixtures \
-  --simulation-dir /var/lib/noet/simulations
+sudo noet config init --profile server
+sudo noet up --config /etc/noet/config.yaml
 ```
 
 Before testing:

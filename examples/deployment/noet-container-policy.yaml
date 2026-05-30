@@ -1,0 +1,22 @@
+version: 0
+routing:
+  mode: explicit_then_fallback
+  fallback_order: [project, user, team, group, org, global]
+budgets:
+  - id: container-default
+    models:
+      allow:
+        - openai-codex:*
+        - openai:*
+        - anthropic:claude-sonnet-*
+        - anthropic:claude-haiku-*
+    limits:
+      spend:
+        - id: daily-cap
+          by: global
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 100
+          action: block

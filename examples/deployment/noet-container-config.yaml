@@ -1,0 +1,14 @@
+server:
+  bind: 0.0.0.0:4051
+policy:
+  path: /etc/noet/policy.yaml
+  decision_mode: enforce
+storage:
+  sqlite_path: /var/lib/noet/noet.sqlite
+  fixture_dir: /var/lib/noet/fixtures
+  simulation_dir: /var/lib/noet/simulations
+updates:
+  auto: off
+  check_on_start: false
+advisory:
+  warning_cadence: 4h

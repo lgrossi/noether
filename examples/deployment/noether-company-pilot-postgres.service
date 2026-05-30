@@ -7,21 +7,17 @@ Wants=network-online.target
 Type=simple
 User=noet
 Group=noet
-EnvironmentFile=/etc/noet/noether.env
-ExecStart=/usr/local/bin/noet serve \
-  --bind 127.0.0.1:4040 \
-  --policy /etc/noet/policy.noet.yaml \
-  --decision-mode enforce \
-  --fixture-dir /var/lib/noet/fixtures \
-  --simulation-dir /var/lib/noet/simulations \
-  --postgres-profile strict
+StateDirectory=noet
+StateDirectoryMode=0750
+ExecStartPre=+/usr/bin/chown -R noet:noet /etc/noet /var/lib/noet
+EnvironmentFile=/etc/noet/noet.env
+ExecStart=/usr/local/bin/noet up --config /etc/noet/config.yaml
 Restart=on-failure
 RestartSec=5
 
-# /etc/noet/noether.env should define NOET_DATABASE_URL without committing secrets.
+# /etc/noet/noet.env should define NOET_DATABASE_URL without committing secrets.
 # Noether is intentionally unauthenticated. Keep this service bound behind an
 # IAP, authenticated reverse proxy, private network, or service mesh policy.
 
 [Install]
 WantedBy=multi-user.target
-

@@ -1,0 +1,8 @@
+/.git
+/.github
+/.noet
+/target
+/extensions/pi-noether/node_modules
+/extensions/pi-noether/dist
+*.sqlite
+*.log

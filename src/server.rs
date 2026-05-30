@@ -970,6 +970,7 @@ pub struct ServeConfig {
     pub policy: Option<PolicyFile>,
     pub noether_config: NoetherConfig,
     pub decision_mode: DecisionMode,
+    pub on_bound: Option<Box<dyn FnOnce() -> Result<(), NoetError> + Send>>,
 }
 
 pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
@@ -1035,6 +1036,9 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
 
     info!(bind = %bind, "starting noet capture server");
     let listener = TcpListener::bind(bind).await?;
+    if let Some(on_bound) = config.on_bound {
+        on_bound()?;
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

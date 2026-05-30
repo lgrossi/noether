@@ -11,6 +11,8 @@ Use:
 curl -fsS http://127.0.0.1:4040/health
 ```
 
+Managed `noet up` deployments default to port `4051`; low-level `noet serve` defaults to `4040`.
+
 Expected company-pilot posture:
 
 - `status=ok`
@@ -40,15 +42,15 @@ fail-open integrations, alert because provider work may proceed without governan
 
 Back up:
 
-- `/var/lib/noet/noether.sqlite`
+- `/var/lib/noet/noet.sqlite`
 - SQLite WAL/SHM side files when present;
-- `/etc/noet/policy.noet.yaml`;
+- `/etc/noet/policy.yaml`;
 - `/var/lib/noet/policy.proposed.yaml` when a draft is intentionally retained;
 - `/var/lib/noet/policy.previous.yaml`;
 - `/var/lib/noet/policy-audit.log`;
 - generated simulation artifacts only if they are needed for review history.
 
-Restore by stopping `noet serve`, restoring the files, then starting Noether and checking `/health`,
+Restore by stopping `noet up`, restoring the files, then starting Noether and checking `/health`,
 `/runs`, and `/v1/reports/usage`.
 
 ### PostgreSQL backend

@@ -1,23 +1,20 @@
 # Team deployment
 
 Noether remains local-first by default. Team deployment is an opt-in operating mode built from the
-same `noet serve` process, the same control contract, and the same reporting surfaces now served
-from that process.
+same control contract and reporting surfaces. Use `noet up --config /etc/noet/config.yaml` as the
+normal process entrypoint; keep `noet serve` for low-level debugging and explicit flag-only setups.
 
 ## Shared server path
 
-Start a shared Noether instance with an explicit bind address, policy path, and durable SQLite
-path:
+Initialize service config:
 
 ```bash
-noet serve \
-  --bind 0.0.0.0:4040 \
-  --policy /etc/noet/policy.noet.yaml \
-  --decision-mode enforce \
-  --db-path /var/lib/noet/noether.sqlite \
-  --fixture-dir /var/lib/noet/fixtures \
-  --simulation-dir /var/lib/noet/simulations
+sudo noet config init --profile server
+sudo noet up --config /etc/noet/config.yaml
 ```
+
+The standard service paths are `/etc/noet/config.yaml`, `/etc/noet/policy.yaml`, and
+`/var/lib/noet/noet.sqlite`.
 
 Recommended shared-server shape:
 
@@ -32,8 +29,8 @@ Recommended shared-server shape:
 
 ## Ports and process layout
 
-- default local bind remains `127.0.0.1:4040`;
-- a shared instance typically binds `0.0.0.0:4040` behind an internal load balancer or reverse
+- default managed local bind is `127.0.0.1:4051`;
+- a shared instance typically binds `0.0.0.0:4051` behind an internal load balancer or reverse
   proxy;
 - one process is enough for the current SQLite-backed implementation; scale-out requires shared
   storage before multiple writers are introduced.
@@ -107,5 +104,7 @@ Team mode must stay opt-in:
 
 - `noet serve` with no extra flags still binds locally, uses local SQLite, and defaults to
   `dry_run`;
+- `noet up` reads YAML config and is foreground by default, so it fits systemd, containers, and
+  Kubernetes without wrapper scripts;
 - no cloud service, auth service, or remote DB is required for local development;
 - shared-server docs must not replace the existing one-laptop workflow.

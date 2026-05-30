@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -330,8 +330,42 @@ function deferred() {
 		const persisted = extension.extensionConfig({}, { cwd: configRoot });
 
 		assert.equal(defaults.failMode, "fail_open");
-		assert.equal(defaults.autoStartLocal, false);
+		assert.equal(defaults.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(defaults.autoStartLocal, true);
+		assert.equal(defaults.localRoot, homedir());
 		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(persisted.autoStartLocal, true);
+	} finally {
+		await rm(configRoot, { recursive: true, force: true });
+	}
+}
+
+{
+	const configRoot = await mkdtemp(resolve(tmpdir(), "pi-noet-config-"));
+
+	try {
+		await mkdir(resolve(configRoot, ".pi"), { recursive: true });
+		await writeFile(
+			resolve(configRoot, ".pi/noether.json"),
+			JSON.stringify({
+				noetherUrl: "http://127.0.0.1:4040",
+				failMode: "fail_open",
+			}),
+			"utf8",
+		);
+		await writeFile(
+			resolve(configRoot, ".pi/noet.json"),
+			JSON.stringify({
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_closed",
+			}),
+			"utf8",
+		);
+
+		const persisted = extension.extensionConfig({}, { cwd: configRoot });
+
+		assert.equal(persisted.noetherUrl, "http://127.0.0.1:4051");
+		assert.equal(persisted.failMode, "fail_closed");
 		assert.equal(persisted.autoStartLocal, true);
 	} finally {
 		await rm(configRoot, { recursive: true, force: true });
@@ -408,6 +442,41 @@ function deferred() {
 }
 
 {
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-fail-open-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) {
+			return new Response("down", { status: 503 });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{ on(event, handler) { handlers.set(event, handler); } },
+			{
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				autoStartLocal: true,
+				localRoot,
+				localStartTimeoutMs: 10,
+				startLocalNoether: async () => {
+					throw new Error("missing noet binary");
+				},
+			},
+		);
+
+		await handlers.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
+	}
+}
+
+{
 	const calls = [];
 	let healthy = false;
 	let starts = 0;
@@ -462,6 +531,62 @@ function deferred() {
 
 		await handlersB.get("session_shutdown")({ reason: "quit" }, fakeContext({ cwd: localRoot }));
 		assert.equal(stops, 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
+	}
+}
+
+{
+	let healthy = false;
+	let stops = 0;
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-legacy-lease-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) {
+			return new Response(healthy ? "ok" : "down", { status: healthy ? 200 : 503 });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{ on(event, handler) { handlers.set(event, handler); } },
+			{
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				autoStartLocal: true,
+				localRoot,
+				localStartTimeoutMs: 1000,
+				startLocalNoether: async () => {
+					healthy = true;
+					return process.pid;
+				},
+				stopLocalNoether: async () => {
+					stops += 1;
+					healthy = false;
+				},
+			},
+		);
+
+		await mkdir(resolve(localRoot, ".noether/pi-sidecar/leases"), { recursive: true });
+		await writeFile(
+			resolve(localRoot, ".noether/pi-sidecar/leases/legacy.json"),
+			JSON.stringify({
+				session_id: "legacy",
+				client_pid: process.pid,
+				acquired_at: new Date().toISOString(),
+			}),
+			"utf8",
+		);
+
+		await handlers.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+		await handlers.get("session_shutdown")({ reason: "quit" }, fakeContext({ cwd: localRoot }));
+
+		assert.equal(stops, 0);
 	} finally {
 		globalThis.fetch = originalFetch;
 		await rm(localRoot, { recursive: true, force: true });

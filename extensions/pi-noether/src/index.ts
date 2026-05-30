@@ -12,8 +12,8 @@ declare const process: {
 	kill: (pid: number, signal?: string | number) => boolean;
 };
 
-const DEFAULT_NOETHER_URL = "http://127.0.0.1:4040";
 const DEFAULT_LOCAL_NOETHER_URL = "http://127.0.0.1:4051";
+const DEFAULT_NOETHER_URL = DEFAULT_LOCAL_NOETHER_URL;
 const EXTENSION_NAME = "noether-pi";
 const DEFAULT_FAIL_MODE = "fail_open";
 const DEFAULT_AUTHORIZE_TIMEOUT_MS = 1_000;
@@ -199,6 +199,7 @@ type LocalSidecarOwner =
 	| {
 			state: "running";
 			pid: number;
+			owner_pid?: number;
 			cwd: string;
 			bind: string;
 			url: string;
@@ -245,7 +246,7 @@ export function extensionConfig(
 			booleanOverride(env.NOET_PI_AUTO_START_LOCAL, fileConfig.autoStartLocal) ??
 			stripTrailingSlash(env.NOET_URL || fileConfig.noetherUrl || DEFAULT_NOETHER_URL) === DEFAULT_LOCAL_NOETHER_URL,
 		localBin: emptyToUndefined(env.NOET_PI_LOCAL_BIN) || fileConfig.localBin,
-		localRoot: emptyToUndefined(env.NOET_PI_LOCAL_ROOT) || fileConfig.localRoot,
+		localRoot: emptyToUndefined(env.NOET_PI_LOCAL_ROOT) || fileConfig.localRoot || defaultLocalRoot(),
 		localStartTimeoutMs:
 			positiveInteger(env.NOET_PI_LOCAL_START_TIMEOUT_MS) ||
 			fileConfig.localStartTimeoutMs ||
@@ -254,6 +255,10 @@ export function extensionConfig(
 		debugHooks: env.NOET_PI_DEBUG_HOOKS === "raw" || fileConfig.debugHooks || false,
 		debugHookLogDir: emptyToUndefined(env.NOET_PI_DEBUG_HOOK_LOG_DIR) || fileConfig.debugHookLogDir,
 	};
+}
+
+function defaultLocalRoot(): string {
+	return homedir() || process.cwd();
 }
 
 function stripTrailingSlash(value: string): string {
@@ -311,6 +316,10 @@ function processExists(pid: number): boolean {
 }
 
 function localSidecarStateDir(root: string): string {
+	return join(root, ".noet", "pi-sidecar");
+}
+
+function legacyLocalSidecarStateDir(root: string): string {
 	return join(root, ".noether", "pi-sidecar");
 }
 
@@ -318,21 +327,35 @@ function localSidecarLeaseDir(root: string): string {
 	return join(localSidecarStateDir(root), "leases");
 }
 
+function legacyLocalSidecarLeaseDir(root: string): string {
+	return join(legacyLocalSidecarStateDir(root), "leases");
+}
+
 function localSidecarOwnerPath(root: string): string {
 	return join(localSidecarStateDir(root), "owner.json");
+}
+
+function legacyLocalSidecarOwnerPath(root: string): string {
+	return join(legacyLocalSidecarStateDir(root), "owner.json");
 }
 
 function localSidecarLeasePath(root: string, sessionId: string): string {
 	return join(localSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
 }
 
+function legacyLocalSidecarLeasePath(root: string, sessionId: string): string {
+	return join(legacyLocalSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
+}
+
 function readLocalSidecarOwner(root: string): LocalSidecarOwner | undefined {
 	const path = localSidecarOwnerPath(root);
-	if (!existsSync(path)) {
+	const legacyPath = legacyLocalSidecarOwnerPath(root);
+	const ownerPath = existsSync(path) ? path : legacyPath;
+	if (!existsSync(ownerPath)) {
 		return undefined;
 	}
 	try {
-		return JSON.parse(readFileSync(path, "utf8")) as LocalSidecarOwner;
+		return JSON.parse(readFileSync(ownerPath, "utf8")) as LocalSidecarOwner;
 	} catch {
 		return undefined;
 	}
@@ -368,7 +391,9 @@ function normalizeSyntheticConfig(
 function loadPersistedConfig(cwd: string): PersistedNoetherConfig {
 	return mergePersistedConfigs(
 		readPersistedConfig(join(homedir(), ".pi/agent/noether.json")),
+		readPersistedConfig(join(homedir(), ".pi/agent/noet.json")),
 		readPersistedConfig(join(cwd, ".pi/noether.json")),
+		readPersistedConfig(join(cwd, ".pi/noet.json")),
 	);
 }
 
@@ -927,7 +952,7 @@ async function noetherHealthcheck(noetherUrl: string, timeoutMs: number, signal?
 
 async function spawnLocalNoether(params: { cwd: string; bind: string; command: string }): Promise<number> {
 	return await new Promise<number>((resolve, reject) => {
-		const child = spawn(params.command, ["local", "up", "--root", params.cwd, "--bind", params.bind], {
+		const child = spawn(params.command, ["up", "--root", params.cwd, "--bind", params.bind], {
 			cwd: params.cwd,
 			detached: true,
 			stdio: "ignore",
@@ -977,14 +1002,22 @@ async function tryWriteStartingLocalSidecarOwner(root: string, owner: LocalSidec
 
 async function clearLocalSidecarOwner(root: string): Promise<void> {
 	await rm(localSidecarOwnerPath(root), { force: true });
+	await rm(legacyLocalSidecarOwnerPath(root), { force: true });
 }
 
 async function listActiveLocalSidecarLeases(root: string): Promise<string[]> {
 	await ensureLocalSidecarLeaseDirs(root);
-	const entries = await readdir(localSidecarLeaseDir(root)).catch(() => [] as string[]);
+	return [
+		...(await listActiveLocalSidecarLeasesInDir(localSidecarLeaseDir(root))),
+		...(await listActiveLocalSidecarLeasesInDir(legacyLocalSidecarLeaseDir(root))),
+	];
+}
+
+async function listActiveLocalSidecarLeasesInDir(dir: string): Promise<string[]> {
+	const entries = await readdir(dir).catch(() => [] as string[]);
 	const active: string[] = [];
 	for (const entry of entries) {
-		const path = join(localSidecarLeaseDir(root), entry);
+		const path = join(dir, entry);
 		const lease = readLocalSidecarLease(path);
 		if (!lease || !processExists(lease.client_pid)) {
 			await rm(path, { force: true });
@@ -1012,6 +1045,7 @@ async function acquireLocalSidecarLease(root: string, sessionId: string): Promis
 
 async function releaseLocalSidecarLease(root: string, sessionId: string): Promise<number> {
 	await rm(localSidecarLeasePath(root, sessionId), { force: true });
+	await rm(legacyLocalSidecarLeasePath(root, sessionId), { force: true });
 	return (await listActiveLocalSidecarLeases(root)).length;
 }
 
@@ -2021,6 +2055,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 								await writeLocalSidecarOwner(cwd, {
 									state: "running",
 									pid: sidecarPid,
+									owner_pid: process.pid,
 									cwd,
 									bind,
 									url: config.noetherUrl,
@@ -2043,7 +2078,17 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	}
 
 	async function ensureNoetherSession(ctx: ExtensionContext): Promise<void> {
-		await ensureNoetherReady(ctx);
+		try {
+			await ensureNoetherReady(ctx);
+		} catch (error) {
+			if (config.failMode === "fail_closed") {
+				throw error;
+			}
+			console.warn(
+				`[noether-pi] Could not auto-start local Noether. Continuing because failMode=fail_open. ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
 		if (!config.autoStartLocal || !isDefaultLocalNoetherUrl(config.noetherUrl)) {
 			return;
 		}
@@ -2068,6 +2113,9 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		}
 		const bind = localNoetherBindForUrl(config.noetherUrl);
 		if (!bind) {
+			return;
+		}
+		if (owner.owner_pid !== process.pid) {
 			return;
 		}
 		if (config.stopLocalNoether) {
