@@ -196,12 +196,74 @@ components:
           items:
             $ref: "#/components/schemas/DecisionExplanation"
         metadata:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/AuthorizeDecisionMetadata"
           description: Optional machine-readable presentation hints and diagnostics.
         created_at:
           type: string
           format: date-time
+    AuthorizeDecisionMetadata:
+      type: object
+      additionalProperties: true
+      properties:
+        message_hints:
+          type: array
+          description: Structured facts integrations may render as warning or denial messages.
+          items:
+            $ref: "#/components/schemas/AuthorizeMessageHint"
+        notifications:
+          type: array
+          description: Canonical Noether-authored notifications that are eligible to display now.
+          items:
+            $ref: "#/components/schemas/AuthorizeNotification"
+    AuthorizeMessageHint:
+      type: object
+      required: [kind, rule_id, severity, recommendation]
+      properties:
+        kind:
+          type: string
+        rule_id:
+          type: string
+        severity:
+          type: string
+          enum: [info, warn, deny]
+        recommendation:
+          type: string
+          enum: [show, hide]
+        limit_type:
+          type: string
+        window_id:
+          type: string
+        window_label:
+          type: string
+        window_mode:
+          type: string
+        window_ends_at:
+          type: string
+          format: date-time
+        projected_spend_usd:
+          type: number
+        max_usd:
+          type: number
+        threshold_usd:
+          type: number
+        threshold_percent:
+          type: integer
+          minimum: 0
+    AuthorizeNotification:
+      type: object
+      required: [kind, key, severity, title, body]
+      properties:
+        kind:
+          type: string
+        key:
+          type: string
+        severity:
+          type: string
+          enum: [info, warn, deny]
+        title:
+          type: string
+        body:
+          type: string
     DecisionOutcome:
       type: string
       enum: [allow, warn, deny]

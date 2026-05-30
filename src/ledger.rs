@@ -51,6 +51,8 @@ pub struct BudgetLedger {
 }
 
 const WARN_ADVISORY_COOLDOWN: Duration = Duration::hours(4);
+const ENABLEMENT_NOTIFICATION_COOLDOWN: Duration = Duration::hours(4);
+const ENABLEMENT_UNDER_PACE_FRACTION: f64 = 0.5;
 
 #[derive(Default)]
 enum LedgerStore {
@@ -830,6 +832,15 @@ struct AuthorizeMessageHint {
 enum MessageHintRecommendation {
     Show,
     Hide,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuthorizeNotification {
+    kind: String,
+    key: String,
+    severity: DecisionSeverity,
+    title: String,
+    body: String,
 }
 
 #[derive(Default)]
@@ -1737,19 +1748,72 @@ impl BudgetLedger {
         if severity != DecisionSeverity::Warn {
             return MessageHintRecommendation::Show;
         }
+        if self.recommend_advisory(
+            &request_user_key(request),
+            advisory_key,
+            scope_key,
+            now,
+            WARN_ADVISORY_COOLDOWN,
+        ) {
+            MessageHintRecommendation::Show
+        } else {
+            MessageHintRecommendation::Hide
+        }
+    }
+
+    fn recommend_advisory(
+        &mut self,
+        user_key: &str,
+        advisory_key: &str,
+        scope_key: &str,
+        now: DateTime<Utc>,
+        cooldown: Duration,
+    ) -> bool {
         let key = (
-            request_user_key(request),
+            user_key.to_owned(),
             advisory_key.to_owned(),
             scope_key.to_owned(),
         );
         if let Some(last_shown_at) = self.advisory_cadence.get(&key)
-            && *last_shown_at + WARN_ADVISORY_COOLDOWN > now
+            && *last_shown_at + cooldown > now
         {
-            return MessageHintRecommendation::Hide;
+            return false;
         }
         self.advisory_cadence.insert(key.clone(), now);
         self.pending_advisory_cadence.insert(key, now);
-        MessageHintRecommendation::Show
+        true
+    }
+
+    fn enablement_notifications(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> Vec<AuthorizeNotification> {
+        let Some(policy) = policy else {
+            return Vec::new();
+        };
+        let Some(reason) = enablement_headroom(policy, self, request, now) else {
+            return Vec::new();
+        };
+        let user_key = request_user_key(request);
+        if !self.recommend_advisory(
+            &user_key,
+            "notification.enablement.headroom",
+            &reason.scope_key,
+            now,
+            ENABLEMENT_NOTIFICATION_COOLDOWN,
+        ) {
+            return Vec::new();
+        }
+        let tip = enablement_tip(&user_key, now);
+        vec![AuthorizeNotification {
+            kind: "enablement_tip".to_owned(),
+            key: tip.key.to_owned(),
+            severity: DecisionSeverity::Info,
+            title: "AI budget headroom available".to_owned(),
+            body: tip.body.to_owned(),
+        }]
     }
 
     pub fn try_authorize(
@@ -1775,6 +1839,7 @@ impl BudgetLedger {
         let mut explanations = Vec::new();
         let mut limit_hits = Vec::new();
         let mut message_hints = Vec::new();
+        let mut notifications = Vec::new();
         let mut selected_budget_id = None;
 
         if let Some(policy) = policy {
@@ -1813,6 +1878,9 @@ impl BudgetLedger {
             self.persist_limit_windows()?;
             self.persist_allocation_buckets()?;
         }
+        if action == PolicyAction::Allow && message_hints.is_empty() {
+            notifications = self.enablement_notifications(policy, request, now);
+        }
 
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
@@ -1820,7 +1888,7 @@ impl BudgetLedger {
             action,
             reservation,
             explanations,
-            metadata: message_hints_metadata(&message_hints),
+            metadata: authorize_metadata(&message_hints, &notifications),
             created_at: now,
         };
         self.persist_decision(
@@ -7661,7 +7729,24 @@ fn apply_budget_limits(
 }
 
 fn message_hints_metadata(message_hints: &[AuthorizeMessageHint]) -> Option<Value> {
-    (!message_hints.is_empty()).then(|| json!({ "message_hints": message_hints }))
+    authorize_metadata(message_hints, &[])
+}
+
+fn authorize_metadata(
+    message_hints: &[AuthorizeMessageHint],
+    notifications: &[AuthorizeNotification],
+) -> Option<Value> {
+    if message_hints.is_empty() && notifications.is_empty() {
+        return None;
+    }
+    let mut metadata = serde_json::Map::new();
+    if !message_hints.is_empty() {
+        metadata.insert("message_hints".to_owned(), json!(message_hints));
+    }
+    if !notifications.is_empty() {
+        metadata.insert("notifications".to_owned(), json!(notifications));
+    }
+    Some(Value::Object(metadata))
 }
 
 fn message_hint_from_projection(
@@ -8002,6 +8087,113 @@ fn first_request_entity(request: &AuthorizeRequest, kind: &str) -> Option<String
         .cloned()
 }
 
+struct EnablementHeadroom {
+    scope_key: String,
+}
+
+struct EnablementTip {
+    key: &'static str,
+    body: &'static str,
+}
+
+const ENABLEMENT_TIPS: &[EnablementTip] = &[
+    EnablementTip {
+        key: "workflow.codify_repeated_process",
+        body: "Try codifying a repeated team workflow into a reusable skill or checklist.",
+    },
+    EnablementTip {
+        key: "automation.mechanical_process",
+        body: "Try turning a weekly mechanical process into a script, template, or command.",
+    },
+    EnablementTip {
+        key: "visualization.interactive_html",
+        body: "Try asking for an interactive HTML view of messy logs, reports, or datasets.",
+    },
+    EnablementTip {
+        key: "agentic.background_investigation",
+        body: "Try delegating a low-risk cleanup or investigation to a background agent.",
+    },
+    EnablementTip {
+        key: "agentic.parallel_review",
+        body: "Try parallel reviews of the same diff, one focused on bugs and one on simplification.",
+    },
+    EnablementTip {
+        key: "architecture.design_suggestions",
+        body: "Try asking for codebase architecture suggestions before a large refactor.",
+    },
+    EnablementTip {
+        key: "reflection.workflow_review",
+        body: "Try asking an agent to review your recent commits or logs and identify repeated friction.",
+    },
+    EnablementTip {
+        key: "reflection.automation_patterns",
+        body: "Try giving an agent JSON logs and asking for bottlenecks or missed automation.",
+    },
+];
+
+fn enablement_tip(user_key: &str, now: DateTime<Utc>) -> &'static EnablementTip {
+    let bucket = now
+        .timestamp()
+        .div_euclid(ENABLEMENT_NOTIFICATION_COOLDOWN.num_seconds());
+    let seed = stable_hash(user_key).wrapping_add(bucket as u64);
+    &ENABLEMENT_TIPS[(seed as usize) % ENABLEMENT_TIPS.len()]
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+    })
+}
+
+fn enablement_headroom(
+    policy: &PolicyFile,
+    ledger: &BudgetLedger,
+    request: &AuthorizeRequest,
+    now: DateTime<Utc>,
+) -> Option<EnablementHeadroom> {
+    let applicable: Vec<&BudgetRule> = policy
+        .budgets
+        .iter()
+        .filter(|rule| budget_rule_matches(rule, request) && budget_model_allowed(rule, request))
+        .collect();
+    if applicable.is_empty() {
+        return None;
+    }
+
+    let mut underpaced_scope = None;
+    for rule in applicable {
+        let projections =
+            spend_window_projections(ledger, rule, request, request.estimated_cost(), now).ok()?;
+        let has_spend_budget = !projections.is_empty();
+        let has_available_allocation = allocation_bucket_available_usd(ledger, rule, request, now)
+            .is_some_and(|available| available > 0.0);
+        if !has_spend_budget && !has_available_allocation {
+            continue;
+        }
+        let pressure = projections
+            .iter()
+            .map(|projection| projection.projected_spend_usd / projection.max_usd)
+            .fold(0.0, f64::max);
+        let warn_at = rule
+            .limits
+            .spend
+            .iter()
+            .flat_map(|limit| limit.warn_at_fractions.iter().copied())
+            .filter(|fraction| *fraction < 1.0)
+            .fold(1.0, f64::min);
+        if pressure >= warn_at {
+            return None;
+        }
+        if has_available_allocation
+            || (has_spend_budget && pressure <= ENABLEMENT_UNDER_PACE_FRACTION)
+        {
+            underpaced_scope.get_or_insert_with(|| rule.id.clone());
+        }
+    }
+
+    underpaced_scope.map(|scope_key| EnablementHeadroom { scope_key })
+}
+
 fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -> Option<String> {
     let allocation = rule.allocation.as_ref()?;
     if allocation.standard != "protected_adoption_pool" {
@@ -8029,6 +8221,31 @@ fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -
             .cloned(),
         _ => None,
     }
+}
+
+fn allocation_bucket_available_usd(
+    ledger: &BudgetLedger,
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let entity_key = allocation_bucket_entity_key(rule, request)?;
+    let protected_amount_usd = rule
+        .allocation
+        .as_ref()
+        .and_then(|allocation| allocation.protected_amount_usd)?;
+    let bucket = ledger
+        .allocation_buckets
+        .get(&(rule.id.clone(), entity_key))
+        .cloned()
+        .unwrap_or(AllocationBucketState {
+            started_at: now,
+            protected_amount_usd,
+            current_grant_usd: protected_amount_usd,
+            carryover_usd: 0.0,
+        });
+    let bucket = rolled_allocation_bucket_state(rule, bucket, now)?;
+    Some(bucket.current_grant_usd + bucket.carryover_usd)
 }
 
 fn consume_allocation_bucket(
@@ -8890,6 +9107,15 @@ mod tests {
         }
     }
 
+    fn first_notification(decision: &AuthorizeDecision) -> Option<&Value> {
+        decision
+            .metadata
+            .as_ref()?
+            .get("notifications")?
+            .as_array()?
+            .first()
+    }
+
     fn protected_adoption_policy(cap_window: &str) -> PolicyFile {
         PolicyFile {
             version: 0,
@@ -8945,6 +9171,87 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert!(decision.reservation.is_some());
+    }
+
+    #[test]
+    fn authorize_emits_enablement_notification_for_underpaced_budget_headroom() {
+        let policy = policy(10.0, 0.8);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        let notification = first_notification(&decision).expect("enablement notification");
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(notification["kind"], "enablement_tip");
+        assert_eq!(notification["severity"], "info");
+        assert_eq!(notification["title"], "AI budget headroom available");
+        assert!(
+            notification["body"]
+                .as_str()
+                .expect("body")
+                .starts_with("Try ")
+        );
+    }
+
+    #[test]
+    fn authorize_cadences_enablement_notifications_per_user() {
+        let policy = policy(10.0, 0.8);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let first = ledger.authorize(Some(&policy), &request);
+        let second = ledger.authorize(Some(&policy), &request);
+
+        assert!(first_notification(&first).is_some());
+        assert!(first_notification(&second).is_none());
+    }
+
+    #[test]
+    fn authorize_suppresses_enablement_notification_when_any_applicable_budget_is_over_pace() {
+        let mut policy = policy(10.0, 0.8);
+        let mut hot_budget = policy.budgets[0].clone();
+        hot_budget.id = "hot-budget".to_owned();
+        hot_budget.limits.spend[0].max_usd = 1.0;
+        policy.budgets.push(hot_budget);
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+        ledger.limit_windows.insert(
+            (
+                "hot-budget".to_owned(),
+                "budget-cap".to_owned(),
+                "project:noether".to_owned(),
+            ),
+            WindowState {
+                started_at: Utc::now(),
+                used_usd: 0.80,
+            },
+        );
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(first_notification(&decision).is_none());
+    }
+
+    #[test]
+    fn authorize_suppresses_enablement_notification_when_decision_warns() {
+        let mut policy = policy(10.0, 0.8);
+        policy.budgets[0].limits.request_cost = Some(RequestCostLimit {
+            max_usd: 0.05,
+            action: PolicyAction::Warn,
+        });
+        let mut request = request(0.10);
+        request.subject = Some("user:alice".to_owned());
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(first_notification(&decision).is_none());
     }
 
     #[test]

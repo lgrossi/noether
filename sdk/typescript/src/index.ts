@@ -45,8 +45,38 @@ export type AuthorizeDecision = {
 	action: PolicyAction;
 	reservation?: Reservation;
 	explanations: DecisionExplanation[];
-	metadata?: Record<string, unknown>;
+	metadata?: AuthorizeDecisionMetadata;
 	created_at: string;
+};
+
+export type AuthorizeDecisionMetadata = {
+	message_hints?: AuthorizeMessageHintMetadata[];
+	notifications?: AuthorizeNotificationMetadata[];
+	[key: string]: unknown;
+};
+
+export type AuthorizeMessageHintMetadata = {
+	kind: string;
+	rule_id: string;
+	severity: DecisionSeverity;
+	recommendation: "show" | "hide" | string;
+	limit_type?: string;
+	window_id?: string;
+	window_label?: string;
+	window_mode?: string;
+	window_ends_at?: string;
+	projected_spend_usd?: number;
+	max_usd?: number;
+	threshold_usd?: number;
+	threshold_percent?: number;
+};
+
+export type AuthorizeNotificationMetadata = {
+	kind: string;
+	key: string;
+	severity: DecisionSeverity;
+	title: string;
+	body: string;
 };
 
 export type UsageObservation = {

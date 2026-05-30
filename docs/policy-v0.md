@@ -129,7 +129,12 @@ The v0 evaluator is an in-memory fixed-window budget:
 - otherwise estimated cost falls back to `estimated_tokens * 0.000001`;
 - `allow` creates a reservation;
 - `warn` creates a reservation and includes an explanation;
-- `deny` does not create a reservation.
+- `deny` does not create a reservation;
+- warn decisions may include `metadata.message_hints[].recommendation` (`show` or `hide`) so
+  integrations can follow Noether's cadence recommendation without losing the underlying decision
+  facts;
+- allow decisions may include `metadata.notifications[]` for Noether-authored enablement tips
+  when applicable budgets have headroom and no applicable budget is near or over pace.
 
 Reservations are finalized through `POST /v1/reservations/{id}/finalize`.
 
