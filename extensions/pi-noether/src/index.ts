@@ -322,6 +322,10 @@ function localSidecarLeaseDir(root: string): string {
 	return join(localSidecarStateDir(root), "leases");
 }
 
+function legacyLocalSidecarLeaseDir(root: string): string {
+	return join(legacyLocalSidecarStateDir(root), "leases");
+}
+
 function localSidecarOwnerPath(root: string): string {
 	return join(localSidecarStateDir(root), "owner.json");
 }
@@ -332,6 +336,10 @@ function legacyLocalSidecarOwnerPath(root: string): string {
 
 function localSidecarLeasePath(root: string, sessionId: string): string {
 	return join(localSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
+}
+
+function legacyLocalSidecarLeasePath(root: string, sessionId: string): string {
+	return join(legacyLocalSidecarLeaseDir(root), `${process.pid}-${sessionId}.json`);
 }
 
 function readLocalSidecarOwner(root: string): LocalSidecarOwner | undefined {
@@ -994,10 +1002,17 @@ async function clearLocalSidecarOwner(root: string): Promise<void> {
 
 async function listActiveLocalSidecarLeases(root: string): Promise<string[]> {
 	await ensureLocalSidecarLeaseDirs(root);
-	const entries = await readdir(localSidecarLeaseDir(root)).catch(() => [] as string[]);
+	return [
+		...(await listActiveLocalSidecarLeasesInDir(localSidecarLeaseDir(root))),
+		...(await listActiveLocalSidecarLeasesInDir(legacyLocalSidecarLeaseDir(root))),
+	];
+}
+
+async function listActiveLocalSidecarLeasesInDir(dir: string): Promise<string[]> {
+	const entries = await readdir(dir).catch(() => [] as string[]);
 	const active: string[] = [];
 	for (const entry of entries) {
-		const path = join(localSidecarLeaseDir(root), entry);
+		const path = join(dir, entry);
 		const lease = readLocalSidecarLease(path);
 		if (!lease || !processExists(lease.client_pid)) {
 			await rm(path, { force: true });
@@ -1025,6 +1040,7 @@ async function acquireLocalSidecarLease(root: string, sessionId: string): Promis
 
 async function releaseLocalSidecarLease(root: string, sessionId: string): Promise<number> {
 	await rm(localSidecarLeasePath(root, sessionId), { force: true });
+	await rm(legacyLocalSidecarLeasePath(root, sessionId), { force: true });
 	return (await listActiveLocalSidecarLeases(root)).length;
 }
 

@@ -1,3 +1,4 @@
+use std::fs as std_fs;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
@@ -142,12 +143,32 @@ async fn migrate_legacy_runtime_if_needed(
     copy_if_present(&legacy.config_path, &layout.config_path).await?;
     copy_if_present(&legacy.policy_path, &layout.policy_path).await?;
     copy_if_present(&legacy.db_path, &layout.db_path).await?;
+    copy_dir_if_present(&legacy.fixture_dir, &layout.fixture_dir)?;
+    copy_dir_if_present(&legacy.simulation_dir, &layout.simulation_dir)?;
     Ok(())
 }
 
 async fn copy_if_present(source: &Path, destination: &Path) -> Result<(), NoetError> {
     if fs::try_exists(source).await? && !fs::try_exists(destination).await? {
         fs::copy(source, destination).await?;
+    }
+    Ok(())
+}
+
+fn copy_dir_if_present(source: &Path, destination: &Path) -> Result<(), NoetError> {
+    if !source.exists() || destination.exists() {
+        return Ok(());
+    }
+    std_fs::create_dir_all(destination)?;
+    for entry in std_fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_if_present(&source_path, &destination_path)?;
+        } else if !destination_path.exists() {
+            std_fs::copy(&source_path, &destination_path)?;
+        }
     }
     Ok(())
 }
@@ -324,6 +345,18 @@ mod tests {
         fs::write(&legacy.db_path, b"legacy-db")
             .await
             .expect("write legacy db");
+        fs::create_dir_all(&legacy.fixture_dir)
+            .await
+            .expect("create legacy fixture dir");
+        fs::write(legacy.fixture_dir.join("fixture.json"), b"{}")
+            .await
+            .expect("write legacy fixture");
+        fs::create_dir_all(&legacy.simulation_dir)
+            .await
+            .expect("create legacy simulation dir");
+        fs::write(legacy.simulation_dir.join("simulation.json"), b"{}")
+            .await
+            .expect("write legacy simulation");
 
         let layout = ensure_local_runtime_layout(tempdir.path())
             .await
@@ -339,5 +372,7 @@ mod tests {
             fs::read(&layout.db_path).await.expect("read migrated db"),
             b"legacy-db"
         );
+        assert!(layout.fixture_dir.join("fixture.json").exists());
+        assert!(layout.simulation_dir.join("simulation.json").exists());
     }
 }

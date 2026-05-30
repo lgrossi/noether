@@ -963,7 +963,26 @@ async fn run_update_on_start_if_configured(
     let installed = apply_update(&plan).await?;
     println!("updated\t{} -> {}", plan.current, plan.latest);
     println!("binary\t{}", installed.display());
+    restart_after_update()?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn restart_after_update() -> Result<(), NoetError> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = std::env::current_exe()?;
+    let error = std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error.into())
+}
+
+#[cfg(not(unix))]
+fn restart_after_update() -> Result<(), NoetError> {
+    Err(NoetError::InvalidConfig(
+        "updated noet binary; restart the process to use it".to_owned(),
+    ))
 }
 
 fn print_update_on_start_status(plan: &UpdatePlan) {

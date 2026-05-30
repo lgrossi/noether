@@ -537,6 +537,62 @@ function deferred() {
 }
 
 {
+	let healthy = false;
+	let stops = 0;
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-legacy-lease-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) {
+			return new Response(healthy ? "ok" : "down", { status: healthy ? 200 : 503 });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{ on(event, handler) { handlers.set(event, handler); } },
+			{
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				autoStartLocal: true,
+				localRoot,
+				localStartTimeoutMs: 1000,
+				startLocalNoether: async () => {
+					healthy = true;
+					return process.pid;
+				},
+				stopLocalNoether: async () => {
+					stops += 1;
+					healthy = false;
+				},
+			},
+		);
+
+		await mkdir(resolve(localRoot, ".noether/pi-sidecar/leases"), { recursive: true });
+		await writeFile(
+			resolve(localRoot, ".noether/pi-sidecar/leases/legacy.json"),
+			JSON.stringify({
+				session_id: "legacy",
+				client_pid: process.pid,
+				acquired_at: new Date().toISOString(),
+			}),
+			"utf8",
+		);
+
+		await handlers.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+		await handlers.get("session_shutdown")({ reason: "quit" }, fakeContext({ cwd: localRoot }));
+
+		assert.equal(stops, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
+	}
+}
+
+{
 	const request = extension.buildAuthorizeRequest(
 		{
 			payload: {
