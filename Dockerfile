@@ -14,8 +14,9 @@ RUN apt-get update \
   && chown -R noet:noet /var/lib/noet
 
 COPY --from=builder /src/target/release/noet /usr/local/bin/noet
-COPY examples/deployment/noet-container-config.yaml /etc/noet/config.yaml
-COPY examples/deployment/noet-container-policy.yaml /etc/noet/policy.yaml
+COPY --chown=noet:noet examples/deployment/noet-container-config.yaml /etc/noet/config.yaml
+COPY --chown=noet:noet examples/deployment/noet-container-policy.yaml /etc/noet/policy.yaml
+RUN chown -R noet:noet /etc/noet /var/lib/noet
 
 EXPOSE 4051
 USER noet

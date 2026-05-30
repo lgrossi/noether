@@ -1103,13 +1103,20 @@ fn process_looks_like_noet(pid: u32) -> bool {
             .ok()
             .and_then(|path| path.file_name().map(|name| name.to_owned()))
             .and_then(|name| name.to_str().map(str::to_owned))
-            .map(|name| name == "noet" || name == "noet.exe")
+            .map(|name| is_noet_executable_name(&name))
             .unwrap_or(false)
     }
     #[cfg(not(target_os = "linux"))]
     {
         true
     }
+}
+
+fn is_noet_executable_name(name: &str) -> bool {
+    matches!(
+        name,
+        "noet" | "noet.exe" | "noet (deleted)" | "noet.exe (deleted)"
+    )
 }
 
 fn resolve_noet_root(root: Option<PathBuf>) -> PathBuf {
@@ -4856,6 +4863,13 @@ mod tests {
             }
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn noet_process_name_accepts_deleted_linux_executable_suffix() {
+        assert!(is_noet_executable_name("noet"));
+        assert!(is_noet_executable_name("noet (deleted)"));
+        assert!(!is_noet_executable_name("python"));
     }
 
     #[test]
