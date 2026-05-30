@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio-postgres = "0.7"
 url = "2.5.8"
 uuid = { version = "1.23.1", features = ["v4"] }
+open = "5.3"
 
 [dev-dependencies]
 tempfile = "3.25.0"
