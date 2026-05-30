@@ -10,6 +10,130 @@
 
 ## 1. Executive Summary
 
+This audit should be read as a production-direction document, not as a mandate to implement every
+finding. The useful conclusion is narrower and clearer than the raw count suggests:
+
+> Noether's next production milestone should be a controlled internal sidecar pilot: one team or
+> company runs Noether behind its existing security boundary, with honest integration claims,
+> durable hot-path behavior, operable logs/metrics, and stored evidence that governed integrations
+> actually block spend before provider traffic.
+
+That target preserves Noether's strongest product identity: a local-first governance sidecar for
+agent work, not a model gateway and not a generic multi-tenant enterprise platform. It also changes
+the priority order. The 351 findings are evidence; the roadmap is the following narrowed sequence:
+
+1. **Make the claim safe:** CI, license, version/release discipline, and a repeatable install path.
+2. **Make the hot path trustworthy:** storage transactions, PG lock/statement/acquire timeouts,
+   proxy/request timeouts, replay caps, and reachable panic removal.
+3. **Make the trust boundary explicit in code:** keep IAP/reverse proxy as the recommended outer
+   boundary, but add opt-in `--api-key`/`NOET_API_KEY` middleware, non-loopback warnings, and
+   key-derived actor attribution for approval and policy audit. Do not jump straight to full RBAC.
+4. **Make the system operable:** request IDs, JSON logs, structured allow/warn/ask/deny events,
+   `/metrics`, richer `/health`, and slow-query/slow-authorize visibility.
+5. **Make integration claims honest:** Pi and LiteLLM need stored live-smoke evidence that denial
+   prevents provider spend; Claude Code, Codex, and OpenCode stay explicitly limited unless
+   stronger hooks are proven.
+6. **Pay down architecture where it blocks confidence:** first fix SDK error semantics, shared
+   contract types, and SDK/integration HTTP behavior because those affect pilot integrations. Then,
+   after contract tests exist, split `ledger.rs` by domain, move dashboard rendering out of
+   `cli.rs`, and split thick server handlers.
+7. **Make policy/API contracts match reality:** complete OpenAPI coverage, add contract tests,
+   classify internal app routes, and fix policy-engine mismatches where docs claim enforcement that
+   code does not provide.
+
+The defer list below is a product strategy overlay on top of the audit findings, not an audit
+conclusion. The audit identifies real gaps; this production direction decides which ones are not
+needed for the first controlled sidecar pilot. Defer unless the product target changes:
+multi-tenant schema/RBAC, browser sessions, SQLCipher/encryption-at-rest productization, a React
+rewrite, broad SDK publishing, OTLP/SBOM programs, and full privacy/SAR machinery. SDK correctness
+bugs and README/API usability bugs remain in-pilot work; publishing every SDK broadly is the part
+deferred.
+
+**Baseline note after rebase.** This report was originally synthesized against `origin/main` at
+`2e1d3d5`. The PR has since been rebased over `73c730c` (core binary releases and updates),
+`2c3e6f0` (advisory notifications and configurable cadence), and `d6b3462` (noet lifecycle and
+deployment UX). Those commits likely resolve or partially resolve release, install, lifecycle, and
+advisory-cadence findings. Before executing Phase 1 or Phase 7, run a focused delta pass against
+the rebased main and trim anything already landed.
+
+### 1.1 Current-main delta pass
+
+The focused pass against the rebased branch changes the execution plan in these areas:
+
+| Area | Current-main state | Planning impact |
+| --- | --- | --- |
+| CI | `.github/workflows/ci.yml` now runs formatting, `cargo test --locked`, and release binary build. | Treat "no CI" as partially resolved. Remaining CI work is PG service coverage, pi-noether/npm tests, integration-probe smoke, and scheduled `cargo audit`. |
+| Release artifacts | `.github/workflows/release.yml` builds Linux x86_64, macOS arm64, and Windows x86_64 binaries, uploads checksums, writes `noether-release.json`, creates a prerelease, and publishes a container image. | Remove "no binary releases" and "no release workflow" from pilot blockers. Keep release smoke hardening and manifest/version checks as maintenance. |
+| Container path | `Dockerfile`, `docs/deployment/container.md`, and README container instructions now exist. | Remove "no Dockerfile/container path" from pilot blockers. Keep runtime auth/metrics/health concerns separate. |
+| Lifecycle/install UX | README and CLI now document/support `noet config init/show`, `noet up`, `up -d`, `status`, `logs`, `open`, `down`, `update check`, and `update apply`. | Treat lifecycle/onboarding as materially progressed. Pilot work should validate the flow, not redesign it. |
+| Version command | `#[command(version)]` is wired for `noet --version`. | Mark the original `--version` gap resolved. |
+| Advisory cadence | Advisory notifications and configurable cadence landed after the audit baseline. | Recheck related observability/storage-schema findings before turning them into implementation tasks. |
+| Still open | No `LICENSE*` file is present; no explicit `[profile.release]`; no `--api-key`; no `/metrics`; no JSON log mode; no request IDs; storage timeout/transaction issues still appear open; SDK correctness/publishing work remains open. | These stay in the pilot-readiness backlog, with SDK correctness separated from broad SDK publishing. |
+
+### 1.2 Controlled sidecar pilot scope
+
+Pilot readiness means Noether can be run by one team/company behind an existing security boundary
+and can truthfully prove what it governs. It does not mean generic enterprise/multi-tenant
+readiness.
+
+| In scope for pilot readiness | Deferred unless the product target changes |
+| --- | --- |
+| LICENSE and current release/install validation | Multi-tenant schema and per-tenant query isolation |
+| CI completion: PG service test, extension tests, integration probes, audit job | Full RBAC or browser sessions |
+| Storage integrity: SQLite transactions, PG acquire/statement/lock timeouts, WAL policy | SQLCipher/encryption-at-rest productization |
+| HTTP hot-path reliability: reqwest/proxy timeouts, replay caps, bounded errors | React rewrite or frontend framework migration |
+| Minimal in-process auth: optional API key, non-loopback warning, actor attribution | Broad SDK registry publishing before there is a consumer pull |
+| Operability: request IDs, JSON logs, structured decision events, `/metrics`, richer `/health` | OTLP/SBOM/supply-chain program beyond basic audit/dependency hygiene |
+| Integration evidence: Pi and LiteLLM live smokes proving deny prevents spend | Full privacy/SAR program |
+| SDK correctness: no silent 4xx/5xx masking, compiling README examples, API-key support | Shared multi-user policy draft isolation |
+| API/policy truth: OpenAPI coverage, contract tests, policy-doc enforcement mismatches | Generic enterprise IAM replacement |
+
+This scope is the input for implementation tasking. Work outside the right column can still be
+valuable, but it should not block the first pilot unless the target shifts from "controlled
+sidecar" to "shared enterprise platform."
+
+### 1.3 Pilot-readiness task set
+
+The implementation backlog should be tracked as vertical workflows, not as the original 12 audit
+phases. The first three workflows are the pilot-readiness foundation and should be implemented
+before deeper SDK/API/architecture work:
+
+1. **Finish baseline readiness**
+   - Keep: LICENSE, release-profile decision, PG CI service test, pi-noether/npm CI test,
+     integration-probe smoke, and scheduled dependency audit.
+   - Already progressed by current main: GitHub Actions exists, release workflow exists, release
+     binary build exists, Docker/container path exists, lifecycle commands exist.
+   - Acceptance: PR CI exercises Rust plus the important integration/package tests; external users
+     can legally evaluate/use the repository; release builds stay validated.
+
+2. **Fix storage and timeout safety**
+   - Implement SQLite authorize/finalize transaction boundaries, PG acquire/statement/lock
+     timeouts, WAL autocheckpoint policy, and hot-path panic removal.
+   - Acceptance: crash/timeout failure modes are bounded; multi-write ledger updates are atomic;
+     tests cover SQLite and PostgreSQL paths where available.
+
+3. **Bound HTTP, proxy, and replay failure modes**
+   - Add upstream/proxy request timeouts, streaming idle timeout, replay job cap/cleanup, request
+     body limit, and sanitized server errors.
+   - Acceptance: slow or hostile upstreams cannot hang the sidecar indefinitely; replay cannot grow
+     without bound; client-facing 5xx bodies do not leak internal SQL/DB details.
+
+Then continue with:
+
+4. **Add minimal auth and audit actor** (`NOET_API_KEY`, bearer middleware, non-loopback warning,
+   actor propagation).
+5. **Add operability** (request IDs, JSON logs, structured decision events, `/metrics`, richer
+   `/health`).
+6. **Collect integration smoke evidence** (Pi and LiteLLM live smokes; explicit weaker-integration
+   limits).
+7. **Fix SDK correctness and shared contracts** (no 4xx/5xx masking, Python exception narrowing,
+   Rust README/API correctness, API-key support, contract crate if needed).
+8. **Align API and policy truth** (OpenAPI coverage, contract tests, policy/doc mismatches).
+9. **Split architecture after tests stabilize** (`ledger.rs`, dashboard rendering from `cli.rs`,
+   thick server handlers).
+
+The original audit summary follows.
+
 Noether has crossed the line from a working prototype into a coherent governance layer. `main` is materially better than `noether/db-port`: the two most dangerous reliability blockers (the `sqlite_conn()` panic on the Postgres backend and the `HotState` mutex-poison cascade) are gone; the Postgres path is real and benchmarked; a deployment story (systemd units + IAP reverse-proxy guidance + operator runbook) exists where there was none; an `approval_audit` subsystem gives operators something they can point at when asked "who approved what?".
 
 **7 of the 8 original P0 findings are resolved in main.** The single remaining P0-class blocker is the architectural one the team has explicitly chosen to defer: Noether has **no in-process authentication**. The deployment story is "put it behind IAP and trust the front door". That works for a single-tenant company pilot. It does not work for a generic enterprise tool, and it does not work the moment the front door is misconfigured.
@@ -236,7 +360,20 @@ All three SDKs are byte-identical between db-port and main; none have been touch
 
 ## 7. Phased Execution Roadmap
 
-Ten phases, ordered foundations-before-features. Each phase is a self-contained workflow chunk. None breaks existing callers unless flagged. Phases marked **decision required** introduce user-visible behavior or new tech and need explicit sign-off before they run.
+Twelve phases, ordered foundations-before-features. Each phase is a self-contained workflow chunk. None breaks existing callers unless flagged. Phases marked **decision required** introduce user-visible behavior or new tech and need explicit sign-off before they run.
+
+The executive direction in §1 intentionally groups the detailed phases into fewer decision buckets:
+
+| §1 direction bucket | Detailed phases |
+| --- | --- |
+| 1. Claim safety | Phase 1, plus the already-landed release/lifecycle delta noted in §1.1 |
+| 2. Hot-path trust | Phases 2 and 3 |
+| 3. Explicit trust boundary | Phases 4 and 6 |
+| 4. Operability | Phase 5 |
+| 5. Honest integration claims | The smoke-evidence items in Phase 12 |
+| 6. Architecture where confidence needs it | Phase 8 first; larger `ledger.rs`, `cli.rs`, and `server.rs` splits after contract tests |
+| 7. Policy/API contract reality | Phases 9 and 10 |
+| Deferred unless target changes | Phase 11 and the optional/non-pilot parts of Phase 12 |
 
 ### Phase 1 — Foundations: CI, LICENSE, release engineering basics
 
