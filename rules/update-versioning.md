@@ -7,11 +7,12 @@ designing, documenting, or implementing update behavior.
 
 Before `1.0`, Noether uses preview-train versioning rather than strict stable semver:
 
-- `0.0.z` is the auto-updatable preview train.
-- `0.y.0` is a manual train bump for intentional contract/default changes.
+- `0.y.z` is the current preview train.
+- `z` bumps are auto-updatable within the current train.
+- `0.(y+1).0` is a manual train bump for intentional contract/default changes.
 - Majors are effectively reserved until the first stable release.
 
-Auto-update may apply `0.0.z` releases that include:
+Auto-update may apply `0.y.z` patch releases within the current preview train that include:
 
 - bug fixes;
 - critical enforcement, budget, accounting, audit, or security fixes;

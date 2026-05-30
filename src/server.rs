@@ -874,6 +874,7 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     fn with_reloadable_policy(
         fixture_dir: PathBuf,
         upstream: Option<url::Url>,

@@ -130,7 +130,10 @@ fn bench_sqlite_authorize(iterations: usize) -> Result<(), Box<dyn Error>> {
         samples.push(started.elapsed());
     }
 
-    print_summary("sqlite actual BudgetLedger::try_authorize rolling", &samples);
+    print_summary(
+        "sqlite actual BudgetLedger::try_authorize rolling",
+        &samples,
+    );
     remove_sqlite_files(&db_path);
     Ok(())
 }
@@ -538,7 +541,10 @@ async fn bench_postgres_authorize_budget_critical_only(
         let expires_at = (base_time + ChronoDuration::hours(1)).to_rfc3339();
         let started = Instant::now();
         client
-            .execute(&statement, &[&reservation_id, &cost, &created_at, &expires_at])
+            .execute(
+                &statement,
+                &[&reservation_id, &cost, &created_at, &expires_at],
+            )
             .await?;
         samples.push(started.elapsed());
     }
@@ -645,10 +651,9 @@ async fn bench_postgres_prepared_single_statement(
         let decision_id = format!("bench-pg-prepared-decision-{index}");
         let reservation_id = format!("bench-pg-prepared-reservation-{index}");
         let created_at = (base_time + ChronoDuration::milliseconds(index as i64)).to_rfc3339();
-        let expires_at = (base_time
-            + ChronoDuration::milliseconds(index as i64)
-            + ChronoDuration::hours(1))
-        .to_rfc3339();
+        let expires_at =
+            (base_time + ChronoDuration::milliseconds(index as i64) + ChronoDuration::hours(1))
+                .to_rfc3339();
         let subject = format!("user:bench-{}", index % 12);
         let metadata_json = format!(
             r#"{{"trace_id":"{trace_id}","request_id":"{request_id}","agent_run_id":"{agent_run_id}"}}"#
@@ -682,9 +687,7 @@ async fn bench_postgres_prepared_single_statement(
     Ok(())
 }
 
-async fn bench_postgres_finalize_reused_client(
-    config: &BenchConfig,
-) -> Result<(), Box<dyn Error>> {
+async fn bench_postgres_finalize_reused_client(config: &BenchConfig) -> Result<(), Box<dyn Error>> {
     let schema = format!("noether_bench_{}_finalize_reused", std::process::id());
     let (client, connection) = tokio_postgres::connect(&config.database_url, NoTls).await?;
     tokio::spawn(async move {
@@ -917,10 +920,7 @@ async fn setup_postgres_budget_only_schema(
     Ok(())
 }
 
-async fn setup_postgres_minimal_table(
-    client: &Client,
-    schema: &str,
-) -> Result<(), Box<dyn Error>> {
+async fn setup_postgres_minimal_table(client: &Client, schema: &str) -> Result<(), Box<dyn Error>> {
     client
         .batch_execute(&format!(
             r#"
@@ -1028,7 +1028,13 @@ async fn postgres_hot_authorize_like_op(
     client
         .execute(
             &insert_reservation_sql,
-            &[&reservation_id, &decision_id, &cost, &created_at, &expires_at],
+            &[
+                &reservation_id,
+                &decision_id,
+                &cost,
+                &created_at,
+                &expires_at,
+            ],
         )
         .await?;
     let insert_scope_sql = format!(
@@ -1096,10 +1102,9 @@ async fn seed_postgres_finalizable_reservations(
         let decision_id = format!("bench-pg-finalize-decision-{index}");
         let reservation_id = format!("bench-pg-finalize-reservation-{index}");
         let created_at = (base_time + ChronoDuration::milliseconds(index as i64)).to_rfc3339();
-        let expires_at = (base_time
-            + ChronoDuration::milliseconds(index as i64)
-            + ChronoDuration::hours(1))
-        .to_rfc3339();
+        let expires_at =
+            (base_time + ChronoDuration::milliseconds(index as i64) + ChronoDuration::hours(1))
+                .to_rfc3339();
         let subject = format!("user:bench-{}", index % 12);
         let metadata_json = format!(
             r#"{{"trace_id":"{trace_id}","request_id":"{request_id}","agent_run_id":"{agent_run_id}"}}"#
@@ -1377,7 +1382,11 @@ fn redact_database_url(database_url: &str) -> String {
     let Some(scheme) = database_url.find("://") else {
         return database_url.to_owned();
     };
-    format!("{}://<redacted>@{}", &database_url[..scheme], &database_url[at + 1..])
+    format!(
+        "{}://<redacted>@{}",
+        &database_url[..scheme],
+        &database_url[at + 1..]
+    )
 }
 
 fn remove_sqlite_files(path: &std::path::Path) {

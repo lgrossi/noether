@@ -16,3 +16,4 @@ pub mod reporting;
 pub mod scenario;
 pub mod server;
 pub mod simulation;
+pub mod update;

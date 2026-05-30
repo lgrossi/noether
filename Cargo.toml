@@ -3,6 +3,10 @@ name = "noether"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["xtask"]
+resolver = "3"
+
 [[bin]]
 name = "noet"
 path = "src/main.rs"
@@ -23,6 +27,7 @@ rusqlite = { version = "0.39.0", features = ["bundled", "chrono"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
+sha2 = "0.10"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }

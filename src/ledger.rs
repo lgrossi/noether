@@ -756,7 +756,6 @@ struct StoredReservation {
     budget_rule_ids: Vec<String>,
     limit_window_spends: Vec<LimitWindowReservationSpend>,
     allocation_spends: Vec<AllocationReservationSpend>,
-    matched_entity: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1941,7 +1940,6 @@ impl BudgetLedger {
                             scope_key: seed.scope_key,
                         }],
                         allocation_spends: Vec::new(),
-                        matched_entity: None,
                     },
                 );
             }
@@ -3802,7 +3800,7 @@ impl BudgetLedger {
 
     fn budget_rejection_reason(
         &mut self,
-        policy: &PolicyFile,
+        _policy: &PolicyFile,
         rule: &BudgetRule,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
@@ -3885,20 +3883,6 @@ impl BudgetLedger {
             .unwrap_or_default();
         let budget_rule_ids: Vec<String> =
             matching_rules.iter().map(|rule| rule.id.clone()).collect();
-        let matched_entity = selected_budget_id.and_then(|selected_budget_id| {
-            policy
-                .and_then(|policy| {
-                    policy
-                        .budgets
-                        .iter()
-                        .find(|rule| rule.id == selected_budget_id)
-                })
-                .and_then(|rule| {
-                    policy.map(|policy| {
-                        matched_entity_and_rank(rule, request, &specificity_order(policy)).0
-                    })?
-                })
-        });
         let mut allocation_spends = Vec::new();
         let mut limit_window_spends = Vec::new();
         let expires_at = matching_rules
@@ -3963,7 +3947,6 @@ impl BudgetLedger {
                 budget_rule_ids,
                 limit_window_spends,
                 allocation_spends,
-                matched_entity,
             },
         );
         reservation
@@ -4038,7 +4021,6 @@ impl BudgetLedger {
                 budget_rule_ids,
                 limit_window_spends,
                 allocation_spends: Vec::new(),
-                matched_entity: None,
             },
         );
         reservation
@@ -4976,10 +4958,6 @@ impl BudgetLedger {
         Ok(())
     }
 
-    fn load_windows(&mut self) -> Result<(), NoetError> {
-        Ok(())
-    }
-
     fn load_limit_windows(&mut self) -> Result<(), NoetError> {
         if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
@@ -5165,7 +5143,6 @@ impl BudgetLedger {
                                 .unwrap_or_default(),
                             allocation_spends: serde_json::from_str(&allocation_spends_json)
                                 .unwrap_or_default(),
-                            matched_entity: None,
                         },
                     )
                 })
@@ -5210,7 +5187,6 @@ impl BudgetLedger {
                         budget_rule_ids,
                         limit_window_spends,
                         allocation_spends,
-                        matched_entity: None,
                     },
                 ))
             })?
@@ -6019,7 +5995,6 @@ fn stored_reservation_from_async_row(row: &AsyncPostgresRow) -> (String, StoredR
             limit_window_spends: serde_json::from_str(&limit_window_spends_json)
                 .unwrap_or_default(),
             allocation_spends: serde_json::from_str(&allocation_spends_json).unwrap_or_default(),
-            matched_entity: None,
         },
     )
 }
@@ -8054,31 +8029,6 @@ fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -
             .cloned(),
         _ => None,
     }
-}
-
-fn allocation_bucket_available_usd(
-    ledger: &BudgetLedger,
-    rule: &BudgetRule,
-    request: &AuthorizeRequest,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    let entity_key = allocation_bucket_entity_key(rule, request)?;
-    let protected_amount_usd = rule
-        .allocation
-        .as_ref()
-        .and_then(|allocation| allocation.protected_amount_usd)?;
-    let bucket = ledger
-        .allocation_buckets
-        .get(&(rule.id.clone(), entity_key))
-        .cloned()
-        .unwrap_or(AllocationBucketState {
-            started_at: now,
-            protected_amount_usd,
-            current_grant_usd: protected_amount_usd,
-            carryover_usd: 0.0,
-        });
-    let bucket = rolled_allocation_bucket_state(rule, bucket, now)?;
-    Some(bucket.current_grant_usd + bucket.carryover_usd)
 }
 
 fn consume_allocation_bucket(

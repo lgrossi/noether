@@ -30,10 +30,12 @@ use crate::server::{ServeConfig, serve};
 use crate::simulation::{
     SimulationDatabase, SimulationFile, compare_strategies_with_database, validate_simulation,
 };
+use crate::update::{DEFAULT_UPDATE_MANIFEST_URL, apply_update, fetch_update_plan};
 
 #[derive(Parser)]
 #[command(name = "noet")]
 #[command(about = "Noether control sidecar tooling")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -55,6 +57,8 @@ enum Command {
     Scenario(ScenarioCommand),
     /// Compare strategy variants over synthetic demand.
     Simulate(SimulateCommand),
+    /// Check for and apply Noether core binary updates.
+    Update(UpdateCommand),
 }
 
 #[derive(Parser)]
@@ -278,6 +282,38 @@ struct SimulateCommand {
     postgres_profile: String,
 }
 
+#[derive(Parser)]
+struct UpdateCommand {
+    #[command(subcommand)]
+    command: UpdateSubcommand,
+}
+
+#[derive(Subcommand)]
+enum UpdateSubcommand {
+    /// Check the release manifest for an auto-update-eligible version.
+    Check(UpdateCheckArgs),
+    /// Apply an auto-update-eligible release to the current noet binary.
+    Apply(UpdateApplyArgs),
+}
+
+#[derive(Parser)]
+struct UpdateCheckArgs {
+    /// Release manifest URL.
+    #[arg(long, default_value = DEFAULT_UPDATE_MANIFEST_URL)]
+    manifest_url: String,
+}
+
+#[derive(Parser)]
+struct UpdateApplyArgs {
+    /// Release manifest URL.
+    #[arg(long, default_value = DEFAULT_UPDATE_MANIFEST_URL)]
+    manifest_url: String,
+
+    /// Confirm replacing the current noet binary.
+    #[arg(long)]
+    yes: bool,
+}
+
 pub async fn run() -> Result<(), NoetError> {
     let cli = Cli::parse();
 
@@ -318,6 +354,7 @@ pub async fn run() -> Result<(), NoetError> {
         Command::Report(command) => run_report(command).await,
         Command::Scenario(command) => run_scenario(command).await,
         Command::Simulate(command) => run_simulate(command).await,
+        Command::Update(command) => run_update(command).await,
     }
 }
 
@@ -645,6 +682,51 @@ async fn run_simulate(command: SimulateCommand) -> Result<(), NoetError> {
         println!("dashboard\t{}", strategy_dashboard_path.display());
     }
     Ok(())
+}
+
+async fn run_update(command: UpdateCommand) -> Result<(), NoetError> {
+    match command.command {
+        UpdateSubcommand::Check(args) => {
+            let plan = fetch_update_plan(&args.manifest_url).await?;
+            print_update_plan(&plan);
+            Ok(())
+        }
+        UpdateSubcommand::Apply(args) => {
+            let plan = fetch_update_plan(&args.manifest_url).await?;
+            print_update_plan(&plan);
+            if !args.yes {
+                return Err(NoetError::InvalidConfig(
+                    "refusing to replace binary without --yes".to_owned(),
+                ));
+            }
+            let installed_path = apply_update(&plan).await?;
+            println!(
+                "updated noet to {} at {}",
+                plan.latest,
+                installed_path.display()
+            );
+            #[cfg(windows)]
+            println!("windows replacement is scheduled and completes after this process exits");
+            Ok(())
+        }
+    }
+}
+
+fn print_update_plan(plan: &crate::update::UpdatePlan) {
+    println!("current: {}", plan.current);
+    println!("latest: {}", plan.latest);
+    println!("channel: {}", plan.manifest.channel);
+    println!("release_type: {}", plan.manifest.release_type);
+    println!("target: {}", plan.target);
+    println!(
+        "auto_update_eligible: {}",
+        plan.manifest.auto_update_eligible
+    );
+    println!("auto_update_allowed: {}", plan.auto_update_allowed);
+    match plan.artifact.as_ref() {
+        Some(artifact) => println!("artifact: {}", artifact.file),
+        None => println!("artifact: missing"),
+    }
 }
 
 fn simulation_database_from_command(
