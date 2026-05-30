@@ -12,14 +12,15 @@ application platform.
   may call Noether; untrusted clients must not.
 - Blocking central human approvals are not the desired workflow. Approval should be self-driven in
   the harness where possible, then centrally auditable when an override looks unusual.
-- SQLite and single-process operation are the current local/pilot default. Postgres is the
-  team/company storage direction once the storage work lands.
+- SQLite and single-process operation remain the local/pilot default. PostgreSQL is now the
+  team/company storage backend for serverless, multi-instance, and company-operated database
+  deployments.
 
 ## Non-negotiable readiness work
 
 1. **Company pilot deployment kit**
    - Supported single-process command.
-   - Current SQLite path layout plus a storage-neutral boundary for Postgres.
+   - SQLite and PostgreSQL deployment shapes.
    - Validation checklist.
    - Explicit non-goals: built-in auth/RBAC, multi-writer HA, provider routing.
 
@@ -31,8 +32,8 @@ application platform.
 
 3. **Operational runbook**
    - Health checks, backup/restore, retention, logs, hot-path latency, and upgrade notes.
-   - Storage-neutral where possible; current SQLite and future Postgres responsibilities are called
-     out separately.
+   - Storage-neutral where possible; SQLite and PostgreSQL responsibilities are called out
+     separately.
 
 4. **Pi and LiteLLM production smoke documentation**
    - Real installed-tool validation, not only local mocks.
@@ -43,7 +44,8 @@ application platform.
 5. **Audited self-approval and override reporting**
    - Preserve non-blocking user flow.
    - Record override/rejection evidence.
-   - Highlight repeated exceptions, high-cost self-approvals, or discrepant behavior centrally.
+   - Highlight repeated exceptions, high-cost self-approvals, or discrepant behavior centrally
+     through `noet report approval-audit` and `GET /v1/reports/approval-audit`.
 
 6. **Claude Code, Codex, and OpenCode integration gap plan**
    - Be explicit about which integrations are governed, wrapper-gated, or only observed.

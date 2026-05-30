@@ -1,7 +1,7 @@
 # Operations runbook
 
-This runbook is storage-neutral where possible. SQLite is the current local/pilot backend; Postgres
-is the team/company storage direction once the backend lands.
+This runbook is storage-neutral where possible. SQLite is the local/pilot default. PostgreSQL is the
+team/company backend for serverless, multi-instance, and company-operated database deployments.
 
 ## Health checks
 
@@ -51,7 +51,7 @@ Back up:
 Restore by stopping `noet serve`, restoring the files, then starting Noether and checking `/health`,
 `/runs`, and `/v1/reports/usage`.
 
-### Future Postgres backend
+### PostgreSQL backend
 
 Back up through the company Postgres backup mechanism. Keep policy files and local artifact paths in
 the Noether host backup set because not all artifacts necessarily belong in the database.
@@ -102,4 +102,3 @@ After upgrade:
 
 Storage-specific migrations belong to the selected backend adapter. Company-readiness report/domain
 logic should remain storage-neutral.
-

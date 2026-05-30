@@ -232,6 +232,8 @@ enum ReportSubcommand {
         #[arg(long)]
         trace: Option<String>,
     },
+    /// Summarize self-approval overrides and audit signals.
+    ApprovalAudit,
     /// Write a self-contained visual HTML dashboard.
     Dashboard {
         /// Output HTML path.
@@ -514,6 +516,16 @@ async fn run_report(command: ReportCommand) -> Result<(), NoetError> {
                 reporting::observations_report(&ledger, kind.as_deref(), trace.as_deref())?,
                 command.json,
             )?;
+        }
+        ReportSubcommand::ApprovalAudit => {
+            let report = reporting::approval_audit_report(&ledger)?;
+            if command.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for line in render_approval_audit_report_lines(&report) {
+                    println!("{line}");
+                }
+            }
         }
         ReportSubcommand::Dashboard { out, trace } => {
             let report = reporting::dashboard_report(&ledger, trace.as_deref())?;
@@ -1406,6 +1418,48 @@ fn render_items_lines(items: &[crate::ledger::TraceReportItem]) -> Vec<String> {
 fn render_trace_report_lines(report: &TraceReport) -> Vec<String> {
     let mut lines = vec![format!("trace\t{}", report.trace_id)];
     lines.extend(render_items_lines(&report.items));
+    lines
+}
+
+fn render_approval_audit_report_lines(
+    report: &crate::approval_audit::ApprovalAuditReport,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("approval_overrides\t{}", report.summary.total),
+        format!("approved\t{}", report.summary.approved),
+        format!("rejected\t{}", report.summary.rejected),
+        format!("high_risk\t{}", report.summary.high_risk),
+        format!(
+            "repeated_subject_rule_approvals\t{}",
+            report.summary.repeated_subject_rule_approvals
+        ),
+        format!(
+            "missing_attribution\t{}",
+            report.summary.missing_attribution
+        ),
+        "occurred_at\toutcome\tsubject\tproject\trule\ttrace\tflags".to_owned(),
+    ];
+    for item in &report.items {
+        let flags = if item.risk_flags.is_empty() {
+            "none".to_owned()
+        } else {
+            item.risk_flags
+                .iter()
+                .map(|flag| format!("{flag:?}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        lines.push(format!(
+            "{}\t{:?}\t{}\t{}\t{}\t{}\t{}",
+            item.occurred_at,
+            item.outcome,
+            item.subject.as_deref().unwrap_or("-"),
+            item.project.as_deref().unwrap_or("-"),
+            item.rule_id.as_deref().unwrap_or("-"),
+            item.trace_id.as_deref().unwrap_or("-"),
+            flags
+        ));
+    }
     lines
 }
 

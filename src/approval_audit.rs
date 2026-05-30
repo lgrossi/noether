@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::contract::TraceEvent;
+use crate::error::NoetError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,7 +95,7 @@ impl Default for ApprovalAuditConfig {
 }
 
 pub trait ApprovalAuditStore {
-    fn approval_audit_events(&self) -> Vec<ApprovalAuditEvent>;
+    fn approval_audit_events(&self) -> Result<Vec<ApprovalAuditEvent>, NoetError>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,16 +119,25 @@ impl InMemoryApprovalAuditStore {
 }
 
 impl ApprovalAuditStore for InMemoryApprovalAuditStore {
-    fn approval_audit_events(&self) -> Vec<ApprovalAuditEvent> {
-        self.events.clone()
+    fn approval_audit_events(&self) -> Result<Vec<ApprovalAuditEvent>, NoetError> {
+        Ok(self.events.clone())
     }
 }
 
 pub fn approval_audit_report(
     store: &impl ApprovalAuditStore,
     config: ApprovalAuditConfig,
+) -> Result<ApprovalAuditReport, NoetError> {
+    Ok(approval_audit_report_from_events(
+        store.approval_audit_events()?,
+        config,
+    ))
+}
+
+pub fn approval_audit_report_from_events(
+    mut items: Vec<ApprovalAuditEvent>,
+    config: ApprovalAuditConfig,
 ) -> ApprovalAuditReport {
-    let mut items = store.approval_audit_events();
     let repeated_keys = repeated_approval_keys(&items, config.repeated_approval_threshold);
     for item in &mut items {
         item.risk_flags = risk_flags(item, &repeated_keys, config);
@@ -457,7 +467,7 @@ mod tests {
         ];
         let store = InMemoryApprovalAuditStore::new(events);
 
-        let report = approval_audit_report(&store, ApprovalAuditConfig::default());
+        let report = approval_audit_report(&store, ApprovalAuditConfig::default()).expect("report");
 
         assert_eq!(report.summary.total, 5);
         assert_eq!(report.summary.approved, 4);
@@ -498,7 +508,7 @@ mod tests {
         ];
 
         let store = InMemoryApprovalAuditStore::from_trace_events(&trace_events);
-        let report = approval_audit_report(&store, ApprovalAuditConfig::default());
+        let report = approval_audit_report(&store, ApprovalAuditConfig::default()).expect("report");
 
         assert_eq!(report.summary.total, 1);
         assert_eq!(report.items[0].trace_id.as_deref(), Some("trace-1"));

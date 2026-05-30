@@ -12,6 +12,7 @@ GET /v1/reports/usage
 GET /v1/reports/decisions
 GET /v1/reports/traces/{trace_id}
 GET /v1/reports/observations?kind=<prefix>&trace=<trace_id>
+GET /v1/reports/approval-audit
 GET /v1/reports/dashboard?trace=<trace_id>
 GET /v1/reports/dashboard-data?trace=<trace_id>
 GET /v1/reports/updates
@@ -99,6 +100,27 @@ Mirror the current CLI output shapes exactly:
 Trace exports are the review surface for one run's decision, usage, tool, lifecycle, and
 observation story. Observation exports remain a filtered event stream rather than a wrapped trace
 document.
+
+## Approval audit report shape
+
+`report approval-audit --json` and `GET /v1/reports/approval-audit` return:
+
+- `summary.total`
+- `summary.approved`
+- `summary.rejected`
+- `summary.high_risk`
+- `summary.repeated_subject_rule_approvals`
+- `summary.missing_attribution`
+- `items[]` with:
+  - `occurred_at`
+  - `outcome` (`approved` or `rejected`)
+  - optional `trace_id`, `request_id`, `agent_run_id`, `decision_id`, and `reservation_id`
+  - optional `subject`, `project`, and `rule_id`
+  - optional `original_action`, `decision_reason`, estimated/actual cost, integration metadata
+  - `risk_flags[]`
+
+The report is derived from normalized approval events and existing Pi `pi.authorize` events that
+carry `user_approval`. It reads through the configured ledger backend, SQLite or PostgreSQL.
 
 ## Simulation artifact surface
 

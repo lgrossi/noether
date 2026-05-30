@@ -5,8 +5,8 @@ Local mocks and unit tests are useful, but they are not enough for the readiness
 
 ## Shared setup
 
-Run Noether behind the company boundary using the company-pilot deployment shape. The current command
-uses SQLite; replace the storage flags with the active backend once Postgres support lands:
+Run Noether behind the company boundary using the company-pilot deployment shape. This example uses
+SQLite; use `--database-url`/`NOET_DATABASE_URL` for PostgreSQL deployments:
 
 ```bash
 noet serve \
@@ -26,8 +26,8 @@ Before testing:
   retention risk;
 - record the exact Noether commit, integration package version, tool version, policy file, and
   decision mode;
-- record the active storage backend. For SQLite pilots, include the database path. For future
-  Postgres pilots, include the DSN identity without secrets.
+- record the active storage backend. For SQLite pilots, include the database path. For PostgreSQL
+  pilots, include the DSN identity without secrets.
 
 ## Pi smoke
 
