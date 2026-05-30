@@ -2056,7 +2056,17 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 	}
 
 	async function ensureNoetherSession(ctx: ExtensionContext): Promise<void> {
-		await ensureNoetherReady(ctx);
+		try {
+			await ensureNoetherReady(ctx);
+		} catch (error) {
+			if (config.failMode === "fail_closed") {
+				throw error;
+			}
+			console.warn(
+				`[noether-pi] Could not auto-start local Noether. Continuing because failMode=fail_open. ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
 		if (!config.autoStartLocal || !isDefaultLocalNoetherUrl(config.noetherUrl)) {
 			return;
 		}

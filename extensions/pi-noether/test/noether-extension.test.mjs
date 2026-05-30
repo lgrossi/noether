@@ -441,6 +441,41 @@ function deferred() {
 }
 
 {
+	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-fail-open-"));
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) {
+			return new Response("down", { status: 503 });
+		}
+		return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		const handlers = new Map();
+		extension.default(
+			{ on(event, handler) { handlers.set(event, handler); } },
+			{
+				noetherUrl: "http://127.0.0.1:4051",
+				failMode: "fail_open",
+				includeBody: false,
+				version: "test",
+				autoStartLocal: true,
+				localRoot,
+				localStartTimeoutMs: 10,
+				startLocalNoether: async () => {
+					throw new Error("missing noet binary");
+				},
+			},
+		);
+
+		await handlers.get("session_start")({ reason: "startup" }, fakeContext({ cwd: localRoot }));
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(localRoot, { recursive: true, force: true });
+	}
+}
+
+{
 	const calls = [];
 	let healthy = false;
 	let starts = 0;

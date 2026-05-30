@@ -89,6 +89,7 @@ It assumes:
 - policy lives at `/etc/noet/policy.yaml`;
 - SQLite durable state lives under `/var/lib/noet`, or PostgreSQL state lives in the configured
   database;
+- systemd creates `/var/lib/noet` for the `noet` service user through `StateDirectory=noet`;
 - an external proxy or private network controls access.
 
 ## Sensitive route inventory

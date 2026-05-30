@@ -170,7 +170,28 @@ pub async fn write_local_sidecar_owner(
 
 pub async fn read_local_sidecar_owner(root: &Path) -> Result<Option<LocalSidecarOwner>, NoetError> {
     let layout = local_runtime_layout_for_read(root).await?;
-    match fs::read(&layout.owner_path).await {
+    if let Some(owner) = read_local_sidecar_owner_at(&layout.owner_path).await? {
+        return Ok(Some(owner));
+    }
+    let legacy = LocalRuntimeLayout::legacy_for_root(root);
+    if legacy.owner_path != layout.owner_path {
+        return read_local_sidecar_owner_at(&legacy.owner_path).await;
+    }
+    Ok(None)
+}
+
+pub async fn clear_local_sidecar_owner(root: &Path) -> Result<(), NoetError> {
+    let layout = local_runtime_layout_for_read(root).await?;
+    remove_owner_file(&layout.owner_path).await?;
+    let legacy = LocalRuntimeLayout::legacy_for_root(root);
+    if legacy.owner_path != layout.owner_path {
+        remove_owner_file(&legacy.owner_path).await?;
+    }
+    Ok(())
+}
+
+async fn read_local_sidecar_owner_at(path: &Path) -> Result<Option<LocalSidecarOwner>, NoetError> {
+    match fs::read(path).await {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(NoetError::from),
@@ -179,9 +200,8 @@ pub async fn read_local_sidecar_owner(root: &Path) -> Result<Option<LocalSidecar
     }
 }
 
-pub async fn clear_local_sidecar_owner(root: &Path) -> Result<(), NoetError> {
-    let layout = local_runtime_layout_for_read(root).await?;
-    match fs::remove_file(&layout.owner_path).await {
+async fn remove_owner_file(path: &Path) -> Result<(), NoetError> {
+    match fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -260,6 +280,32 @@ mod tests {
             .expect("owner present");
 
         assert_eq!(owner.pid, 123);
+    }
+
+    #[tokio::test]
+    async fn read_local_sidecar_owner_falls_back_to_legacy_owner_when_noet_exists() {
+        let tempdir = tempdir().expect("tempdir");
+        let layout = LocalRuntimeLayout::for_root(tempdir.path());
+        fs::create_dir_all(&layout.sidecar_dir)
+            .await
+            .expect("create new sidecar dir");
+        let legacy = LocalRuntimeLayout::legacy_for_root(tempdir.path());
+        fs::create_dir_all(&legacy.sidecar_dir)
+            .await
+            .expect("create legacy sidecar dir");
+        fs::write(
+            &legacy.owner_path,
+            br#"{"state":"running","pid":456,"cwd":"/tmp","bind":"127.0.0.1:4051","url":"http://127.0.0.1:4051","started_at":"2026-05-30T00:00:00Z"}"#,
+        )
+        .await
+        .expect("write legacy owner");
+
+        let owner = read_local_sidecar_owner(tempdir.path())
+            .await
+            .expect("read owner")
+            .expect("owner present");
+
+        assert_eq!(owner.pid, 456);
     }
 
     #[tokio::test]

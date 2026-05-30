@@ -618,6 +618,18 @@ async fn run_down(args: DownArgs) -> Result<(), NoetError> {
     let root = resolve_noet_root(args.root);
     match read_local_sidecar_owner(&root).await? {
         Some(owner) => {
+            if !process_exists(owner.pid) {
+                clear_local_sidecar_owner(&root).await?;
+                println!("state\tstopped");
+                println!("stale_pid\t{}", owner.pid);
+                return Ok(());
+            }
+            if !process_looks_like_noet(owner.pid) {
+                return Err(NoetError::InvalidConfig(format!(
+                    "refusing to stop pid {}; owner file is stale or does not point to noet",
+                    owner.pid
+                )));
+            }
             stop_process(owner.pid)?;
             clear_local_sidecar_owner(&root).await?;
             println!("state\tstopped");
@@ -1034,6 +1046,44 @@ fn stop_process(pid: u32) -> Result<(), NoetError> {
         Err(NoetError::InvalidConfig(format!(
             "failed to stop noet process {pid}"
         )))
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn process_looks_like_noet(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .map(|name| name == "noet" || name == "noet.exe")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
 
