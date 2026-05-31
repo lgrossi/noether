@@ -2,6 +2,7 @@
 name = "noether"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 [workspace]
 members = ["xtask"]
@@ -32,7 +33,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tower = "0.5.2"
-tower-http = { version = "0.6.10", features = ["trace"] }
+tower-http = { version = "0.6.10", features = ["limit", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio-postgres = "0.7"
@@ -42,3 +43,7 @@ open = "5.3"
 
 [dev-dependencies]
 tempfile = "3.25.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

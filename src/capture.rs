@@ -25,6 +25,7 @@ use crate::redaction::{redact_headers, redact_reqwest_headers};
 use crate::server::AppState;
 
 const MAX_CAPTURED_STREAM_CHUNKS: usize = 128;
+const UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: u64 = 60;
 
 struct ForwardContext {
     trace_id: String,
@@ -234,7 +235,27 @@ fn stream_upstream_response(
         let mut capture = StreamCapture::default();
         let mut error = None;
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let Some(item) = (match tokio::time::timeout(
+                std::time::Duration::from_secs(UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(item) => item,
+                Err(_) => {
+                    let message = format!(
+                        "upstream stream timed out after {UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS}s without a chunk"
+                    );
+                    error = Some(message.clone());
+                    let _ = sender
+                        .send(Err(io::Error::new(io::ErrorKind::TimedOut, message)))
+                        .await;
+                    break;
+                }
+            }) else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     capture.record_chunk(&bytes);

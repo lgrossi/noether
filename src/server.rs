@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -541,6 +542,11 @@ fn default_app_runs_limit() -> usize {
 const APP_REPLAY_HISTORY_WINDOW_DAYS: i64 = 30;
 const APP_REPLAY_PREVIEW_REQUEST_CAP: usize = 5_000;
 const APP_REPLAY_CHANGED_RUNS_CAP: usize = 100;
+const APP_REPLAY_MAX_JOBS: usize = 8;
+const APP_REPLAY_JOB_RETENTION_MINUTES: i64 = 30;
+const APP_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AppRunUsage {
@@ -865,7 +871,11 @@ impl AppState {
             policy_proposal_path: PathBuf::from(".noet/policy.proposed.yaml"),
             upstream,
             routes: Vec::new(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECONDS))
+                .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECONDS))
+                .build()
+                .expect("valid upstream HTTP client"),
             policy,
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
@@ -1113,6 +1123,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", any(capture))
         .route("/health", any(health))
         .fallback(any(capture))
+        .layer(RequestBodyLimitLayer::new(APP_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1637,6 +1648,17 @@ async fn start_app_replay_job(
     let created_at = chrono::Utc::now();
     {
         let mut jobs = state.replay_jobs.lock().await;
+        prune_replay_jobs(&mut jobs, created_at);
+        if jobs.values().any(|job| job.status == "running") {
+            return Err(NoetError::TooManyRequests(
+                "a full replay job is already running".to_owned(),
+            ));
+        }
+        if jobs.len() >= APP_REPLAY_MAX_JOBS {
+            return Err(NoetError::TooManyRequests(format!(
+                "at most {APP_REPLAY_MAX_JOBS} replay jobs are retained"
+            )));
+        }
         jobs.insert(
             id.clone(),
             AppReplayJob {
@@ -1675,6 +1697,20 @@ async fn start_app_replay_job(
         .expect("job was inserted before response")
         .clone();
     Ok(Json(app_replay_job_response(id, job)))
+}
+
+fn prune_replay_jobs(
+    jobs: &mut BTreeMap<String, AppReplayJob>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let retention = chrono::Duration::minutes(APP_REPLAY_JOB_RETENTION_MINUTES);
+    jobs.retain(|_, job| {
+        job.status == "running"
+            || job
+                .completed_at
+                .map(|completed_at| now - completed_at < retention)
+                .unwrap_or(true)
+    });
 }
 
 async fn app_replay_job(
