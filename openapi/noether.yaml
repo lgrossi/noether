@@ -367,7 +367,7 @@ components:
           additionalProperties: true
     HealthResponse:
       type: object
-      required: [status, decision_mode, policy_loaded, upstream_configured, route_count]
+      required: [status, decision_mode, policy_loaded, upstream_configured, route_count, ledger_backend, build_version]
       properties:
         status:
           type: string
@@ -382,6 +382,17 @@ components:
         route_count:
           type: integer
           minimum: 0
+        ledger_backend:
+          type: string
+          enum: [sqlite, postgres]
+        postgres_async_finalize_failures:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: "Count of failed PG-async finalize attempts; null when not running on Postgres."
+        build_version:
+          type: string
+          description: "CARGO_PKG_VERSION baked into the binary at build time. Example: '0.1.0'."
     ErrorResponse:
       type: object
       required: [error]

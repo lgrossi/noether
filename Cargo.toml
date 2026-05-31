@@ -2,6 +2,12 @@
 name = "noether"
 version = "0.1.0"
 edition = "2024"
+license = "BUSL-1.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [workspace]
 members = ["xtask"]

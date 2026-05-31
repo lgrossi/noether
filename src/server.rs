@@ -418,6 +418,7 @@ struct HealthResponse {
     route_count: usize,
     ledger_backend: &'static str,
     postgres_async_finalize_failures: Option<u64>,
+    build_version: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1126,6 +1127,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         route_count: state.routes.len(),
         ledger_backend: state.ledger_backend_name(),
         postgres_async_finalize_failures: state.postgres_async_finalize_failures(),
+        build_version: env!("CARGO_PKG_VERSION"),
     })
 }
 
@@ -1455,7 +1457,7 @@ async fn app_runs(
                     next_offset,
                 }));
             }
-            let decisions = reporting::decisions_report(&ledger)?;
+            let decisions = reporting::decisions_report(ledger)?;
             let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
             let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
             let totals = app_run_totals_from_rows(&all_runs);

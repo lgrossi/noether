@@ -727,4 +727,9 @@ Noether is local-first and privacy-secure by default:
 
 ## License
 
-License is not finalized yet.
+Noether is distributed under the
+[Business Source License 1.1](LICENSE).
+Internal organizational use is permitted under the Additional Use Grant
+in the LICENSE file.
+On 2030-05-30 the license converts to Apache License, Version 2.0.
+For any other production use, contact the licensor for a commercial license.
