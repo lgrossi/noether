@@ -1872,6 +1872,7 @@ fn evaluate_scenario_assertions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_scenario_assertion(
     assertion: &ScenarioAssertion,
     default_request_id: Option<&str>,
@@ -2973,10 +2974,8 @@ fn run_story(
             top_row.model.as_deref().unwrap_or("unknown model")
         ));
     }
-    if let Some(item) = latest_decision {
-        if let Some(detail) = decision_supporting_line(item) {
-            points.push(detail);
-        }
+    if let Some(item) = latest_decision && let Some(detail) = decision_supporting_line(item) {
+        points.push(detail);
     }
     if stats.warn > 0 {
         points.push(format!(
@@ -2984,14 +2983,12 @@ fn run_story(
             stats.warn
         ));
     }
-    if let Some(adoption) = &usage.protected_adoption {
-        if adoption.unused_protected_opportunity_usd > 0.0 {
-            points.push(format!(
-                "{} of protected opportunity is still available across {} low adopters.",
-                format_money(adoption.unused_protected_opportunity_usd),
-                adoption.low_adopters.len()
-            ));
-        }
+    if let Some(adoption) = &usage.protected_adoption && adoption.unused_protected_opportunity_usd > 0.0 {
+        points.push(format!(
+            "{} of protected opportunity is still available across {} low adopters.",
+            format_money(adoption.unused_protected_opportunity_usd),
+            adoption.low_adopters.len()
+        ));
     }
     let tool_events = activity
         .iter()
@@ -4086,24 +4083,22 @@ fn decision_supporting_line(item: &TraceReportItem) -> Option<String> {
         return Some(line);
     }
 
-    if item.kind.ends_with(".deny") {
-        if let Some(reason) = decision_rejected_reason(item) {
-            let mut line = match decision_rejected_budget(item) {
-                Some(budget) => format!("Budget {budget} rejected the request: {reason}."),
-                None => format!("Noether blocked the request: {reason}."),
-            };
-            if let Some(remaining) = item
-                .routing
-                .as_ref()
-                .and_then(|routing| routing.budget_window_remaining_usd)
-            {
-                line.push_str(&format!(
-                    " Recorded budget-window remaining at evaluation time: {}.",
-                    format_money(remaining)
-                ));
-            }
-            return Some(line);
+    if item.kind.ends_with(".deny") && let Some(reason) = decision_rejected_reason(item) {
+        let mut line = match decision_rejected_budget(item) {
+            Some(budget) => format!("Budget {budget} rejected the request: {reason}."),
+            None => format!("Noether blocked the request: {reason}."),
+        };
+        if let Some(remaining) = item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.budget_window_remaining_usd)
+        {
+            line.push_str(&format!(
+                " Recorded budget-window remaining at evaluation time: {}.",
+                format_money(remaining)
+            ));
         }
+        return Some(line);
     }
 
     item.routing.as_ref().map(|routing| {

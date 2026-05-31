@@ -264,7 +264,7 @@ fn authorize_request(index: usize) -> AuthorizeRequest {
         subject: Some(format!("user:bench-{}", index % 12)),
         project: Some("noether".to_owned()),
         provider: Some("openai-codex".to_owned()),
-        model: Some(if index % 7 == 0 {
+        model: Some(if index.is_multiple_of(7) {
             "gpt-large-bench".to_owned()
         } else {
             "gpt-small-bench".to_owned()
@@ -283,7 +283,7 @@ fn finalize_payload(index: usize) -> FinalizeReservation {
         outcome: Default::default(),
         usage: Some(UsageObservation {
             provider: Some("openai-codex".to_owned()),
-            model: Some(if index % 7 == 0 {
+            model: Some(if index.is_multiple_of(7) {
                 "gpt-large-bench".to_owned()
             } else {
                 "gpt-small-bench".to_owned()

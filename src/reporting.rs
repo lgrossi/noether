@@ -365,9 +365,9 @@ mod tests {
         assert_eq!(report.summary.usage.total_tokens, 1_770);
         assert_eq!(report.summary.decisions.allow, 2);
         assert_eq!(report.summary.activity.skill_context, 1);
-        assert_eq!(report.summary.sections.policy, true);
-        assert_eq!(report.summary.sections.spend, true);
-        assert_eq!(report.summary.sections.evidence, true);
+        assert!(report.summary.sections.policy);
+        assert!(report.summary.sections.spend);
+        assert!(report.summary.sections.evidence);
     }
 
     #[test]
