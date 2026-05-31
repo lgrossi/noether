@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -19,3 +25,81 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --locked --release --bin noet
+
+  postgres:
+    name: postgres parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: noether_test
+          POSTGRES_USER: noether
+          POSTGRES_PASSWORD: noether
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U noether -d noether_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NOET_TEST_POSTGRES_URL: postgres://noether:noether@localhost:5432/noether_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run PostgreSQL ignored tests
+        run: cargo test --locked -- --ignored
+
+  node:
+    name: node packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - extensions/pi-noether
+          - sdk/typescript
+          - integrations/codex
+          - integrations/claude-code
+          - integrations/opencode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        working-directory: ${{ matrix.package }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+      - name: Run package tests
+        working-directory: ${{ matrix.package }}
+        run: npm test
+
+  integration-probes:
+    name: integration probe fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate checked-in integration probe claims
+        run: |
+          set -euo pipefail
+          for file in examples/integration-probes/*.json; do
+            jq -e '.integration and .target_posture and .probe_mode and .honest_claim and (.next_evidence_needed | type == "array")' "$file" >/dev/null
+          done
+
+  dependency-audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit

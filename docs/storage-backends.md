@@ -49,6 +49,9 @@ behavior.
 | Async finalize | `--postgres-async-finalize` / `NOET_POSTGRES_ASYNC_FINALIZE` | `false` | Returns finalize responses after in-memory finalization and queues PostgreSQL persistence. Authorization remains synchronous. |
 | Finalize queue capacity | `--postgres-finalize-queue-capacity` / `NOET_POSTGRES_FINALIZE_QUEUE_CAPACITY` | `1024` | If the queue is full or closed, finalize falls back to synchronous persistence. |
 | Synchronous commit | `--postgres-synchronous-commit` / `NOET_POSTGRES_SYNCHRONOUS_COMMIT` | database default | Accepts `on`, `off`, `local`, `remote_write`, or `remote_apply`; `off` can reduce tail latency but can lose the latest commits on database crash. |
+| Statement timeout | `NOET_POSTGRES_STATEMENT_TIMEOUT_MS` | `30000` | Bounds individual PostgreSQL statements, including time spent waiting on the serialized ledger advisory lock. |
+| Idle transaction timeout | `NOET_POSTGRES_IDLE_TX_TIMEOUT_MS` | `30000` | Bounds sessions left idle inside a PostgreSQL transaction. |
+| Lock timeout | `NOET_POSTGRES_LOCK_TIMEOUT_MS` | `0` | Disabled by default so legitimate serialized ledger writes can wait for the active writer; set only when deployment needs a shorter lock-wait fail-fast policy. |
 | Stage timing | `--postgres-stage-timing` / `NOET_POSTGRES_STAGE_TIMING` | `false` | Emits debug logs for in-memory and database stages. |
 
 Use `strict` for audit-grade budget enforcement. Use `performance` only when the

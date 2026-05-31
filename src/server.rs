@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -541,6 +542,25 @@ fn default_app_runs_limit() -> usize {
 const APP_REPLAY_HISTORY_WINDOW_DAYS: i64 = 30;
 const APP_REPLAY_PREVIEW_REQUEST_CAP: usize = 5_000;
 const APP_REPLAY_CHANGED_RUNS_CAP: usize = 100;
+const APP_REPLAY_MAX_JOBS: usize = 8;
+const APP_REPLAY_JOB_RETENTION_MINUTES: i64 = 30;
+const DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+
+fn app_request_body_limit_bytes() -> usize {
+    parse_app_request_body_limit_bytes(
+        std::env::var("NOET_REQUEST_BODY_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_app_request_body_limit_bytes(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AppRunUsage {
@@ -865,7 +885,10 @@ impl AppState {
             policy_proposal_path: PathBuf::from(".noet/policy.proposed.yaml"),
             upstream,
             routes: Vec::new(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECONDS))
+                .build()
+                .expect("valid upstream HTTP client"),
             policy,
             decision_mode,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
@@ -1044,6 +1067,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let request_body_limit = app_request_body_limit_bytes();
     Router::new()
         .route("/v1/authorize", post(authorize))
         .route("/v1/reservations/{id}/finalize", post(finalize_reservation))
@@ -1113,6 +1137,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", any(capture))
         .route("/health", any(health))
         .fallback(any(capture))
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(RequestBodyLimitLayer::new(request_body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1637,6 +1663,17 @@ async fn start_app_replay_job(
     let created_at = chrono::Utc::now();
     {
         let mut jobs = state.replay_jobs.lock().await;
+        prune_replay_jobs(&mut jobs, created_at);
+        if jobs.values().any(|job| job.status == "running") {
+            return Err(NoetError::TooManyRequests(
+                "a full replay job is already running".to_owned(),
+            ));
+        }
+        if jobs.len() >= APP_REPLAY_MAX_JOBS {
+            return Err(NoetError::TooManyRequests(format!(
+                "at most {APP_REPLAY_MAX_JOBS} replay jobs are retained"
+            )));
+        }
         jobs.insert(
             id.clone(),
             AppReplayJob {
@@ -1675,6 +1712,20 @@ async fn start_app_replay_job(
         .expect("job was inserted before response")
         .clone();
     Ok(Json(app_replay_job_response(id, job)))
+}
+
+fn prune_replay_jobs(
+    jobs: &mut BTreeMap<String, AppReplayJob>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let retention = chrono::Duration::minutes(APP_REPLAY_JOB_RETENTION_MINUTES);
+    jobs.retain(|_, job| {
+        job.status == "running"
+            || job
+                .completed_at
+                .map(|completed_at| now - completed_at < retention)
+                .unwrap_or(true)
+    });
 }
 
 async fn app_replay_job(
@@ -3219,6 +3270,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_body_limit_defaults_to_large_llm_payload_cap_and_accepts_env_override() {
+        assert_eq!(
+            parse_app_request_body_limit_bytes(None),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("2097152")),
+            2_097_152
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("0")),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("not-a-number")),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
+    }
+
     fn report_request(
         trace_id: &str,
         request_id: &str,
@@ -3772,6 +3843,29 @@ mod tests {
                 panic!("expected captured JSON")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn capture_accepts_body_above_axum_default_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let app = build_router(state_with_dir(
+            tempdir.path().join("fixtures"),
+            None,
+            DecisionMode::DryRun,
+        ));
+        let body = vec![b'a'; 3 * 1024 * 1024];
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

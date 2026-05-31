@@ -198,6 +198,8 @@ async fn fetch_github_release_manifest(selector: &str) -> Result<ReleaseManifest
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("noet/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("valid update HTTP client")
 }

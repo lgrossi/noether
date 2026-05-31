@@ -1066,6 +1066,7 @@ pub struct AsyncPostgresLedger {
     finalize_tx: Option<mpsc::Sender<AsyncFinalizeWrite>>,
     pending_async_finalizations: Arc<tokio::sync::Mutex<HashSet<String>>>,
     async_finalize_failures: Arc<AtomicU64>,
+    options: AsyncPostgresLedgerOptions,
     stage_timing: bool,
 }
 
@@ -1085,9 +1086,36 @@ struct AsyncPostgresPool {
 }
 
 impl AsyncPostgresPool {
-    fn connection(&self) -> Arc<tokio::sync::Mutex<AsyncPostgresConnection>> {
+    async fn lock_connection(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, AsyncPostgresConnection>, NoetError> {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
-        self.connections[index].clone()
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            self.lock_any_connection(index),
+        )
+        .await
+        .map_err(|_| {
+            NoetError::GatewayTimeout(format!(
+                "postgres connection acquisition exceeded {timeout_ms}ms"
+            ))
+        })
+    }
+
+    async fn lock_any_connection(
+        &self,
+        start_index: usize,
+    ) -> tokio::sync::MutexGuard<'_, AsyncPostgresConnection> {
+        loop {
+            for offset in 0..self.connections.len() {
+                let index = (start_index + offset) % self.connections.len();
+                if let Ok(connection) = self.connections[index].try_lock() {
+                    return connection;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 }
 
@@ -1097,6 +1125,10 @@ pub struct AsyncPostgresLedgerOptions {
     pub async_finalize: bool,
     pub finalize_queue_capacity: usize,
     pub synchronous_commit: Option<String>,
+    pub acquire_timeout_ms: u64,
+    pub statement_timeout_ms: u64,
+    pub idle_transaction_timeout_ms: u64,
+    pub lock_timeout_ms: u64,
     pub stage_timing: bool,
 }
 
@@ -1128,6 +1160,22 @@ impl Default for AsyncPostgresLedgerOptions {
         {
             options.synchronous_commit = Some(synchronous_commit);
         }
+        if let Some(acquire_timeout_ms) = parse_env_u64_option("NOET_POSTGRES_ACQUIRE_TIMEOUT_MS") {
+            options.acquire_timeout_ms = acquire_timeout_ms.max(1);
+        }
+        if let Some(statement_timeout_ms) =
+            parse_env_u64_option("NOET_POSTGRES_STATEMENT_TIMEOUT_MS")
+        {
+            options.statement_timeout_ms = statement_timeout_ms;
+        }
+        if let Some(idle_transaction_timeout_ms) =
+            parse_env_u64_option("NOET_POSTGRES_IDLE_TX_TIMEOUT_MS")
+        {
+            options.idle_transaction_timeout_ms = idle_transaction_timeout_ms;
+        }
+        if let Some(lock_timeout_ms) = parse_env_u64_option("NOET_POSTGRES_LOCK_TIMEOUT_MS") {
+            options.lock_timeout_ms = lock_timeout_ms;
+        }
         if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING") {
             options.stage_timing = stage_timing;
         }
@@ -1142,6 +1190,10 @@ impl AsyncPostgresLedgerOptions {
             async_finalize: false,
             finalize_queue_capacity: 1024,
             synchronous_commit: None,
+            acquire_timeout_ms: 5_000,
+            statement_timeout_ms: 30_000,
+            idle_transaction_timeout_ms: 30_000,
+            lock_timeout_ms: 0,
             stage_timing: false,
         }
     }
@@ -1285,6 +1337,32 @@ fn parse_env_bool_option(name: &str) -> Option<bool> {
     })
 }
 
+fn parse_env_u64_option(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn sqlite_wal_autocheckpoint() -> u64 {
+    parse_env_u64_option("NOET_SQLITE_WAL_AUTOCHECKPOINT").unwrap_or(1_000)
+}
+
+fn finish_sqlite_transaction<T>(
+    conn: &Connection,
+    result: Result<T, NoetError>,
+) -> Result<T, NoetError> {
+    match result {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 async fn prepare_async_postgres_statements(
     client: &AsyncPostgresClient,
 ) -> Result<AsyncPostgresStatements, NoetError> {
@@ -1300,13 +1378,41 @@ async fn apply_postgres_connection_options(
     client: &AsyncPostgresClient,
     options: &AsyncPostgresLedgerOptions,
 ) -> Result<(), NoetError> {
+    let mut statements = Vec::new();
     if let Some(value) = options.synchronous_commit.as_deref() {
         let value = normalized_synchronous_commit(value)?;
-        client
-            .batch_execute(&format!("SET synchronous_commit TO {value}"))
-            .await?;
+        statements.push(format!("SET synchronous_commit TO {value};"));
     }
+    statements.push(format!(
+        "SET statement_timeout TO '{}ms';",
+        options.statement_timeout_ms
+    ));
+    statements.push(format!(
+        "SET idle_in_transaction_session_timeout TO '{}ms';",
+        options.idle_transaction_timeout_ms
+    ));
+    statements.push(format!(
+        "SET lock_timeout TO '{}ms';",
+        options.lock_timeout_ms
+    ));
+    client.batch_execute(&statements.join("\n")).await?;
     Ok(())
+}
+
+async fn lock_postgres_connection(
+    connection: &Arc<tokio::sync::Mutex<AsyncPostgresConnection>>,
+    timeout_ms: u64,
+) -> Result<tokio::sync::MutexGuard<'_, AsyncPostgresConnection>, NoetError> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        connection.lock(),
+    )
+    .await
+    .map_err(|_| {
+        NoetError::GatewayTimeout(format!(
+            "postgres connection acquisition exceeded {timeout_ms}ms"
+        ))
+    })
 }
 
 fn postgres_url_requires_tls(database_url: &str) -> bool {
@@ -1379,13 +1485,20 @@ async fn run_async_postgres_finalize_worker(
     connection: Arc<tokio::sync::Mutex<AsyncPostgresConnection>>,
     pending_finalizations: Arc<tokio::sync::Mutex<HashSet<String>>>,
     failures: Arc<AtomicU64>,
+    options: AsyncPostgresLedgerOptions,
     mut rx: mpsc::Receiver<AsyncFinalizeWrite>,
 ) {
     while let Some(write) = rx.recv().await {
         let mut attempt = 0_u64;
         loop {
             attempt += 1;
-            let mut connection = connection.lock().await;
+            let Ok(mut connection) =
+                lock_postgres_connection(&connection, options.acquire_timeout_ms).await
+            else {
+                failures.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
             let statements = connection.statements.clone();
             let result = async {
                 let tx = connection.client.transaction().await?;
@@ -1468,6 +1581,7 @@ impl AsyncPostgresLedger {
                 finalize_connection,
                 pending_async_finalizations.clone(),
                 async_finalize_failures.clone(),
+                options.clone(),
                 rx,
             ));
             Some(tx)
@@ -1480,6 +1594,7 @@ impl AsyncPostgresLedger {
             finalize_tx,
             pending_async_finalizations,
             async_finalize_failures,
+            options: options.clone(),
             stage_timing: options.stage_timing,
         })
     }
@@ -1504,8 +1619,10 @@ impl AsyncPostgresLedger {
     ) -> Result<AuthorizeDecision, NoetError> {
         let started = Instant::now();
         let mut ledger = self.ledger.lock().await;
-        let connection = self.pool.connection();
-        let mut connection = connection.lock().await;
+        let mut connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         let tx = connection.client.transaction().await?;
         tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
             .await?;
@@ -1546,8 +1663,10 @@ impl AsyncPostgresLedger {
         let finalize_tx = self.finalize_tx.as_ref().cloned();
         let (reservation, write, decision_elapsed) = {
             let mut ledger = self.ledger.lock().await;
-            let connection = self.pool.connection();
-            let mut connection = connection.lock().await;
+            let mut connection = self
+                .pool
+                .lock_connection(self.options.acquire_timeout_ms)
+                .await?;
             let statements = connection.statements.clone();
             let tx = connection.client.transaction().await?;
             tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
@@ -1650,8 +1769,10 @@ impl AsyncPostgresLedger {
         decision_elapsed: std::time::Duration,
     ) -> Result<Reservation, NoetError> {
         let db_started = Instant::now();
-        let connection = self.pool.connection();
-        let mut connection = connection.lock().await;
+        let mut connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         let statements = connection.statements.clone();
         let tx = connection.client.transaction().await?;
         tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
@@ -1674,8 +1795,10 @@ impl AsyncPostgresLedger {
             let mut ledger = self.ledger.lock().await;
             ledger.record_event(event.clone())?;
         }
-        let connection = self.pool.connection();
-        let connection = connection.lock().await;
+        let connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         persist_event_async(&connection.client, &event).await
     }
 }
@@ -1711,10 +1834,18 @@ impl BudgetLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-        init_schema(&conn)?;
-        let mut ledger = Self::default();
-        ledger.store = LedgerStore::Sqlite(conn);
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            sqlite_wal_autocheckpoint() as i64,
+        )?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let schema_result = init_schema(&conn);
+        finish_sqlite_transaction(&conn, schema_result)?;
+        let mut ledger = Self {
+            store: LedgerStore::Sqlite(conn),
+            ..Self::default()
+        };
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
@@ -1731,13 +1862,37 @@ impl BudgetLedger {
             PostgresClient::connect(database_url, NoTls)?
         };
         init_postgres_schema(&mut pg_conn)?;
-        let mut ledger = Self::default();
-        ledger.store = LedgerStore::Postgres(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn))));
+        let mut ledger = Self {
+            store: LedgerStore::Postgres(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn)))),
+            ..Self::default()
+        };
         ledger.load_limit_windows()?;
         ledger.load_allocation_buckets()?;
         ledger.load_active_reservations()?;
         ledger.load_advisory_cadence_postgres()?;
         Ok(ledger)
+    }
+
+    fn begin_sqlite_transaction(&self) -> Result<bool, NoetError> {
+        let LedgerStore::Sqlite(conn) = &self.store else {
+            return Ok(false);
+        };
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(true)
+    }
+
+    fn finish_sqlite_transaction<T>(
+        &self,
+        started: bool,
+        result: Result<T, NoetError>,
+    ) -> Result<T, NoetError> {
+        if !started {
+            return result;
+        }
+        let LedgerStore::Sqlite(conn) = &self.store else {
+            return result;
+        };
+        finish_sqlite_transaction(conn, result)
     }
 
     pub fn authorize(
@@ -1893,10 +2048,7 @@ impl BudgetLedger {
         };
         self.last_selected_budget_id = selected_budget_id.clone();
         self.last_limit_hits = limit_hits.clone();
-        if reservation.is_some() {
-            self.persist_limit_windows()?;
-            self.persist_allocation_buckets()?;
-        }
+        let has_reservation = reservation.is_some();
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
             outcome: action.decision_outcome(),
@@ -1906,13 +2058,21 @@ impl BudgetLedger {
             metadata: authorize_metadata(&message_hints, &notifications),
             created_at: now,
         };
-        self.persist_decision(
-            policy,
-            request,
-            &decision,
-            selected_budget_id.as_deref(),
-            &limit_hits,
-        )?;
+        let sqlite_tx = self.begin_sqlite_transaction()?;
+        let persist_result = (|| {
+            if has_reservation {
+                self.persist_limit_windows()?;
+                self.persist_allocation_buckets()?;
+            }
+            self.persist_decision(
+                policy,
+                request,
+                &decision,
+                selected_budget_id.as_deref(),
+                &limit_hits,
+            )
+        })();
+        self.finish_sqlite_transaction(sqlite_tx, persist_result)?;
         Ok(decision)
     }
 
@@ -2067,9 +2227,13 @@ impl BudgetLedger {
 
         stored.reservation.status = ReservationStatus::Finalized;
         let reservation = stored.reservation.clone();
-        self.persist_finalization(&reservation, payload)?;
-        self.persist_windows()?;
-        self.persist_limit_windows()?;
+        let sqlite_tx = self.begin_sqlite_transaction()?;
+        let persist_result = (|| {
+            self.persist_finalization(&reservation, payload)?;
+            self.persist_windows()?;
+            self.persist_limit_windows()
+        })();
+        self.finish_sqlite_transaction(sqlite_tx, persist_result)?;
         Ok(reservation)
     }
 
@@ -5567,7 +5731,8 @@ fn init_schema(conn: &Connection) -> Result<(), NoetError> {
 }
 
 fn init_postgres_schema(conn: &mut PostgresClient) -> Result<(), NoetError> {
-    conn.batch_execute(
+    conn.batch_execute("BEGIN")?;
+    let result = conn.batch_execute(
         "
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version BIGINT PRIMARY KEY,
@@ -5713,13 +5878,24 @@ fn init_postgres_schema(conn: &mut PostgresClient) -> Result<(), NoetError> {
             PRIMARY KEY (user_key, advisory_key, scope_key)
         );
         ",
-    )?;
-    Ok(())
+    );
+    match result {
+        Ok(()) => {
+            conn.batch_execute("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.batch_execute("ROLLBACK");
+            Err(error.into())
+        }
+    }
 }
 
 async fn init_postgres_schema_async(conn: &AsyncPostgresClient) -> Result<(), NoetError> {
     conn.batch_execute(
         "
+        BEGIN;
+
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version BIGINT PRIMARY KEY,
             applied_at TEXT NOT NULL
@@ -5863,6 +6039,8 @@ async fn init_postgres_schema_async(conn: &AsyncPostgresClient) -> Result<(), No
             last_shown_at TEXT NOT NULL,
             PRIMARY KEY (user_key, advisory_key, scope_key)
         );
+
+        COMMIT;
         ",
     )
     .await?;
@@ -10742,10 +10920,15 @@ mod tests {
                 "
                 SELECT EXISTS (
                     SELECT 1
-                    FROM pg_indexes
-                    WHERE schemaname = $1
-                      AND indexname = 'idx_reservations_active'
-                      AND indexdef LIKE '%WHERE (status = ''active''::text)%'
+                    FROM pg_class index_class
+                    JOIN pg_namespace index_namespace
+                      ON index_namespace.oid = index_class.relnamespace
+                    JOIN pg_index index_metadata
+                      ON index_metadata.indexrelid = index_class.oid
+                    WHERE index_namespace.nspname = $1
+                      AND index_class.relname = 'idx_reservations_active'
+                      AND pg_get_expr(index_metadata.indpred, index_metadata.indrelid)
+                        LIKE '%status = ''active''::text%'
                 )
                 ",
                 &[&schema],

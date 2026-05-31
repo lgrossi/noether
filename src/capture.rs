@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
@@ -25,6 +26,8 @@ use crate::redaction::{redact_headers, redact_reqwest_headers};
 use crate::server::AppState;
 
 const MAX_CAPTURED_STREAM_CHUNKS: usize = 128;
+const UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 600;
+const UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: u64 = 60;
 
 struct ForwardContext {
     trace_id: String,
@@ -161,13 +164,21 @@ async fn forward_upstream(
     let reqwest_method = reqwest::Method::from_bytes(context.method.as_str().as_bytes())
         .map_err(|error| NoetError::Method(error.to_string()))?;
     let upstream_headers = upstream_headers(&context.headers);
-    let upstream_response = state
-        .client
-        .request(reqwest_method, target)
-        .headers(upstream_headers)
-        .body(context.body.clone())
-        .send()
-        .await?;
+    let upstream_response = tokio::time::timeout(
+        Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECONDS),
+        state
+            .client
+            .request(reqwest_method, target)
+            .headers(upstream_headers)
+            .body(context.body.clone())
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        NoetError::GatewayTimeout(format!(
+            "upstream request exceeded {UPSTREAM_REQUEST_TIMEOUT_SECONDS}s before response headers"
+        ))
+    })??;
 
     let status = upstream_response.status();
     let response_headers = upstream_response.headers().clone();
@@ -185,7 +196,16 @@ async fn forward_upstream(
         ));
     }
 
-    let response_bytes = upstream_response.bytes().await?;
+    let response_bytes = tokio::time::timeout(
+        Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECONDS),
+        upstream_response.bytes(),
+    )
+    .await
+    .map_err(|_| {
+        NoetError::GatewayTimeout(format!(
+            "upstream response exceeded {UPSTREAM_REQUEST_TIMEOUT_SECONDS}s"
+        ))
+    })??;
     let fixture = CaptureFixture::new(
         context.trace_id.clone(),
         context.request,
@@ -234,7 +254,27 @@ fn stream_upstream_response(
         let mut capture = StreamCapture::default();
         let mut error = None;
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let Some(item) = (match tokio::time::timeout(
+                Duration::from_secs(UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(item) => item,
+                Err(_) => {
+                    let message = format!(
+                        "upstream stream timed out after {UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS}s without a chunk"
+                    );
+                    error = Some(message.clone());
+                    let _ = sender
+                        .send(Err(io::Error::new(io::ErrorKind::TimedOut, message)))
+                        .await;
+                    break;
+                }
+            }) else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     capture.record_chunk(&bytes);
