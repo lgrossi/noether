@@ -1166,7 +1166,7 @@ impl AsyncPostgresLedgerOptions {
             acquire_timeout_ms: 5_000,
             statement_timeout_ms: 30_000,
             idle_transaction_timeout_ms: 30_000,
-            lock_timeout_ms: 2_000,
+            lock_timeout_ms: 0,
             stage_timing: false,
         }
     }

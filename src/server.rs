@@ -544,9 +544,23 @@ const APP_REPLAY_PREVIEW_REQUEST_CAP: usize = 5_000;
 const APP_REPLAY_CHANGED_RUNS_CAP: usize = 100;
 const APP_REPLAY_MAX_JOBS: usize = 8;
 const APP_REPLAY_JOB_RETENTION_MINUTES: i64 = 30;
-const APP_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 10;
-const UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 600;
+
+fn app_request_body_limit_bytes() -> usize {
+    parse_app_request_body_limit_bytes(
+        std::env::var("NOET_REQUEST_BODY_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_app_request_body_limit_bytes(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AppRunUsage {
@@ -873,7 +887,6 @@ impl AppState {
             routes: Vec::new(),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECONDS))
-                .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECONDS))
                 .build()
                 .expect("valid upstream HTTP client"),
             policy,
@@ -1123,7 +1136,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", any(capture))
         .route("/health", any(health))
         .fallback(any(capture))
-        .layer(RequestBodyLimitLayer::new(APP_REQUEST_BODY_LIMIT_BYTES))
+        .layer(RequestBodyLimitLayer::new(app_request_body_limit_bytes()))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -3253,6 +3266,26 @@ mod tests {
                 upstream_base_url,
             }],
         }
+    }
+
+    #[test]
+    fn request_body_limit_defaults_to_large_llm_payload_cap_and_accepts_env_override() {
+        assert_eq!(
+            parse_app_request_body_limit_bytes(None),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("2097152")),
+            2_097_152
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("0")),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_app_request_body_limit_bytes(Some("not-a-number")),
+            DEFAULT_APP_REQUEST_BODY_LIMIT_BYTES
+        );
     }
 
     fn report_request(

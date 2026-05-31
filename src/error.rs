@@ -59,13 +59,14 @@ impl IntoResponse for NoetError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::GatewayTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            Self::Upstream(error) if error.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
             Self::Io(_)
-            | Self::Upstream(_)
             | Self::Url(_)
             | Self::Method(_)
             | Self::Sqlite(_)
             | Self::Postgres(_)
             | Self::PostgresTls(_) => StatusCode::BAD_GATEWAY,
+            Self::Upstream(_) => StatusCode::BAD_GATEWAY,
         };
         let message = match &self {
             Self::InvalidPolicy(_)
