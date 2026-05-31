@@ -4,6 +4,8 @@
 /**/node_modules
 /sdk/typescript/dist
 /sdk/python/.venv
+/sdk/python/build
+/sdk/python/*.egg-info
 /integrations/litellm/.venv
 __pycache__/
 /test-results

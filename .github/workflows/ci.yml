@@ -7,15 +7,113 @@ on:
       - main
 
 jobs:
-  rust:
-    name: rust
+  rust-sqlite:
+    name: rust (sqlite)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
-      - name: Run tests
+      - name: Lint (clippy)
+        run: cargo clippy --no-deps --all-targets --locked -- -D warnings
+      - name: Run tests (sqlite)
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --locked --release --bin noet
+
+  rust-postgres:
+    name: rust (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: noether
+          POSTGRES_PASSWORD: noether
+          POSTGRES_DB: noether_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U noether -d noether_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NOET_TEST_PG_URL: postgres://noether:noether@127.0.0.1:5432/noether_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests (postgres backend gated tests)
+        run: cargo test --locked -- --include-ignored
+
+  sdk-rust:
+    name: sdk (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (sdk/rust)
+        working-directory: sdk/rust
+        run: cargo test --locked
+
+  sdk-typescript:
+    name: sdk (typescript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: npm install
+        working-directory: sdk/typescript
+        run: npm install
+      - name: npm test
+        working-directory: sdk/typescript
+        run: npm test
+
+  sdk-python:
+    name: sdk (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install pytest
+        run: pip install pytest
+      - name: pytest
+        working-directory: sdk/python
+        run: pytest
+
+  integration-claude-code:
+    name: integration (claude-code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: npm test (claude-code hook)
+        working-directory: integrations/claude-code
+        run: npm test
+
+  integration-litellm:
+    name: integration (litellm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install pytest
+        run: pip install pytest
+      - name: pytest (litellm callback)
+        working-directory: integrations/litellm
+        run: python -m pytest tests/
