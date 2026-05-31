@@ -10889,10 +10889,15 @@ mod tests {
                 "
                 SELECT EXISTS (
                     SELECT 1
-                    FROM pg_indexes
-                    WHERE schemaname = $1
-                      AND indexname = 'idx_reservations_active'
-                      AND indexdef LIKE '%WHERE (status = ''active''::text)%'
+                    FROM pg_class index_class
+                    JOIN pg_namespace index_namespace
+                      ON index_namespace.oid = index_class.relnamespace
+                    JOIN pg_index index_metadata
+                      ON index_metadata.indexrelid = index_class.oid
+                    WHERE index_namespace.nspname = $1
+                      AND index_class.relname = 'idx_reservations_active'
+                      AND pg_get_expr(index_metadata.indpred, index_metadata.indrelid)
+                        LIKE '%status = ''active''::text%'
                 )
                 ",
                 &[&schema],
