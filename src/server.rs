@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -1067,6 +1067,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let request_body_limit = app_request_body_limit_bytes();
     Router::new()
         .route("/v1/authorize", post(authorize))
         .route("/v1/reservations/{id}/finalize", post(finalize_reservation))
@@ -1136,7 +1137,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", any(capture))
         .route("/health", any(health))
         .fallback(any(capture))
-        .layer(RequestBodyLimitLayer::new(app_request_body_limit_bytes()))
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(RequestBodyLimitLayer::new(request_body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -3841,6 +3843,29 @@ mod tests {
                 panic!("expected captured JSON")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn capture_accepts_body_above_axum_default_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let app = build_router(state_with_dir(
+            tempdir.path().join("fixtures"),
+            None,
+            DecisionMode::DryRun,
+        ));
+        let body = vec![b'a'; 3 * 1024 * 1024];
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

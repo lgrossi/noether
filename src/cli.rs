@@ -509,6 +509,7 @@ fn postgres_options_from_serve_args(
     {
         options.synchronous_commit = Some(synchronous_commit);
     }
+    apply_postgres_timeout_env_options(&mut options)?;
     if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING")? {
         options.stage_timing = stage_timing;
     }
@@ -550,10 +551,32 @@ fn postgres_options_from_runtime_env() -> Result<AsyncPostgresLedgerOptions, Noe
     {
         options.synchronous_commit = Some(synchronous_commit);
     }
+    apply_postgres_timeout_env_options(&mut options)?;
     if let Some(stage_timing) = parse_env_bool_option("NOET_POSTGRES_STAGE_TIMING")? {
         options.stage_timing = stage_timing;
     }
     Ok(options)
+}
+
+fn apply_postgres_timeout_env_options(
+    options: &mut AsyncPostgresLedgerOptions,
+) -> Result<(), NoetError> {
+    if let Some(acquire_timeout_ms) = parse_env_u64_option("NOET_POSTGRES_ACQUIRE_TIMEOUT_MS")? {
+        options.acquire_timeout_ms = acquire_timeout_ms.max(1);
+    }
+    if let Some(statement_timeout_ms) = parse_env_u64_option("NOET_POSTGRES_STATEMENT_TIMEOUT_MS")?
+    {
+        options.statement_timeout_ms = statement_timeout_ms;
+    }
+    if let Some(idle_transaction_timeout_ms) =
+        parse_env_u64_option("NOET_POSTGRES_IDLE_TX_TIMEOUT_MS")?
+    {
+        options.idle_transaction_timeout_ms = idle_transaction_timeout_ms;
+    }
+    if let Some(lock_timeout_ms) = parse_env_u64_option("NOET_POSTGRES_LOCK_TIMEOUT_MS")? {
+        options.lock_timeout_ms = lock_timeout_ms;
+    }
+    Ok(())
 }
 
 fn parse_env_usize_option(name: &str) -> Result<Option<usize>, NoetError> {
@@ -564,6 +587,18 @@ fn parse_env_usize_option(name: &str) -> Result<Option<usize>, NoetError> {
         return Ok(None);
     };
     value.trim().parse::<usize>().map(Some).map_err(|error| {
+        NoetError::InvalidConfig(format!("invalid {name} value {value:?}: {error}"))
+    })
+}
+
+fn parse_env_u64_option(name: &str) -> Result<Option<u64>, NoetError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value.trim().parse::<u64>().map(Some).map_err(|error| {
         NoetError::InvalidConfig(format!("invalid {name} value {value:?}: {error}"))
     })
 }

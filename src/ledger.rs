@@ -1086,9 +1086,36 @@ struct AsyncPostgresPool {
 }
 
 impl AsyncPostgresPool {
-    fn connection(&self) -> Arc<tokio::sync::Mutex<AsyncPostgresConnection>> {
+    async fn lock_connection(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, AsyncPostgresConnection>, NoetError> {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
-        self.connections[index].clone()
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            self.lock_any_connection(index),
+        )
+        .await
+        .map_err(|_| {
+            NoetError::GatewayTimeout(format!(
+                "postgres connection acquisition exceeded {timeout_ms}ms"
+            ))
+        })
+    }
+
+    async fn lock_any_connection(
+        &self,
+        start_index: usize,
+    ) -> tokio::sync::MutexGuard<'_, AsyncPostgresConnection> {
+        loop {
+            for offset in 0..self.connections.len() {
+                let index = (start_index + offset) % self.connections.len();
+                if let Ok(connection) = self.connections[index].try_lock() {
+                    return connection;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 }
 
@@ -1592,9 +1619,10 @@ impl AsyncPostgresLedger {
     ) -> Result<AuthorizeDecision, NoetError> {
         let started = Instant::now();
         let mut ledger = self.ledger.lock().await;
-        let connection = self.pool.connection();
-        let mut connection =
-            lock_postgres_connection(&connection, self.options.acquire_timeout_ms).await?;
+        let mut connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         let tx = connection.client.transaction().await?;
         tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
             .await?;
@@ -1635,9 +1663,10 @@ impl AsyncPostgresLedger {
         let finalize_tx = self.finalize_tx.as_ref().cloned();
         let (reservation, write, decision_elapsed) = {
             let mut ledger = self.ledger.lock().await;
-            let connection = self.pool.connection();
-            let mut connection =
-                lock_postgres_connection(&connection, self.options.acquire_timeout_ms).await?;
+            let mut connection = self
+                .pool
+                .lock_connection(self.options.acquire_timeout_ms)
+                .await?;
             let statements = connection.statements.clone();
             let tx = connection.client.transaction().await?;
             tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
@@ -1740,9 +1769,10 @@ impl AsyncPostgresLedger {
         decision_elapsed: std::time::Duration,
     ) -> Result<Reservation, NoetError> {
         let db_started = Instant::now();
-        let connection = self.pool.connection();
-        let mut connection =
-            lock_postgres_connection(&connection, self.options.acquire_timeout_ms).await?;
+        let mut connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         let statements = connection.statements.clone();
         let tx = connection.client.transaction().await?;
         tx.batch_execute("SELECT pg_advisory_xact_lock(1984111137)")
@@ -1765,9 +1795,10 @@ impl AsyncPostgresLedger {
             let mut ledger = self.ledger.lock().await;
             ledger.record_event(event.clone())?;
         }
-        let connection = self.pool.connection();
-        let connection =
-            lock_postgres_connection(&connection, self.options.acquire_timeout_ms).await?;
+        let connection = self
+            .pool
+            .lock_connection(self.options.acquire_timeout_ms)
+            .await?;
         persist_event_async(&connection.client, &event).await
     }
 }
