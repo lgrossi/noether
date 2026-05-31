@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from unittest import TestCase, main
 
-from noether_sidecar import NoetherClient, NoetherDeniedError
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "sdk/python"))
+
+from noether_sidecar import NoetherClient, NoetherDeniedError, NoetherHttpError
 
 
 class NoetherClientTests(TestCase):
@@ -14,7 +19,7 @@ class NoetherClientTests(TestCase):
         server = TestServer()
         server.start()
         try:
-            client = NoetherClient(url=server.url, timeout=0.5)
+            client = NoetherClient(url=server.url, timeout=0.5, api_key="secret-token")
 
             decision = client.authorize(
                 {
@@ -48,6 +53,9 @@ class NoetherClientTests(TestCase):
                     ("GET", "/health"),
                 ],
             )
+            self.assertTrue(
+                all(item["authorization"] == "Bearer secret-token" for item in server.seen)
+            )
         finally:
             server.stop()
 
@@ -59,6 +67,23 @@ class NoetherClientTests(TestCase):
         self.assertEqual(decision["outcome"], "allow")
         self.assertEqual(decision["action"], "allow")
         self.assertEqual(decision["explanations"][0]["rule_id"], "sdk.sidecar_unavailable")
+
+    def test_fail_open_does_not_synthesize_allow_for_auth_failures(self) -> None:
+        server = TestServer(authorize_status=401)
+        server.start()
+        try:
+            client = NoetherClient(
+                url=server.url,
+                timeout=0.5,
+                fail_mode="fail_open",
+                api_key="wrong-token",
+            )
+
+            with self.assertRaises(NoetherHttpError) as captured:
+                client.authorize({"project": "noether"})
+            self.assertEqual(captured.exception.status, 401)
+        finally:
+            server.stop()
 
     def test_fail_closed_blocks_with_decision(self) -> None:
         client = NoetherClient(url="http://127.0.0.1:9", timeout=0.05, fail_mode="fail_closed")
@@ -77,13 +102,20 @@ class NoetherClientTests(TestCase):
 
 
 class TestServer:
-    def __init__(self) -> None:
+    def __init__(self, authorize_status: int = 200) -> None:
         self.seen: list[dict[str, Any]] = []
         seen = self.seen
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                seen.append({"method": "GET", "path": self.path, "body": None})
+                seen.append(
+                    {
+                        "method": "GET",
+                        "path": self.path,
+                        "authorization": self.headers.get("authorization"),
+                        "body": None,
+                    }
+                )
                 if self.path == "/health":
                     self.write_json(
                         {
@@ -103,10 +135,17 @@ class TestServer:
                     {
                         "method": "POST",
                         "path": self.path,
+                        "authorization": self.headers.get("authorization"),
                         "body": json.loads(body.decode("utf-8")) if body else None,
                     }
                 )
                 if self.path == "/v1/authorize":
+                    if authorize_status != 200:
+                        self.write_json(
+                            {"error": "missing or invalid Noether API key"},
+                            status=authorize_status,
+                        )
+                        return
                     self.write_json(
                         {
                             "decision_id": "decision-1",

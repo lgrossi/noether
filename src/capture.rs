@@ -3,7 +3,7 @@ use std::io;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, State};
+use axum::extract::{Extension, OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use reqwest::header::{
@@ -23,7 +23,7 @@ use crate::fixture::{
 use crate::mock::{mock_json, mock_stream};
 use crate::proxy::ProxyRoutes;
 use crate::redaction::{redact_headers, redact_reqwest_headers};
-use crate::server::AppState;
+use crate::server::{AppState, RequestContext, apply_request_context_to_authorize_request};
 
 const MAX_CAPTURED_STREAM_CHUNKS: usize = 128;
 const UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 600;
@@ -41,6 +41,7 @@ struct ForwardContext {
 
 pub async fn capture(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     OriginalUri(original_uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
@@ -58,7 +59,7 @@ pub async fn capture(
         headers: redact_headers(&headers),
         body: capture_body(&body),
     };
-    let decision = evaluate_capture_decision(&state, &request).await?;
+    let decision = evaluate_capture_decision(&state, &request, &context).await?;
 
     if state.decision_mode == DecisionMode::Enforce
         && decision
@@ -100,14 +101,17 @@ pub async fn capture(
 async fn evaluate_capture_decision(
     state: &AppState,
     request: &CapturedRequest,
+    context: &RequestContext,
 ) -> Result<Option<CapturedDecision>, NoetError> {
     let Some(policy) = state.active_policy().await else {
         return Ok(None);
     };
-    let authorize_request = authorize_request_from_capture(request);
+    let mut authorize_request = authorize_request_from_capture(request);
+    apply_request_context_to_authorize_request(&mut authorize_request, context);
     let decision = state
         .authorize_request(Some(policy), authorize_request)
         .await?;
+    state.record_decision_metric(&decision);
     Ok(Some(CapturedDecision {
         mode: state.decision_mode,
         decision,
@@ -163,7 +167,7 @@ async fn forward_upstream(
     let target = upstream.join(context.upstream_path.trim_start_matches('/'))?;
     let reqwest_method = reqwest::Method::from_bytes(context.method.as_str().as_bytes())
         .map_err(|error| NoetError::Method(error.to_string()))?;
-    let upstream_headers = upstream_headers(&context.headers);
+    let upstream_headers = upstream_headers(&state, &context.headers);
     let upstream_response = tokio::time::timeout(
         Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECONDS),
         state
@@ -524,11 +528,14 @@ fn should_stream_response(headers: &ReqwestHeaderMap) -> bool {
         || !headers.contains_key(reqwest::header::CONTENT_LENGTH)
 }
 
-fn upstream_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
+fn upstream_headers(state: &AppState, headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut upstream_headers = ReqwestHeaderMap::new();
     let hop_by_hop_headers = request_hop_by_hop_headers(headers);
     for (name, value) in headers {
-        if hop_by_hop_headers.contains(name.as_str()) || name == header::HOST {
+        if hop_by_hop_headers.contains(name.as_str())
+            || name == header::HOST
+            || state.should_strip_proxy_request_header(name, value)
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (

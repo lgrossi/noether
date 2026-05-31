@@ -15,6 +15,23 @@ Product invariant: Noether is a decision sidecar. Integrations own provider tran
 | Claude Code | Hook command | Tool/action authorization supported; main model pre-call not supported | Supported for `PreToolUse` and `PermissionRequest` | Best effort for Agent tool usage only | Supported | Public hook surface does not document main model provider pre-call/usage hooks. |
 | Codex | `codex exec --json` wrapper | Supported before launching `codex exec` | Supported before process spawn | Best effort when JSONL events expose usage/cost | Supported from JSONL stream | Local CLI exposes `exec --json`; no stable provider pre-call plugin hook verified. |
 
+## Enforcement claim boundaries
+
+- **Governed** means the integration has a pre-provider control point and a deny proof that provider
+  traffic did not happen. Pi and LiteLLM can qualify only on their validated hook/callback paths.
+- **Wrapper-gated** means Noether can block process launch, not every provider request inside that
+  process. Codex wrapper claims must use this weaker language unless a stable provider pre-call hook
+  is proven.
+- **Tool-governed** means Noether can block tool/action use, not main model spend. Claude Code is in
+  this posture for public hooks.
+- **Observed** means Noether receives events after the fact. OpenCode remains observed for provider
+  spend until a documented pre-provider hook exists.
+
+Do not use "hard block", "deny prevents spend", or "governed" for an integration path unless the
+probe or live smoke demonstrates provider traffic was stopped before send. Use
+[`docs/testing/pilot-smoke-instructions.md`](./testing/pilot-smoke-instructions.md) for repeatable
+pilot evidence.
+
 ## Finalize/accounting rules
 
 `POST /v1/reservations/{id}/finalize` accepts:

@@ -97,6 +97,11 @@ class LiteLLMIntegrationTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "Noether denied request: daily cap exceeded")
 
+    def test_config_reads_shared_noether_api_key(self) -> None:
+        config = NoetherLiteLLMConfig.from_env({"NOET_API_KEY": "secret-token"})
+
+        self.assertEqual(config.api_key, "secret-token")
+
     async def test_success_finalizes_observed_usage(self) -> None:
         fake = FakeNoetherClient({"decision_id": "decision-1", "outcome": "allow", "reservation": {"id": "reservation-1"}})
         handler = NoetherLiteLLMHandler(client=fake)  # type: ignore[arg-type]

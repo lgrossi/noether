@@ -29,6 +29,7 @@ class NoetherLiteLLMConfig:
     subject: str | None = None
     budget_id: str | None = None
     entities: tuple[str, ...] = ()
+    api_key: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "NoetherLiteLLMConfig":
@@ -41,6 +42,7 @@ class NoetherLiteLLMConfig:
             subject=_empty_to_none(values.get("NOET_LITELLM_SUBJECT")),
             budget_id=_empty_to_none(values.get("NOET_LITELLM_BUDGET_ID")),
             entities=tuple(_split_csv(values.get("NOET_LITELLM_ENTITIES"))),
+            api_key=_empty_to_none(values.get("NOET_API_KEY")),
         )
 
 
@@ -55,6 +57,7 @@ class NoetherLiteLLMHandler(CustomLogger):
             url=self.config.noether_url,
             timeout=self.config.timeout,
             fail_mode=self.config.fail_mode,  # type: ignore[arg-type]
+            api_key=self.config.api_key,
         )
 
     async def async_pre_call_hook(

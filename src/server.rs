@@ -6,13 +6,16 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderValue, Request, StatusCode};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -23,7 +26,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::capture::capture;
@@ -43,6 +46,8 @@ use crate::proxy::ProxyRoute;
 use crate::reporting;
 use crate::simulation::SimulationComparisonReport;
 
+pub(crate) const NOETHER_API_KEY_HEADER: &str = "x-noet-api-key";
+
 #[derive(Clone)]
 pub struct AppState {
     pub fixture_dir: PathBuf,
@@ -53,10 +58,32 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub policy: PolicyRuntime,
     pub decision_mode: DecisionMode,
+    api_key: Option<Arc<str>>,
+    actor_header: Option<Arc<str>>,
     pub ledger: Arc<Mutex<BudgetLedger>>,
     pub ledger_backend: LedgerBackend,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
+    metrics: AppMetrics,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestContext {
+    pub request_id: String,
+    pub actor: String,
+    pub actor_source: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AppMetrics {
+    requests_total: Arc<AtomicU64>,
+    unauthorized_total: Arc<AtomicU64>,
+    responses_4xx_total: Arc<AtomicU64>,
+    responses_5xx_total: Arc<AtomicU64>,
+    decisions_allow_total: Arc<AtomicU64>,
+    decisions_warn_total: Arc<AtomicU64>,
+    decisions_deny_total: Arc<AtomicU64>,
+    errors_total: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -418,6 +445,10 @@ struct HealthResponse {
     upstream_configured: bool,
     route_count: usize,
     ledger_backend: &'static str,
+    auth_configured: bool,
+    request_body_limit_bytes: usize,
+    replay_jobs: usize,
+    replay_job_capacity: usize,
     postgres_async_finalize_failures: Option<u64>,
 }
 
@@ -891,10 +922,13 @@ impl AppState {
                 .expect("valid upstream HTTP client"),
             policy,
             decision_mode,
+            api_key: None,
+            actor_header: None,
             ledger: Arc::new(Mutex::new(BudgetLedger::default())),
             ledger_backend: LedgerBackend::in_memory(),
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            metrics: AppMetrics::default(),
         }
     }
 
@@ -925,6 +959,38 @@ impl AppState {
 
     pub fn postgres_async_finalize_failures(&self) -> Option<u64> {
         self.ledger_backend.postgres_async_finalize_failures()
+    }
+
+    pub fn record_decision_metric(&self, decision: &AuthorizeDecision) {
+        record_decision_metrics(&self.metrics, decision);
+    }
+
+    pub(crate) fn should_strip_proxy_request_header(
+        &self,
+        name: &axum::http::HeaderName,
+        value: &HeaderValue,
+    ) -> bool {
+        if name.as_str().eq_ignore_ascii_case(NOETHER_API_KEY_HEADER) {
+            return true;
+        }
+        if self
+            .actor_header
+            .as_deref()
+            .is_some_and(|actor_header| name.as_str().eq_ignore_ascii_case(actor_header))
+        {
+            return true;
+        }
+        if name == AUTHORIZATION
+            && let Some(api_key) = self.api_key.as_deref()
+            && value
+                .to_str()
+                .ok()
+                .and_then(bearer_token)
+                .is_some_and(|token| token == api_key)
+        {
+            return true;
+        }
+        false
     }
 
     pub async fn authorize_request(
@@ -993,6 +1059,8 @@ pub struct ServeConfig {
     pub policy: Option<PolicyFile>,
     pub noether_config: NoetherConfig,
     pub decision_mode: DecisionMode,
+    pub api_key: Option<String>,
+    pub actor_header: Option<String>,
     pub on_bound: Option<Box<dyn FnOnce() -> Result<(), NoetError> + Send>>,
 }
 
@@ -1047,6 +1115,14 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     state.simulation_dir = config.simulation_dir;
     state.policy_proposal_path = policy_proposal_path;
     state.routes = config.routes;
+    state.api_key = normalize_api_key(config.api_key).map(Arc::from);
+    state.actor_header = normalize_actor_header(config.actor_header).map(Arc::from);
+    if state.api_key.is_none() && bind_requires_auth_warning(bind) {
+        warn!(
+            bind = %bind,
+            "NOET_API_KEY is not set while noet is bound to a non-loopback address; rely on an external security boundary or configure bearer auth"
+        );
+    }
     if let Some(database_url) = config.database_url {
         if let Some(postgres_ledger) = postgres_ledger {
             state.ledger_backend = LedgerBackend::postgres(database_url, postgres_ledger);
@@ -1136,7 +1212,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/messages", any(capture))
         .route("/v1/responses", any(capture))
         .route("/health", any(health))
+        .route("/metrics", get(metrics))
         .fallback(any(capture))
+        .layer(from_fn_with_state(
+            state.clone(),
+            request_context_middleware,
+        ))
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(RequestBodyLimitLayer::new(request_body_limit))
         .layer(TraceLayer::new_for_http())
@@ -1144,6 +1225,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let replay_jobs = state.replay_jobs.lock().await.len();
     Json(HealthResponse {
         status: "ok",
         decision_mode: state.decision_mode,
@@ -1151,27 +1233,349 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         upstream_configured: state.upstream.is_some(),
         route_count: state.routes.len(),
         ledger_backend: state.ledger_backend_name(),
+        auth_configured: state.api_key.is_some(),
+        request_body_limit_bytes: app_request_body_limit_bytes(),
+        replay_jobs,
+        replay_job_capacity: APP_REPLAY_MAX_JOBS,
         postgres_async_finalize_failures: state.postgres_async_finalize_failures(),
     })
 }
 
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let replay_jobs = state.replay_jobs.lock().await.len();
+    let metrics = &state.metrics;
+    let body = format!(
+        concat!(
+            "noet_requests_total {}\n",
+            "noet_unauthorized_requests_total {}\n",
+            "noet_responses_4xx_total {}\n",
+            "noet_responses_5xx_total {}\n",
+            "noet_decisions_allow_total {}\n",
+            "noet_decisions_warn_total {}\n",
+            "noet_decisions_deny_total {}\n",
+            "noet_errors_total {}\n",
+            "noet_replay_jobs {}\n",
+            "noet_replay_job_capacity {}\n"
+        ),
+        metrics.requests_total.load(Ordering::Relaxed),
+        metrics.unauthorized_total.load(Ordering::Relaxed),
+        metrics.responses_4xx_total.load(Ordering::Relaxed),
+        metrics.responses_5xx_total.load(Ordering::Relaxed),
+        metrics.decisions_allow_total.load(Ordering::Relaxed),
+        metrics.decisions_warn_total.load(Ordering::Relaxed),
+        metrics.decisions_deny_total.load(Ordering::Relaxed),
+        metrics.errors_total.load(Ordering::Relaxed),
+        replay_jobs,
+        APP_REPLAY_MAX_JOBS
+    );
+    ([(CONTENT_TYPE, "text/plain; charset=utf-8")], body)
+}
+
+async fn request_context_middleware(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let request_id = request_id_from_headers(request.headers())
+        .unwrap_or_else(|| format!("req-{}", Uuid::new_v4()));
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(api_key) = state.api_key.as_deref() {
+        let authorized = request_has_noether_api_key(request.headers(), api_key);
+        if !authorized {
+            state
+                .metrics
+                .unauthorized_total
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .responses_4xx_total
+                .fetch_add(1, Ordering::Relaxed);
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "missing or invalid Noether API key",
+                    "message": format!("Send Authorization: Bearer <NOET_API_KEY> for Noether API calls, or {NOETHER_API_KEY_HEADER}: <NOET_API_KEY> when preserving a provider Authorization header on proxy traffic."),
+                })),
+            )
+                .into_response();
+            insert_request_id_header(&mut response, &request_id);
+            return response;
+        }
+    }
+
+    let context = match request_context_from_headers(
+        request.headers(),
+        &request_id,
+        state.api_key.is_some(),
+        state.actor_header.as_deref(),
+    ) {
+        Ok(context) => context,
+        Err(error_response) => {
+            state
+                .metrics
+                .unauthorized_total
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .responses_4xx_total
+                .fetch_add(1, Ordering::Relaxed);
+            let mut response = error_response.into_response();
+            insert_request_id_header(&mut response, &request_id);
+            return response;
+        }
+    };
+    request.extensions_mut().insert(context);
+    let mut response = next.run(request).await;
+    insert_request_id_header(&mut response, &request_id);
+    let status = response.status();
+    if status.is_client_error() {
+        state
+            .metrics
+            .responses_4xx_total
+            .fetch_add(1, Ordering::Relaxed);
+    } else if status.is_server_error() {
+        state
+            .metrics
+            .responses_5xx_total
+            .fetch_add(1, Ordering::Relaxed);
+        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+    response
+}
+
+fn request_has_noether_api_key(headers: &axum::http::HeaderMap, api_key: &str) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token)
+        .is_some_and(|token| token == api_key)
+        || headers
+            .get(NOETHER_API_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|token| token == api_key)
+}
+
+fn request_context_from_headers(
+    headers: &axum::http::HeaderMap,
+    request_id: &str,
+    auth_configured: bool,
+    actor_header: Option<&str>,
+) -> Result<RequestContext, (StatusCode, Json<serde_json::Value>)> {
+    let (actor, actor_source) = if let Some(actor_header) = actor_header {
+        let Some(actor) = headers
+            .get(actor_header)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned())
+        else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "missing trusted actor header",
+                    "message": format!("Noether requires trusted actor header `{actor_header}` because NOET_ACTOR_HEADER is configured. Configure the IAP/reverse proxy to strip client-supplied `{actor_header}` and inject the authenticated user value before forwarding to Noether."),
+                    "actor_header": actor_header,
+                })),
+            ));
+        };
+        (actor, "trusted_header")
+    } else if auth_configured {
+        ("api_key".to_owned(), "bearer")
+    } else {
+        ("anonymous".to_owned(), "none")
+    };
+    Ok(RequestContext {
+        request_id: request_id.to_owned(),
+        actor,
+        actor_source,
+    })
+}
+
+fn request_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-noet-request-id")
+        .or_else(|| headers.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn insert_request_id_header(response: &mut Response, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-noet-request-id", value);
+    }
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn normalize_api_key(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_actor_header(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn bind_requires_auth_warning(bind: SocketAddr) -> bool {
+    !bind.ip().is_loopback()
+}
+
+pub(crate) fn apply_request_context_to_authorize_request(
+    request: &mut AuthorizeRequest,
+    context: &RequestContext,
+) {
+    add_request_context_metadata(&mut request.metadata, context);
+    if context.actor_source == "trusted_header" {
+        let trusted_subject = trusted_actor_subject(&context.actor);
+        if let Some(subject) = request.subject.replace(trusted_subject.clone()) {
+            request
+                .metadata
+                .entry("client_claimed_subject".to_owned())
+                .or_insert_with(|| serde_json::json!(subject));
+        }
+        let client_user_entities = request
+            .entities
+            .iter()
+            .filter(|entity| entity.to_ascii_lowercase().starts_with("user:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !client_user_entities.is_empty() {
+            request
+                .metadata
+                .entry("client_claimed_user_entities".to_owned())
+                .or_insert_with(|| serde_json::json!(client_user_entities));
+        }
+        request
+            .entities
+            .retain(|entity| !entity.to_ascii_lowercase().starts_with("user:"));
+        if !request
+            .entities
+            .iter()
+            .any(|entity| entity == &trusted_subject)
+        {
+            request.entities.push(trusted_subject);
+        }
+    }
+}
+
+fn trusted_actor_subject(actor: &str) -> String {
+    let actor = actor.trim();
+    if actor.to_ascii_lowercase().starts_with("user:") {
+        return actor.to_owned();
+    }
+    if let Some((_issuer, value)) = actor.split_once(':')
+        && actor.contains('@')
+        && !value.trim().is_empty()
+    {
+        return format!("user:{}", value.trim());
+    }
+    format!("user:{actor}")
+}
+
+fn add_request_context_metadata(
+    metadata: &mut BTreeMap<String, serde_json::Value>,
+    context: &RequestContext,
+) {
+    metadata
+        .entry("request_id".to_owned())
+        .or_insert_with(|| serde_json::json!(context.request_id));
+    set_authoritative_actor_metadata(metadata, context);
+}
+
+fn set_authoritative_actor_metadata(
+    metadata: &mut BTreeMap<String, serde_json::Value>,
+    context: &RequestContext,
+) {
+    if let Some(client_actor) = metadata.remove("actor") {
+        metadata
+            .entry("client_claimed_actor".to_owned())
+            .or_insert(client_actor);
+    }
+    metadata.insert(
+        "actor".to_owned(),
+        serde_json::json!({
+            "id": context.actor,
+            "source": context.actor_source,
+        }),
+    );
+}
+
+fn add_request_context_to_event(event: &mut TraceEvent, context: &RequestContext) {
+    let payload = if let Some(payload) = event.payload.as_object_mut() {
+        payload
+    } else {
+        let original_payload = std::mem::replace(&mut event.payload, serde_json::json!({}));
+        event.payload = serde_json::json!({ "original_payload": original_payload });
+        event.payload.as_object_mut().expect("object payload")
+    };
+    payload
+        .entry("request_id".to_owned())
+        .or_insert_with(|| serde_json::json!(context.request_id));
+    if let Some(client_actor) = payload.remove("actor") {
+        payload
+            .entry("client_claimed_actor".to_owned())
+            .or_insert(client_actor);
+    }
+    payload.insert(
+        "actor".to_owned(),
+        serde_json::json!({
+            "id": context.actor,
+            "source": context.actor_source,
+        }),
+    );
+}
+
+fn record_decision_metrics(metrics: &AppMetrics, decision: &AuthorizeDecision) {
+    match decision.outcome {
+        DecisionOutcome::Allow => metrics
+            .decisions_allow_total
+            .fetch_add(1, Ordering::Relaxed),
+        DecisionOutcome::Warn => metrics.decisions_warn_total.fetch_add(1, Ordering::Relaxed),
+        DecisionOutcome::Deny => metrics.decisions_deny_total.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
 async fn authorize(
     State(state): State<AppState>,
-    Json(request): Json<AuthorizeRequest>,
+    Extension(context): Extension<RequestContext>,
+    Json(mut request): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeDecision>, NoetError> {
+    apply_request_context_to_authorize_request(&mut request, &context);
     let policy = state.active_policy().await;
     let decision = state
         .authorize_request(policy.clone(), request.clone())
         .await?;
+    record_decision_metrics(&state.metrics, &decision);
+    info!(
+        request_id = %context.request_id,
+        actor = %context.actor,
+        outcome = ?decision.outcome,
+        action = ?decision.action,
+        decision_id = %decision.decision_id,
+        "noet decision"
+    );
     publish_report_update(&state, "authorize", request_trace_id(&request));
     Ok(Json(decision))
 }
 
 async fn finalize_reservation(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     AxumPath(id): AxumPath<String>,
-    Json(payload): Json<FinalizeReservation>,
+    Json(mut payload): Json<FinalizeReservation>,
 ) -> Result<Json<Reservation>, NoetError> {
+    add_request_context_metadata(&mut payload.metadata, &context);
     let trace_id = finalize_trace_id(&payload);
     let reservation = state.finalize_reservation(id, payload).await?;
     publish_report_update(&state, "finalize", trace_id);
@@ -1180,8 +1584,10 @@ async fn finalize_reservation(
 
 async fn record_event(
     State(state): State<AppState>,
-    Json(event): Json<TraceEvent>,
+    Extension(context): Extension<RequestContext>,
+    Json(mut event): Json<TraceEvent>,
 ) -> Result<impl IntoResponse, NoetError> {
+    add_request_context_to_event(&mut event, &context);
     let trace_id = event.trace_id.clone();
     state.record_trace_event(event).await?;
     publish_report_update(&state, "event", trace_id);
@@ -1481,7 +1887,7 @@ async fn app_runs(
                     next_offset,
                 }));
             }
-            let decisions = reporting::decisions_report(&ledger)?;
+            let decisions = reporting::decisions_report(ledger)?;
             let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
             let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
             let totals = app_run_totals_from_rows(&all_runs);
@@ -3290,6 +3696,362 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_key_auth_rejects_missing_bearer_and_preserves_request_id() {
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/health")
+                    .header("x-noet-request-id", "req-auth")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-noet-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req-auth")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_accepts_bearer_and_health_reports_auth() {
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/health")
+                    .header("authorization", "Bearer secret-token")
+                    .header("x-noet-request-id", "req-health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-noet-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req-health")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("health json");
+        assert_eq!(payload["auth_configured"], true);
+        assert_eq!(payload["replay_job_capacity"], APP_REPLAY_MAX_JOBS);
+    }
+
+    #[tokio::test]
+    async fn configured_actor_header_is_required_with_clear_error() {
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        state.actor_header = Some(Arc::<str>::from("x-goog-authenticated-user-email"));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/health")
+                    .header("authorization", "Bearer secret-token")
+                    .header("x-noet-request-id", "req-missing-actor")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-noet-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req-missing-actor")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"], "missing trusted actor header");
+        assert_eq!(payload["actor_header"], "x-goog-authenticated-user-email");
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("strip client-supplied")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_adds_actor_and_request_id_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        let db_path = tempdir.path().join("actor.sqlite");
+        state.ledger = Arc::new(TokioMutex::new(
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
+        ));
+        state.ledger_backend = LedgerBackend::sqlite(db_path);
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("authorization", "Bearer secret-token")
+                    .header("x-noet-request-id", "req-actor")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "project": "noether" }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let historical = state
+            .read_ledger(|ledger| ledger.historical_authorize_requests())
+            .await
+            .expect("historical requests");
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].request.metadata["request_id"], "req-actor");
+        assert_eq!(historical[0].request.metadata["actor"]["id"], "api_key");
+        assert_eq!(historical[0].request.metadata["actor"]["source"], "bearer");
+    }
+
+    #[tokio::test]
+    async fn trusted_actor_header_overrides_client_claimed_user_identity() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        state.actor_header = Some(Arc::<str>::from("x-goog-authenticated-user-email"));
+        let db_path = tempdir.path().join("iap-actor.sqlite");
+        state.ledger = Arc::new(TokioMutex::new(
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
+        ));
+        state.ledger_backend = LedgerBackend::sqlite(db_path);
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("authorization", "Bearer secret-token")
+                    .header(
+                        "x-goog-authenticated-user-email",
+                        "accounts.google.com:alice@example.com",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "subject": "user:eve",
+                            "entities": ["user:eve", "project:noether"]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let historical = state
+            .read_ledger(|ledger| ledger.historical_authorize_requests())
+            .await
+            .expect("historical requests");
+        assert_eq!(
+            historical[0].request.subject.as_deref(),
+            Some("user:alice@example.com")
+        );
+        assert_eq!(
+            historical[0].request.entities,
+            vec![
+                "project:noether".to_owned(),
+                "user:alice@example.com".to_owned()
+            ]
+        );
+        assert_eq!(
+            historical[0].request.metadata["actor"]["id"],
+            "accounts.google.com:alice@example.com"
+        );
+        assert_eq!(
+            historical[0].request.metadata["actor"]["source"],
+            "trusted_header"
+        );
+        assert_eq!(
+            historical[0].request.metadata["client_claimed_subject"],
+            "user:eve"
+        );
+        assert_eq!(
+            historical[0].request.metadata["client_claimed_user_entities"],
+            json!(["user:eve"])
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_requests_decisions_and_replay_capacity() {
+        let app = build_router(test_state(None));
+
+        let authorize_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/authorize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "project": "noether" }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("authorize response");
+        assert_eq!(authorize_response.status(), StatusCode::OK);
+
+        let metrics_response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        let metrics = std::str::from_utf8(&body).expect("metrics utf8");
+        assert!(metrics.contains("noet_requests_total 2"));
+        assert!(metrics.contains("noet_decisions_allow_total 1"));
+        assert!(metrics.contains(&format!("noet_replay_job_capacity {APP_REPLAY_MAX_JOBS}")));
+    }
+
+    #[tokio::test]
+    async fn record_event_actor_is_exposed_in_approval_audit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        let db_path = tempdir.path().join("approval-actor.sqlite");
+        state.ledger = Arc::new(TokioMutex::new(
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
+        ));
+        state.ledger_backend = LedgerBackend::sqlite(db_path);
+        let app = build_router(state);
+
+        let event = json!({
+            "trace_id": "trace-approval-actor",
+            "kind": "approval.self.approved",
+            "payload": {
+                "subject": "user:alice",
+                "actor": {"id": "user:spoofed", "source": "client"},
+                "rule_id": "restricted-tool",
+                "decision_reason": "approval requested"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("authorization", "Bearer secret-token")
+                    .header("x-noet-request-id", "req-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("event response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let audit_response = app
+            .oneshot(
+                Request::get("/v1/reports/approval-audit")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("audit response");
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let body = to_bytes(audit_response.into_body(), usize::MAX)
+            .await
+            .expect("audit body");
+        let payload: Value = serde_json::from_slice(&body).expect("audit json");
+        assert_eq!(payload["items"][0]["actor"], "api_key");
+        assert_eq!(payload["items"][0]["request_id"], "req-approval");
+    }
+
+    #[tokio::test]
+    async fn trusted_actor_header_overwrites_client_claimed_event_actor() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state(None);
+        state.api_key = Some(Arc::<str>::from("secret-token"));
+        state.actor_header = Some(Arc::<str>::from("x-goog-authenticated-user-email"));
+        let db_path = tempdir.path().join("approval-trusted-actor.sqlite");
+        state.ledger = Arc::new(TokioMutex::new(
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
+        ));
+        state.ledger_backend = LedgerBackend::sqlite(db_path);
+        let app = build_router(state);
+
+        let event = json!({
+            "trace_id": "trace-approval-trusted-actor",
+            "kind": "approval.self.approved",
+            "payload": {
+                "subject": "user:eve",
+                "actor": {"id": "user:eve", "source": "client"},
+                "rule_id": "restricted-tool",
+                "decision_reason": "approval requested"
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("authorization", "Bearer secret-token")
+                    .header(
+                        "x-goog-authenticated-user-email",
+                        "accounts.google.com:alice@example.com",
+                    )
+                    .header("x-noet-request-id", "req-trusted-approval")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("event response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let audit_response = app
+            .oneshot(
+                Request::get("/v1/reports/approval-audit")
+                    .header("authorization", "Bearer secret-token")
+                    .header(
+                        "x-goog-authenticated-user-email",
+                        "accounts.google.com:alice@example.com",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("audit response");
+        assert_eq!(audit_response.status(), StatusCode::OK);
+        let body = to_bytes(audit_response.into_body(), usize::MAX)
+            .await
+            .expect("audit body");
+        let payload: Value = serde_json::from_slice(&body).expect("audit json");
+        assert_eq!(
+            payload["items"][0]["actor"],
+            "accounts.google.com:alice@example.com"
+        );
+        assert_eq!(payload["items"][0]["request_id"], "req-trusted-approval");
+    }
+
     fn report_request(
         trace_id: &str,
         request_id: &str,
@@ -3746,7 +4508,7 @@ mod tests {
             br#"{"ok":true}"#,
         )
         .await;
-        let app = build_router(state_with_routes(
+        let mut state = state_with_routes(
             fixture_dir.clone(),
             ProxyRoutes {
                 routes: vec![ProxyRoute {
@@ -3757,7 +4519,10 @@ mod tests {
                     upstream_base_url: upstream.base_url.clone(),
                 }],
             },
-        ));
+        );
+        state.api_key = Some(Arc::<str>::from("noether-secret"));
+        state.actor_header = Some(Arc::<str>::from("x-goog-authenticated-user-email"));
+        let app = build_router(state);
         let request_body = r#"{"model":"gpt-test", "api_key":"sk-body", "messages":[]}"#;
 
         let response = app
@@ -3765,6 +4530,11 @@ mod tests {
                 Request::put("/providers/openai/v1/chat/completions?stream=false")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer sk-test")
+                    .header("x-noet-api-key", "noether-secret")
+                    .header(
+                        "x-goog-authenticated-user-email",
+                        "accounts.google.com:alice@example.com",
+                    )
                     .header("x-account-id", "acct_123")
                     .header("x-noet-provider", "openai")
                     .body(Body::from(request_body))
@@ -3802,6 +4572,8 @@ mod tests {
             request.headers.get("authorization").map(String::as_str),
             Some("Bearer sk-test")
         );
+        assert_eq!(request.headers.get("x-noet-api-key"), None);
+        assert_eq!(request.headers.get("x-goog-authenticated-user-email"), None);
         assert_eq!(
             request.headers.get("x-account-id").map(String::as_str),
             Some("acct_123")
@@ -3843,6 +4615,43 @@ mod tests {
                 panic!("expected captured JSON")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn transparent_route_strips_noether_bearer_authorization_before_upstream() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let fixture_dir = tempdir.path().join("fixtures");
+        let upstream = start_upstream(StatusCode::OK, vec![], br#"{"ok":true}"#).await;
+        let mut state = state_with_routes(
+            fixture_dir,
+            ProxyRoutes {
+                routes: vec![ProxyRoute {
+                    id: "openai-wrapper".to_owned(),
+                    path_prefix: Some("/providers/openai".to_owned()),
+                    header_name: None,
+                    header_value: None,
+                    upstream_base_url: upstream.base_url.clone(),
+                }],
+            },
+        );
+        state.api_key = Some(Arc::<str>::from("noether-secret"));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/providers/openai/v1/responses")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer noether-secret")
+                    .body(Body::from(r#"{"model":"gpt-test"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = upstream.observed.lock().await;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].headers.get("authorization"), None);
     }
 
     #[tokio::test]
@@ -4139,7 +4948,8 @@ mod tests {
 
     #[tokio::test]
     async fn events_endpoint_accepts_trace_events() {
-        let app = build_router(test_state(None));
+        let state = test_state(None);
+        let app = build_router(state.clone());
         let response = app
             .oneshot(
                 Request::post("/v1/events")
@@ -4153,6 +4963,48 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_preserves_non_object_payloads_when_adding_context() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("events.sqlite");
+        let mut state = test_state(None);
+        state.ledger = Arc::new(TokioMutex::new(
+            BudgetLedger::open_sqlite(&db_path).expect("sqlite ledger"),
+        ));
+        state.ledger_backend = LedgerBackend::sqlite(db_path);
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/events")
+                    .header("content-type", "application/json")
+                    .header("x-noet-request-id", "req-array-payload")
+                    .body(Body::from(
+                        json!({
+                            "trace_id":"trace-array-payload",
+                            "kind":"custom.array_payload",
+                            "payload":["kept", 1]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let trace = state
+            .read_ledger(|ledger| ledger.trace_report("trace-array-payload"))
+            .await
+            .expect("trace report");
+        assert_eq!(trace.items.len(), 1);
+        assert!(
+            trace.items[0]
+                .summary
+                .contains("keys=actor,original_payload,request_id")
+        );
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ pub struct NoetherClient {
     url: reqwest::Url,
     client: reqwest::Client,
     fail_mode: FailMode,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -40,6 +41,7 @@ impl NoetherClient {
                 .timeout(Duration::from_millis(1_000))
                 .build()?,
             fail_mode: FailMode::FailClosed,
+            api_key: None,
         })
     }
 
@@ -55,9 +57,16 @@ impl NoetherClient {
         self
     }
 
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into();
+        self.api_key = (!api_key.trim().is_empty()).then(|| api_key.trim().to_owned());
+        self
+    }
+
     pub async fn authorize(&self, request: &AuthorizeRequest) -> AuthorizeDecision {
         match self.post("v1/authorize", request).await {
             Ok(decision) => decision,
+            Err(error) if is_auth_failure(&error) => synthetic_auth_failure_decision(&error),
             Err(error) => synthetic_decision(self.fail_mode, &error),
         }
     }
@@ -119,7 +128,7 @@ impl NoetherClient {
         T: serde::de::DeserializeOwned,
     {
         let url = self.url.join(path)?;
-        let response = self.client.get(url).send().await?;
+        let response = self.apply_auth(self.client.get(url)).send().await?;
         decode_response(response).await
     }
 
@@ -129,8 +138,20 @@ impl NoetherClient {
         B: serde::Serialize + ?Sized,
     {
         let url = self.url.join(path)?;
-        let response = self.client.post(url).json(body).send().await?;
+        let response = self
+            .apply_auth(self.client.post(url))
+            .json(body)
+            .send()
+            .await?;
         decode_response(response).await
+    }
+
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(api_key) = &self.api_key {
+            builder.bearer_auth(api_key)
+        } else {
+            builder
+        }
     }
 }
 
@@ -188,6 +209,30 @@ fn synthetic_decision(fail_mode: FailMode, error: &NoetherClientError) -> Author
     }
 }
 
+fn synthetic_auth_failure_decision(error: &NoetherClientError) -> AuthorizeDecision {
+    AuthorizeDecision {
+        decision_id: "sdk-auth_failure".to_owned(),
+        outcome: DecisionOutcome::Deny,
+        action: PolicyAction::Block,
+        reservation: None,
+        explanations: vec![DecisionExplanation {
+            rule_id: "sdk.sidecar_auth_failed".to_owned(),
+            reason: format!("Noether authentication failed; refusing fail-open behavior: {error}"),
+            severity: DecisionSeverity::Deny,
+        }],
+        metadata: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn is_auth_failure(error: &NoetherClientError) -> bool {
+    matches!(
+        error,
+        NoetherClientError::Http { status, .. }
+            if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN
+    )
+}
+
 fn percent_encode_path_component(input: &str) -> String {
     let mut encoded = String::new();
     for byte in input.bytes() {
@@ -207,7 +252,7 @@ fn percent_encode_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::body::Bytes;
-    use axum::http::{Method, Uri};
+    use axum::http::{HeaderMap, Method, Uri};
     use axum::routing::any;
     use axum::{Json, Router};
     use noether::contract::{ReservationStatus, UsageObservation};
@@ -233,7 +278,10 @@ mod tests {
             .await;
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert_eq!(
-            decision.reservation.as_ref().map(|reservation| reservation.id.as_str()),
+            decision
+                .reservation
+                .as_ref()
+                .map(|reservation| reservation.id.as_str()),
             Some("reservation-1")
         );
 
@@ -276,6 +324,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_sends_configured_api_key_to_health_and_decision_endpoints() {
+        let server = TestServer::start_requiring_api_key("secret-token").await;
+        let client = NoetherClient::new(&server.url)
+            .expect("client")
+            .with_api_key("secret-token");
+
+        assert_eq!(client.health().await.expect("health").status, "ok");
+        assert_eq!(
+            client.authorize(&authorize_request()).await.outcome,
+            DecisionOutcome::Allow
+        );
+    }
+
+    #[tokio::test]
     async fn fail_modes_return_synthetic_decisions_when_sidecar_is_unavailable() {
         let fail_open = NoetherClient::new("http://127.0.0.1:9")
             .expect("client")
@@ -300,61 +362,57 @@ mod tests {
         assert!(matches!(result, Err(NoetherClientError::Denied(_, _))));
     }
 
+    #[tokio::test]
+    async fn fail_open_does_not_synthesize_allow_for_auth_failures() {
+        let server = TestServer::start_rejecting_authorize(StatusCode::UNAUTHORIZED).await;
+        let client = NoetherClient::new(&server.url)
+            .expect("client")
+            .with_api_key("wrong-token")
+            .with_fail_mode(FailMode::FailOpen);
+
+        let decision = client.authorize(&authorize_request()).await;
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(decision.action, PolicyAction::Block);
+        assert_eq!(decision.explanations[0].rule_id, "sdk.sidecar_auth_failed");
+    }
+
     struct TestServer {
         url: String,
     }
 
     impl TestServer {
         async fn start() -> Self {
+            let app =
+                Router::new().fallback(any(|method: Method, uri: Uri, body: Bytes| async move {
+                    handle_test_request(method, uri, HeaderMap::new(), body, None)
+                }));
+            Self::serve(app).await
+        }
+
+        async fn start_requiring_api_key(api_key: &'static str) -> Self {
             let app = Router::new().fallback(any(
-                |method: Method, uri: Uri, body: Bytes| async move {
-                    let path = uri.path();
-                    if method == Method::POST && path == "/v1/authorize" {
-                        return Json(json!({
-                            "decision_id":"decision-1",
-                            "outcome":"allow",
-                            "action":"allow",
-                            "reservation":{
-                                "id":"reservation-1",
-                                "amount_usd":0.12,
-                                "currency":"USD",
-                                "status":"active",
-                                "created_at":"2026-05-27T00:00:00Z",
-                                "expires_at":"2026-05-27T01:00:00Z"
-                            },
-                            "explanations":[],
-                            "created_at":"2026-05-27T00:00:00Z"
-                        }));
-                    }
-                    if method == Method::POST && path == "/v1/reservations/reservation-1/finalize"
-                    {
-                        let value: serde_json::Value =
-                            serde_json::from_slice(&body).expect("json body");
-                        assert_eq!(value["actual_cost_usd"], 0.10);
-                        return Json(json!({
-                            "id":"reservation-1",
-                            "amount_usd":0.10,
-                            "currency":"USD",
-                            "status":"finalized",
-                            "created_at":"2026-05-27T00:00:00Z",
-                            "expires_at":"2026-05-27T01:00:00Z"
-                        }));
-                    }
-                    if method == Method::POST && path == "/v1/events" {
-                        return Json(json!({"accepted":true}));
-                    }
-                    if method == Method::GET && path == "/health" {
-                        return Json(json!({
-                            "status":"ok",
-                            "decision_mode":"dry_run",
-                            "policy_loaded":true,
-                            "upstream_configured":false,
-                            "route_count":0
-                        }));
-                    }
-                    Json(json!({"error":"not found"}))
+                move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| async move {
+                    handle_test_request(method, uri, headers, body, Some(api_key))
                 },
             ));
+            Self::serve(app).await
+        }
+
+        async fn start_rejecting_authorize(status: StatusCode) -> Self {
+            let app = Router::new().fallback(any(move |method: Method, uri: Uri| async move {
+                if method == Method::POST && uri.path() == "/v1/authorize" {
+                    return (
+                        status,
+                        Json(json!({"error":"missing or invalid Noether API key"})),
+                    );
+                }
+                (StatusCode::NOT_FOUND, Json(json!({"error":"not found"})))
+            }));
+            Self::serve(app).await
+        }
+
+        async fn serve(app: Router) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
             let addr = listener.local_addr().expect("addr");
             tokio::spawn(async move {
@@ -364,6 +422,67 @@ mod tests {
                 url: format!("http://{addr}"),
             }
         }
+    }
+
+    fn handle_test_request(
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        expected_api_key: Option<&str>,
+    ) -> Json<serde_json::Value> {
+        if let Some(api_key) = expected_api_key {
+            let expected = format!("Bearer {api_key}");
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected.as_str())
+            );
+        }
+        let path = uri.path();
+        if method == Method::POST && path == "/v1/authorize" {
+            return Json(json!({
+                "decision_id":"decision-1",
+                "outcome":"allow",
+                "action":"allow",
+                "reservation":{
+                    "id":"reservation-1",
+                    "amount_usd":0.12,
+                    "currency":"USD",
+                    "status":"active",
+                    "created_at":"2026-05-27T00:00:00Z",
+                    "expires_at":"2026-05-27T01:00:00Z"
+                },
+                "explanations":[],
+                "created_at":"2026-05-27T00:00:00Z"
+            }));
+        }
+        if method == Method::POST && path == "/v1/reservations/reservation-1/finalize" {
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(value["actual_cost_usd"], 0.10);
+            return Json(json!({
+                "id":"reservation-1",
+                "amount_usd":0.10,
+                "currency":"USD",
+                "status":"finalized",
+                "created_at":"2026-05-27T00:00:00Z",
+                "expires_at":"2026-05-27T01:00:00Z"
+            }));
+        }
+        if method == Method::POST && path == "/v1/events" {
+            return Json(json!({"accepted":true}));
+        }
+        if method == Method::GET && path == "/health" {
+            return Json(json!({
+                "status":"ok",
+                "decision_mode":"dry_run",
+                "policy_loaded":true,
+                "upstream_configured":false,
+                "route_count":0
+            }));
+        }
+        Json(json!({"error":"not found"}))
     }
 
     fn authorize_request() -> AuthorizeRequest {

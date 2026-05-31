@@ -50,6 +50,7 @@ integration -> POST /v1/events</pre>
         <li><code>POST /v1/reservations/{id}/finalize</code> - report actual provider outcome.</li>
         <li><code>POST /v1/events</code> - record harness/tool/session events.</li>
         <li><code>GET /health</code> - read sidecar runtime posture.</li>
+        <li><code>GET /metrics</code> - read pilot counters and gauges.</li>
       </ul>
     </main>
   </body>
@@ -77,6 +78,7 @@ mod tests {
         assert!(spec["paths"]["/v1/reservations/{id}/finalize"]["post"].is_object());
         assert!(spec["paths"]["/v1/events"]["post"].is_object());
         assert!(spec["paths"]["/health"]["get"].is_object());
+        assert!(spec["paths"]["/metrics"]["get"].is_object());
     }
 
     #[test]

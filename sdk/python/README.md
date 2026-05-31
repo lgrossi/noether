@@ -5,12 +5,15 @@ Dependency-free Python client for the Noether decision sidecar API.
 Noether does not call providers. Your integration owns provider transport:
 
 ```python
+import os
+
 from noether_sidecar import NoetherClient
 
 noether = NoetherClient(
     url="http://127.0.0.1:4051",
     timeout=1.0,
     fail_mode="fail_closed",
+    api_key=os.environ.get("NOET_API_KEY"),
 )
 
 decision = noether.require_authorization({

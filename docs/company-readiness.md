@@ -61,6 +61,10 @@ application platform.
 - External security recipe: [deployment/iap-reverse-proxy.md](./deployment/iap-reverse-proxy.md)
 - Pi and LiteLLM production smoke checklist:
   [testing/pi-litellm-production-smoke.md](./testing/pi-litellm-production-smoke.md)
+- Repeatable pilot smoke instructions:
+  [testing/pilot-smoke-instructions.md](./testing/pilot-smoke-instructions.md)
+- Latest local pilot smoke evidence:
+  [testing/pilot-smoke-evidence-2026-05-31.md](./testing/pilot-smoke-evidence-2026-05-31.md)
 - Audited self-approval direction: [audited-self-approval.md](./audited-self-approval.md)
 - Integration gap plan: [integration-gap-plan.md](./integration-gap-plan.md)
 - Hard-vs-report-only capability matrix:

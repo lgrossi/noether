@@ -143,6 +143,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -301,6 +302,7 @@ function deferred() {
 {
 	const config = extension.extensionConfig({
 		NOET_URL: "http://127.0.0.1:4040/",
+		NOET_API_KEY: "secret-token",
 		NOET_PI_PROJECT: "noether",
 		NOET_PI_SUBJECT: "user:alice",
 		NOET_PI_BUDGET_ID: "project-noether",
@@ -309,6 +311,7 @@ function deferred() {
 	const request = extension.buildAuthorizeRequest({ payload: { model: "local" } }, fakeContext(), config);
 
 	assert.equal(config.noetherUrl, "http://127.0.0.1:4040");
+	assert.equal(config.apiKey, "secret-token");
 	assert.equal(request.budget_id, "project-noether");
 	assert.deepEqual(request.entities, ["project:noether", "user:alice"]);
 }
@@ -389,8 +392,15 @@ function deferred() {
 	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-"));
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init) => {
-		calls.push({ url: String(url), body: init?.body && JSON.parse(init.body) });
+		calls.push({
+			url: String(url),
+			authorization: init?.headers?.authorization,
+			body: init?.body && JSON.parse(init.body),
+		});
 		if (String(url).endsWith("/health")) {
+			if (init?.headers?.authorization !== "Bearer secret-token") {
+				return new Response("unauthorized", { status: 401 });
+			}
 			return new Response(healthy ? "ok" : "down", { status: healthy ? 200 : 503 });
 		}
 		if (String(url).endsWith("/v1/authorize")) {
@@ -415,13 +425,15 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:4051",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
 				autoStartLocal: true,
 				localRoot,
 				localStartTimeoutMs: 1000,
-				startLocalNoether: async () => {
+				startLocalNoether: async (params) => {
+					assert.equal(params.apiKey, "secret-token");
 					starts += 1;
 					healthy = true;
 					return process.pid;
@@ -434,6 +446,10 @@ function deferred() {
 
 		assert.equal(starts, 1);
 		assert.equal(calls.some((call) => call.url.endsWith("/health")), true);
+		assert.equal(
+			calls.filter((call) => call.url.endsWith("/health")).every((call) => call.authorization === "Bearer secret-token"),
+			true,
+		);
 		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -442,8 +458,60 @@ function deferred() {
 }
 
 {
-	const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-fail-open-"));
 	const originalFetch = globalThis.fetch;
+		globalThis.fetch = async (url) => {
+			if (String(url).endsWith("/health")) {
+				return new Response(JSON.stringify({ error: "missing or invalid Noether API key" }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+		};
+
+		try {
+			const handlers = new Map();
+			const ui = captureUiSignals();
+			extension.default(
+				{
+					on(event, handler) {
+						handlers.set(event, handler);
+					},
+				},
+				{
+					noetherUrl: "http://127.0.0.1:4051",
+					failMode: "fail_open",
+					includeBody: false,
+					version: "test",
+					autoStartLocal: true,
+					localStartTimeoutMs: 100,
+					startLocalNoether: async () => {
+						throw new Error("should not autostart after auth failure");
+					},
+				},
+			);
+
+			let aborted = false;
+			await handlers.get("before_provider_request")(
+				{ payload: { model: "local" } },
+				fakeContext({
+					ui: ui.ui,
+					abort: () => {
+						aborted = true;
+					},
+				}),
+			);
+
+			assert.equal(aborted, true);
+			assert.match(ui.notifications.at(-1).message, /Noether authentication failed/);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	{
+		const localRoot = await mkdtemp(resolve(tmpdir(), "pi-noether-sidecar-fail-open-"));
+		const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url) => {
 		if (String(url).endsWith("/health")) {
 			return new Response("down", { status: 503 });
@@ -732,7 +800,7 @@ function deferred() {
 	const calls = [];
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init) => {
-		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+		calls.push({ url: String(url), headers: init.headers, body: init.body && JSON.parse(init.body) });
 		if (String(url).endsWith("/v1/authorize")) {
 			return Response.json({
 				decision_id: "dec_1",
@@ -763,6 +831,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -787,6 +856,7 @@ function deferred() {
 		assert(ui.statuses.some((status) => status.text === "Daily budget exceeded."));
 		assert.equal(calls.some((call) => call.url.endsWith("/v1/authorize")), true);
 		const authorizeCall = calls.find((call) => call.url.endsWith("/v1/authorize"));
+		assert.equal(authorizeCall.headers.authorization, "Bearer secret-token");
 		assert.equal(typeof authorizeCall.body.metadata.trace_id, "string");
 		assert.equal(typeof authorizeCall.body.metadata.request_id, "string");
 		assert.equal(JSON.stringify(calls).includes("do not send"), false);
@@ -831,6 +901,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -911,6 +982,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -997,6 +1069,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1056,6 +1129,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1108,6 +1182,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1173,6 +1248,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1240,6 +1316,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1306,6 +1383,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1368,6 +1446,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1421,6 +1500,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1459,6 +1539,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1551,6 +1632,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1573,6 +1655,57 @@ function deferred() {
 {
 	const calls = [];
 	const originalFetch = globalThis.fetch;
+		globalThis.fetch = async (url, init) => {
+			calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
+			if (String(url).endsWith("/v1/authorize")) {
+				return new Response(JSON.stringify({ error: "missing or invalid Noether API key" }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 202, headers: { "content-type": "application/json" } });
+		};
+
+		try {
+			const handlers = new Map();
+			const ui = captureUiSignals();
+			extension.default(
+				{
+					on(event, handler) {
+						handlers.set(event, handler);
+					},
+				},
+				{
+					noetherUrl: "http://127.0.0.1:1",
+					failMode: "fail_open",
+					includeBody: false,
+					version: "test",
+				},
+			);
+
+			let aborted = false;
+			await handlers.get("before_provider_request")(
+				{ payload: { model: "local" } },
+				fakeContext({
+					ui: ui.ui,
+					abort: () => {
+						aborted = true;
+					},
+				}),
+			);
+
+			assert.equal(aborted, true);
+			assert.equal(ui.notifications.at(-1).type, "error");
+			assert.match(ui.notifications.at(-1).message, /Noether authentication failed/);
+			await waitFor(() => calls.some((call) => call.body.kind === "pi.authorize_error"), "authorize error event");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	{
+		const calls = [];
+		const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init) => {
 		calls.push({ url: String(url), body: init.body && JSON.parse(init.body) });
 		if (String(url).endsWith("/v1/authorize")) {
@@ -1647,6 +1780,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1697,6 +1831,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1743,6 +1878,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1802,6 +1938,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1873,6 +2010,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1923,6 +2061,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -1987,6 +2126,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -2059,6 +2199,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -2104,6 +2245,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -2165,6 +2307,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",
@@ -2205,6 +2348,7 @@ function deferred() {
 			},
 			{
 				noetherUrl: "http://127.0.0.1:1",
+				apiKey: "secret-token",
 				failMode: "fail_open",
 				includeBody: false,
 				version: "test",

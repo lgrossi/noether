@@ -9,6 +9,7 @@ export type NoetherClientOptions = {
 	url?: string;
 	timeoutMs?: number;
 	failMode?: FailMode;
+	apiKey?: string;
 	fetch?: typeof fetch;
 };
 
@@ -112,6 +113,12 @@ export type HealthResponse = {
 	policy_loaded: boolean;
 	upstream_configured: boolean;
 	route_count: number;
+	ledger_backend: string;
+	auth_configured: boolean;
+	request_body_limit_bytes: number;
+	replay_jobs: number;
+	replay_job_capacity: number;
+	postgres_async_finalize_failures?: number | null;
 };
 
 export type WithDecisionContext = {
@@ -146,16 +153,22 @@ export class NoetherDeniedError extends NoetherError {
 	}
 }
 
+function isNoetherAuthFailure(error: unknown): boolean {
+	return error instanceof NoetherHttpError && (error.status === 401 || error.status === 403);
+}
+
 export class NoetherClient {
 	readonly url: string;
 	readonly timeoutMs: number;
 	readonly failMode: FailMode;
+	readonly apiKey?: string;
 	private readonly fetchImpl: typeof fetch;
 
 	constructor(options: NoetherClientOptions = {}) {
 		this.url = stripTrailingSlash(options.url ?? "http://127.0.0.1:4051");
 		this.timeoutMs = options.timeoutMs ?? 1_000;
 		this.failMode = options.failMode ?? "fail_closed";
+		this.apiKey = options.apiKey;
 		this.fetchImpl = options.fetch ?? globalThis.fetch;
 		if (!this.fetchImpl) {
 			throw new NoetherError("No fetch implementation available");
@@ -166,6 +179,9 @@ export class NoetherClient {
 		try {
 			return await this.postJson<AuthorizeDecision>("/v1/authorize", request);
 		} catch (error) {
+			if (isNoetherAuthFailure(error)) {
+				throw error;
+			}
 			return syntheticDecision(this.failMode, error);
 		}
 	}
@@ -215,9 +231,14 @@ export class NoetherClient {
 	private async request(path: string, init: RequestInit): Promise<Response> {
 		const controller = new AbortController();
 		const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+		const headers = new Headers(init.headers);
+		if (this.apiKey) {
+			headers.set("Authorization", `Bearer ${this.apiKey}`);
+		}
 		try {
 			const response = await this.fetchImpl(`${this.url}${path}`, {
 				...init,
+				headers,
 				signal: controller.signal,
 			});
 			if (!response.ok) {

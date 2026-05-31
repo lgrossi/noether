@@ -11,6 +11,7 @@ const noether = new NoetherClient({
   url: "http://127.0.0.1:4051",
   timeoutMs: 1000,
   failMode: "fail_closed",
+  apiKey: process.env.NOET_API_KEY,
 });
 
 const decision = await noether.requireAuthorization({

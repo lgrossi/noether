@@ -42,6 +42,8 @@ pub struct ApprovalAuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
@@ -142,7 +144,7 @@ pub fn approval_audit_report_from_events(
     for item in &mut items {
         item.risk_flags = risk_flags(item, &repeated_keys, config);
     }
-    items.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.occurred_at));
     let summary = approval_audit_summary(&items);
     ApprovalAuditReport { summary, items }
 }
@@ -171,6 +173,10 @@ impl ApprovalAuditEvent {
             reservation_id: string_path(&event.payload, &["reservation_id"]),
             subject: string_path(&event.payload, &["subject"])
                 .or_else(|| request.and_then(|request| string_path(request, &["subject"]))),
+            actor: string_path(&event.payload, &["actor"])
+                .or_else(|| string_path(&event.payload, &["actor", "id"]))
+                .or_else(|| string_path(metadata?, &["actor"]))
+                .or_else(|| string_path(metadata?, &["actor", "id"])),
             project: string_path(&event.payload, &["project"])
                 .or_else(|| request.and_then(|request| string_path(request, &["project"]))),
             rule_id: string_path(&event.payload, &["rule_id"])
@@ -251,10 +257,11 @@ fn risk_flags(
     }
     if item.outcome == ApprovalOutcome::Approved
         && item
-            .subject
-            .as_ref()
+            .audit_principal()
             .zip(item.rule_id.as_ref())
-            .and_then(|(subject, rule_id)| repeated_keys.get(&(subject.clone(), rule_id.clone())))
+            .and_then(|(principal, rule_id)| {
+                repeated_keys.get(&(principal.clone(), rule_id.clone()))
+            })
             .is_some()
     {
         flags.push(ApprovalRiskFlag::RepeatedSubjectRuleApproval);
@@ -279,18 +286,27 @@ fn repeated_approval_keys(
         if item.outcome != ApprovalOutcome::Approved {
             continue;
         }
-        let Some(subject) = item.subject.as_ref() else {
+        let Some(principal) = item.audit_principal() else {
             continue;
         };
         let Some(rule_id) = item.rule_id.as_ref() else {
             continue;
         };
         *counts
-            .entry((subject.clone(), rule_id.clone()))
+            .entry((principal.clone(), rule_id.clone()))
             .or_insert(0) += 1;
     }
     counts.retain(|_, count| *count >= threshold);
     counts
+}
+
+impl ApprovalAuditEvent {
+    fn audit_principal(&self) -> Option<&String> {
+        self.actor
+            .as_ref()
+            .filter(|actor| actor.as_str() != "api_key" && actor.as_str() != "anonymous")
+            .or(self.subject.as_ref())
+    }
 }
 
 fn has_lifecycle_limit_followup(item: &ApprovalAuditEvent) -> bool {
@@ -485,6 +501,80 @@ mod tests {
     }
 
     #[test]
+    fn repeated_approval_grouping_prefers_authoritative_actor_over_subject() {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap();
+        let mut first = approved_event(
+            occurred_at,
+            "user:spoofed-a",
+            Some("noether"),
+            "rule-a",
+            0.1,
+            None,
+        );
+        first.actor = Some("accounts.google.com:alice@example.com".to_owned());
+        let mut second = approved_event(
+            occurred_at,
+            "user:spoofed-b",
+            Some("noether"),
+            "rule-a",
+            0.1,
+            None,
+        );
+        second.actor = Some("accounts.google.com:alice@example.com".to_owned());
+        let store = InMemoryApprovalAuditStore::new(vec![first, second]);
+
+        let report = approval_audit_report(
+            &store,
+            ApprovalAuditConfig {
+                repeated_approval_threshold: 2,
+                ..ApprovalAuditConfig::default()
+            },
+        )
+        .expect("report");
+
+        assert_eq!(report.summary.repeated_subject_rule_approvals, 2);
+        assert!(report.items.iter().all(|item| {
+            item.risk_flags
+                .contains(&ApprovalRiskFlag::RepeatedSubjectRuleApproval)
+        }));
+    }
+
+    #[test]
+    fn repeated_approval_grouping_ignores_api_key_actor() {
+        let occurred_at = Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap();
+        let mut first = approved_event(
+            occurred_at,
+            "user:alice",
+            Some("noether"),
+            "rule-a",
+            0.1,
+            None,
+        );
+        first.actor = Some("api_key".to_owned());
+        let mut second = approved_event(
+            occurred_at,
+            "user:bob",
+            Some("noether"),
+            "rule-a",
+            0.1,
+            None,
+        );
+        second.actor = Some("api_key".to_owned());
+        let store = InMemoryApprovalAuditStore::new(vec![first, second]);
+
+        let report = approval_audit_report(
+            &store,
+            ApprovalAuditConfig {
+                repeated_approval_threshold: 2,
+                ..ApprovalAuditConfig::default()
+            },
+        )
+        .expect("report");
+
+        assert_eq!(report.summary.repeated_subject_rule_approvals, 0);
+    }
+
+    #[test]
     fn memory_store_can_be_seeded_from_trace_events() {
         let trace_events = vec![
             TraceEvent {
@@ -531,6 +621,7 @@ mod tests {
             decision_id: None,
             reservation_id: None,
             subject: Some(subject.to_owned()),
+            actor: None,
             project: project.map(ToOwned::to_owned),
             rule_id: Some(rule_id.to_owned()),
             original_action: Some("ask".to_owned()),
