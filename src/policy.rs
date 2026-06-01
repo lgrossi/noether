@@ -67,9 +67,15 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
             policy.routing.mode
         ));
     }
+    let mut budget_ids = BTreeSet::new();
     for budget in &policy.budgets {
         if budget.id.trim().is_empty() {
             errors.push("budget id must not be empty".to_owned());
+        } else if !budget_ids.insert(budget.id.clone()) {
+            errors.push(format!(
+                "budget ids must be unique, found duplicate id {}",
+                budget.id
+            ));
         }
         if budget.limits.spend.is_empty() {
             errors.push(format!(
@@ -306,6 +312,11 @@ pub fn validate_policy(policy: &PolicyFile) -> Result<(), NoetError> {
                 policy_rule.id
             ));
         }
+        validate_rule_match(
+            &format!("policy {}", policy_rule.id),
+            &policy_rule.when.rule_match,
+            &mut errors,
+        );
     }
 
     if errors.is_empty() {
@@ -387,7 +398,7 @@ pub fn rule_match_matches(rule_match: &RuleMatch, request: &AuthorizeRequest) ->
         && matches_entity_kind_optional(request, "workflow", &rule_match.workflow)
         && matches_entity_kind_optional(request, "surface", &rule_match.surface)
         && matches_optional(&rule_match.provider, &request.provider)
-        && matches_optional(&rule_match.model, &request.model);
+        && matches_model_optional(&rule_match.model, request);
     let any_match = rule_match.any.is_empty()
         || rule_match
             .any
@@ -463,6 +474,23 @@ fn matches_optional(expected: &Option<String>, actual: &Option<String>) -> bool 
             .as_ref()
             .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
     })
+}
+
+fn matches_model_optional(expected: &Option<String>, request: &AuthorizeRequest) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return true;
+    };
+    let Some(model) = request.model.as_deref() else {
+        return false;
+    };
+    if expected.contains(':') {
+        let Some(provider) = request.provider.as_deref() else {
+            return false;
+        };
+        model_pattern_matches(expected, &format!("{provider}:{model}"))
+    } else {
+        model_pattern_matches(expected, model)
+    }
 }
 
 fn matches_user_optional(expected: &Option<String>, request: &AuthorizeRequest) -> bool {
@@ -552,16 +580,17 @@ fn spend_window_label(limit: &SpendWindowLimit) -> &str {
 
 pub fn parse_limit_window(value: &str) -> Option<chrono::Duration> {
     let trimmed = value.trim();
-    let (amount, unit) = trimmed.split_at(trimmed.len().checked_sub(1)?);
+    let unit = trimmed.chars().last()?;
+    let amount = trimmed.strip_suffix(unit)?;
     let amount: i64 = amount.parse().ok()?;
     if amount <= 0 {
         return None;
     }
     match unit {
-        "s" => Some(chrono::Duration::seconds(amount)),
-        "m" => Some(chrono::Duration::minutes(amount)),
-        "h" => Some(chrono::Duration::hours(amount)),
-        "d" => Some(chrono::Duration::days(amount)),
+        's' => Some(chrono::Duration::seconds(amount)),
+        'm' => Some(chrono::Duration::minutes(amount)),
+        'h' => Some(chrono::Duration::hours(amount)),
+        'd' => Some(chrono::Duration::days(amount)),
         _ => None,
     }
 }
@@ -785,6 +814,81 @@ budgets:
         assert!(error.to_string().contains(
             "budget duplicate-limits limits.spend ids must be unique, found duplicate id daily-cap"
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_budget_ids() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: duplicate-budget
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
+  - id: duplicate-budget
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("duplicate budget ids should be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("budget ids must be unique, found duplicate id duplicate-budget")
+        );
+    }
+
+    #[test]
+    fn validates_policy_rule_match_shape() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
+policies:
+  - id: bad-policy
+    action: warn
+    reason: malformed matcher
+    when:
+      match:
+        project: ""
+"#,
+        )
+        .expect("policy parses");
+
+        let error = validate_policy(&policy).expect_err("policy rule match should be invalid");
+        assert!(error.to_string().contains("policy bad-policy project must not be empty"));
+    }
+
+    #[test]
+    fn parse_limit_window_rejects_unicode_without_panic() {
+        assert_eq!(parse_limit_window("💥"), None);
+        assert_eq!(parse_limit_window("10💥"), None);
     }
 
     #[test]
@@ -1048,6 +1152,47 @@ budgets:
                 .iter()
                 .all(|rule| budget_rule_matches(rule, &request))
         );
+    }
+
+    #[test]
+    fn policy_rule_model_match_uses_model_allow_wildcard_semantics() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
+policies:
+  - id: match-model-family
+    action: warn
+    reason: model family matched
+    when:
+      match:
+        model: gpt-4*
+  - id: match-provider-model-family
+    action: warn
+    reason: provider/model family matched
+    when:
+      match:
+        model: openai:gpt-4*
+"#,
+        )
+        .expect("policy parses");
+        let mut request = request_with_entities(["project:noether"]);
+        request.provider = Some("openai".to_owned());
+        request.model = Some("gpt-4.1".to_owned());
+
+        let explanations = matching_policy_explanations(&policy, &request);
+
+        assert_eq!(explanations.len(), 2);
     }
 
     #[test]

@@ -208,6 +208,33 @@ pub(super) fn apply_budget_limits(context: BudgetLimitEvaluation<'_>) -> bool {
         }
     }
 
+    if let Some(available_usd) = allocation_bucket_available_usd(ledger, rule, request, now)
+        && estimated_cost > available_usd
+    {
+        let reason = format!(
+            "estimated request cost ${estimated_cost:.6} exceeds protected allocation available ${available_usd:.6}"
+        );
+        *action = merge_policy_action(*action, PolicyAction::Block);
+        explanations.push(DecisionExplanation {
+            rule_id: format!("{}.allocation", rule.id),
+            reason: reason.clone(),
+            severity: DecisionSeverity::Deny,
+        });
+        limit_hits.push(DecisionLimitHitReport {
+            rule_id: format!("{}.allocation", rule.id),
+            reason,
+            severity: DecisionSeverity::Deny,
+            window_id: Some("protected_adoption_pool".to_owned()),
+            window_mode: None,
+            window_started_at: None,
+            window_ends_at: None,
+            projected_spend_usd: Some(estimated_cost),
+            max_usd: Some(available_usd),
+            scope_entity: allocation_bucket_entity_key(rule, request),
+        });
+        return true;
+    }
+
     for projection in spend_window_projections(ledger, rule, request, estimated_cost, now)
         .expect("selected budget has valid spend window scopes")
     {
@@ -427,10 +454,14 @@ pub(super) fn newly_crossed_warn_at_fraction(projection: &SpendWindowProjection)
         .warn_at_fractions
         .iter()
         .copied()
-        .filter(|warn_at_fraction| *warn_at_fraction < 1.0)
         .filter(|warn_at_fraction| {
             let threshold = projection.max_usd * *warn_at_fraction;
-            projection.current_spend_usd < threshold && projection.projected_spend_usd >= threshold
+            projection.current_spend_usd < threshold
+                && if (*warn_at_fraction - 1.0).abs() < f64::EPSILON {
+                    (projection.projected_spend_usd - threshold).abs() < f64::EPSILON
+                } else {
+                    projection.projected_spend_usd >= threshold
+                }
         })
         .max_by(|left, right| left.total_cmp(right))
 }

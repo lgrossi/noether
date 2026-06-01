@@ -2833,7 +2833,7 @@ mod tests {
         assert!(adoption_html.contains("Budget limits changed the spend story"));
         assert!(adoption_html.contains("Protected opportunity"));
         assert!(adoption_html.contains(
-            "protected adoption surfaced $1.11 of unused protected opportunity across 3 low adopters and 5 high adopters."
+            "protected adoption surfaced $1.49 of unused protected opportunity across 3 low adopters and 5 high adopters."
         ));
     }
 
