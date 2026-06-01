@@ -2,9 +2,9 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::header::HeaderName;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::HeaderName;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use tokio_stream::StreamExt;

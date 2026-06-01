@@ -243,9 +243,8 @@ impl PolicyRuntime {
         match &*state {
             PolicyRuntimeState::Static(_) => None,
             PolicyRuntimeState::Reloadable(reloadable) => match &reloadable.last_observed_source {
-                PolicySourceSnapshot::ReadError(error) | PolicySourceSnapshot::ParseError(error) => {
-                    Some(error.clone())
-                }
+                PolicySourceSnapshot::ReadError(error)
+                | PolicySourceSnapshot::ParseError(error) => Some(error.clone()),
                 PolicySourceSnapshot::Bytes(_) => None,
             },
         }

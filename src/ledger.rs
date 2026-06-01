@@ -10607,7 +10607,9 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.explanations.iter().any(|explanation| {
             explanation.rule_id == "ai-adoption.allocation"
-                && explanation.reason.contains("protected allocation available")
+                && explanation
+                    .reason
+                    .contains("protected allocation available")
         }));
     }
 
