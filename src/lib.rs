@@ -7,6 +7,7 @@ pub mod dashboard;
 pub mod error;
 pub mod fixture;
 pub mod ledger;
+pub mod ledger_reports;
 pub mod local;
 pub mod mock;
 pub mod noether_app;

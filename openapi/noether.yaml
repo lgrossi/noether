@@ -18,6 +18,12 @@ tags:
   - name: Events
   - name: Health
   - name: Metrics
+  - name: Reports
+  - name: Policy
+  - name: App
+  - name: Replay
+  - name: Simulations
+  - name: Proxy
 security:
   - NoetherApiKey: []
   - {}
@@ -144,6 +150,530 @@ paths:
         "401":
           $ref: "#/components/responses/Error"
         "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/usage:
+    get:
+      tags: [Reports]
+      summary: Read usage and cost report rows.
+      operationId: reportUsage
+      responses:
+        "200":
+          description: Usage report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/decisions:
+    get:
+      tags: [Reports]
+      summary: Read recent authorization decisions.
+      operationId: reportDecisions
+      responses:
+        "200":
+          description: Decision report rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/traces/{trace_id}:
+    get:
+      tags: [Reports]
+      summary: Read a trace report by trace id.
+      operationId: reportTrace
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Trace report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/observations:
+    get:
+      tags: [Reports]
+      summary: Read observed events and usage observations.
+      operationId: reportObservations
+      responses:
+        "200":
+          description: Observation rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/approval-audit:
+    get:
+      tags: [Reports]
+      summary: Read approval and policy-change audit evidence.
+      operationId: reportApprovalAudit
+      responses:
+        "200":
+          description: Approval audit report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/reports/updates:
+    get:
+      tags: [Reports]
+      summary: Stream report updates as server-sent events.
+      operationId: reportUpdates
+      responses:
+        "200":
+          description: Server-sent report update stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/policy:
+    get:
+      tags: [Policy]
+      summary: Read active policy, proposal, rule stats, and suggestions.
+      operationId: appPolicy
+      responses:
+        "200":
+          description: App policy state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/policy/proposal:
+    put:
+      tags: [Policy]
+      summary: Save a policy proposal draft.
+      operationId: updatePolicyProposal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicySourceUpdate"
+      responses:
+        "200":
+          description: Updated app policy state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Policy]
+      summary: Discard the saved policy proposal draft.
+      operationId: discardPolicyProposal
+      responses:
+        "200":
+          description: Updated app policy state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/policy/suggestions/{suggestion_id}/apply:
+    post:
+      tags: [Policy]
+      summary: Apply an app-generated policy suggestion to the proposal draft.
+      operationId: applyPolicySuggestion
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Applied suggestion response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/policy/enforce:
+    post:
+      tags: [Policy]
+      summary: Promote the saved policy proposal to active policy.
+      operationId: enforcePolicyProposal
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicyEnforceRequest"
+      responses:
+        "200":
+          description: Updated app policy state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/policy/rollback:
+    post:
+      tags: [Policy]
+      summary: Restore the previous active policy snapshot.
+      operationId: rollbackPolicy
+      responses:
+        "200":
+          description: Rolled back policy response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/runs:
+    get:
+      tags: [App]
+      summary: Read app run list.
+      operationId: appRuns
+      responses:
+        "200":
+          description: Run list response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/runs/{run_id}:
+    get:
+      tags: [App]
+      summary: Read one app run detail.
+      operationId: appRunDetail
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Run detail response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/replay:
+    get:
+      tags: [Replay]
+      summary: Preview replay impact for the current policy proposal.
+      operationId: appReplay
+      responses:
+        "200":
+          description: Replay preview response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/replay/jobs:
+    post:
+      tags: [Replay]
+      summary: Start a bounded replay job.
+      operationId: startReplayJob
+      responses:
+        "202":
+          description: Replay job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "429":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/app/replay/jobs/{job_id}:
+    get:
+      tags: [Replay]
+      summary: Read replay job status and result.
+      operationId: replayJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Replay job response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations:
+    get:
+      tags: [Simulations]
+      summary: List simulation reports.
+      operationId: listSimulations
+      responses:
+        "200":
+          description: Simulation list response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations/{simulation_id}:
+    get:
+      tags: [Simulations]
+      summary: Read one simulation report.
+      operationId: simulationReport
+      parameters:
+        - name: simulation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Simulation report response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations/{simulation_id}/dashboard:
+    get:
+      tags: [Simulations]
+      summary: Read one simulation dashboard as HTML.
+      operationId: simulationDashboard
+      parameters:
+        - name: simulation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Simulation dashboard HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations/{simulation_id}/strategies/{strategy_id}/usage:
+    get:
+      tags: [Simulations]
+      summary: Read usage report for one simulation strategy.
+      operationId: simulationStrategyUsage
+      parameters:
+        - name: simulation_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: strategy_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Strategy usage report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations/{simulation_id}/strategies/{strategy_id}/decisions:
+    get:
+      tags: [Simulations]
+      summary: Read decision report for one simulation strategy.
+      operationId: simulationStrategyDecisions
+      parameters:
+        - name: simulation_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: strategy_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Strategy decision rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JsonObject"
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/simulations/{simulation_id}/strategies/{strategy_id}/dashboard:
+    get:
+      tags: [Simulations]
+      summary: Read dashboard HTML for one simulation strategy.
+      operationId: simulationStrategyDashboard
+      parameters:
+        - name: simulation_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: strategy_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Strategy dashboard HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+  /v1/chat/completions:
+    post:
+      tags: [Proxy]
+      summary: OpenAI-compatible chat completions proxy path.
+      operationId: proxyChatCompletions
+      responses:
+        "200":
+          description: Upstream-compatible response when allowed.
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/messages:
+    post:
+      tags: [Proxy]
+      summary: Anthropic-compatible messages proxy path.
+      operationId: proxyMessages
+      responses:
+        "200":
+          description: Upstream-compatible response when allowed.
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/responses:
+    post:
+      tags: [Proxy]
+      summary: OpenAI-compatible responses proxy path.
+      operationId: proxyResponses
+      responses:
+        "200":
+          description: Upstream-compatible response when allowed.
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "504":
           $ref: "#/components/responses/Error"
   /health:
     get:
@@ -456,6 +986,24 @@ components:
             - integer
             - "null"
           minimum: 0
+    JsonObject:
+      type: object
+      additionalProperties: true
+    PolicySourceUpdate:
+      type: object
+      required: [source]
+      additionalProperties: false
+      properties:
+        source:
+          type: string
+          description: Full policy YAML source to save as a proposal.
+    PolicyEnforceRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        confirm_replay:
+          type: boolean
+          description: Must be true after reviewing replay before promoting a proposal.
     ErrorResponse:
       type: object
       required: [error]

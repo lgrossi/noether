@@ -88,22 +88,87 @@ mod tests {
             "/v1/authorize",
             "/v1/reservations/{id}/finalize",
             "/v1/events",
+            "/v1/reports/usage",
+            "/v1/reports/decisions",
+            "/v1/reports/traces/{trace_id}",
+            "/v1/reports/observations",
+            "/v1/reports/approval-audit",
+            "/v1/reports/updates",
+            "/v1/app/policy",
+            "/v1/app/policy/proposal",
+            "/v1/app/policy/suggestions/{suggestion_id}/apply",
+            "/v1/app/policy/enforce",
+            "/v1/app/policy/rollback",
+            "/v1/app/runs",
+            "/v1/app/runs/{run_id}",
+            "/v1/app/replay",
+            "/v1/app/replay/jobs",
+            "/v1/app/replay/jobs/{job_id}",
+            "/v1/simulations",
+            "/v1/simulations/{simulation_id}",
+            "/v1/simulations/{simulation_id}/dashboard",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/usage",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/decisions",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/dashboard",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
             "/health",
             "/metrics",
         ] {
-            let operation = if path == "/health" || path == "/metrics" {
-                &spec["paths"][path]["get"]
-            } else {
-                &spec["paths"][path]["post"]
-            };
-            assert!(
-                operation["responses"]["401"].is_object(),
-                "missing 401 response for {path}"
-            );
-            assert!(
-                operation["responses"]["403"].is_object(),
-                "missing 403 response for {path}"
-            );
+            let operations = spec["paths"][path].as_object().expect("path item object");
+            for (method, operation) in operations {
+                assert!(
+                    operation["responses"]["401"].is_object(),
+                    "missing 401 response for {method} {path}"
+                );
+                assert!(
+                    operation["responses"]["403"].is_object(),
+                    "missing 403 response for {method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openapi_covers_public_json_and_proxy_api_routes() {
+        let spec = openapi_json_value().expect("openapi parses");
+        let paths = spec["paths"].as_object().expect("paths object");
+        let expected = [
+            "/v1/authorize",
+            "/v1/reservations/{id}/finalize",
+            "/v1/events",
+            "/v1/reports/usage",
+            "/v1/reports/decisions",
+            "/v1/reports/traces/{trace_id}",
+            "/v1/reports/observations",
+            "/v1/reports/approval-audit",
+            "/v1/reports/updates",
+            "/v1/app/policy",
+            "/v1/app/policy/proposal",
+            "/v1/app/policy/suggestions/{suggestion_id}/apply",
+            "/v1/app/policy/enforce",
+            "/v1/app/policy/rollback",
+            "/v1/app/runs",
+            "/v1/app/runs/{run_id}",
+            "/v1/app/replay",
+            "/v1/app/replay/jobs",
+            "/v1/app/replay/jobs/{job_id}",
+            "/v1/simulations",
+            "/v1/simulations/{simulation_id}",
+            "/v1/simulations/{simulation_id}/dashboard",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/usage",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/decisions",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/dashboard",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/health",
+            "/metrics",
+        ];
+
+        for path in expected {
+            assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
     }
 
