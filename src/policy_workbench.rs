@@ -18,6 +18,9 @@ pub(crate) struct AppPolicyResponse {
     pub(crate) source: String,
     pub(crate) policy: PolicyFile,
     pub(crate) decision_mode: DecisionMode,
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reload_error: Option<String>,
     pub(crate) rule_stats: Vec<AppRuleStat>,
     pub(crate) suggestions: Vec<AppSuggestion>,
     #[serde(skip_serializing_if = "Option::is_none")]

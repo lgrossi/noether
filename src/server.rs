@@ -174,6 +174,7 @@ struct ReloadablePolicyState {
 enum PolicySourceSnapshot {
     Bytes(Vec<u8>),
     ReadError(String),
+    ParseError(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,12 +229,24 @@ impl PolicyRuntime {
                     PolicySourceSnapshot::Bytes(bytes) => {
                         String::from_utf8_lossy(bytes).into_owned()
                     }
-                    PolicySourceSnapshot::ReadError(_) => {
+                    PolicySourceSnapshot::ReadError(_) | PolicySourceSnapshot::ParseError(_) => {
                         serde_yaml::to_string(policy.as_ref()).ok()?
                     }
                 };
                 Some((Some(reloadable.source_path.clone()), source, policy))
             }
+        }
+    }
+
+    async fn reload_error(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        match &*state {
+            PolicyRuntimeState::Static(_) => None,
+            PolicyRuntimeState::Reloadable(reloadable) => match &reloadable.last_observed_source {
+                PolicySourceSnapshot::ReadError(error)
+                | PolicySourceSnapshot::ParseError(error) => Some(error.clone()),
+                PolicySourceSnapshot::Bytes(_) => None,
+            },
         }
     }
 }
@@ -302,6 +315,8 @@ impl ReloadablePolicyState {
                         info!(policy_path = %self.source_path.display(), "reloaded noet policy");
                     }
                     Err(error) => {
+                        self.last_observed_source =
+                            PolicySourceSnapshot::ParseError(error.to_string());
                         error!(
                             policy_path = %self.source_path.display(),
                             error = %error,
@@ -456,6 +471,10 @@ impl AppState {
 
     async fn active_policy_source(&self) -> Option<(Option<PathBuf>, String, Arc<PolicyFile>)> {
         self.policy.source().await
+    }
+
+    async fn policy_reload_error(&self) -> Option<String> {
+        self.policy.reload_error().await
     }
 
     async fn update_policy_source(
@@ -4472,5 +4491,69 @@ policies: []
             )
             .expect("authorize with preserved policy");
         assert_eq!(decision.outcome, crate::contract::DecisionOutcome::Allow);
+    }
+
+    #[tokio::test]
+    async fn noether_app_policy_reports_reload_error_after_invalid_edit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let policy_path = tempdir.path().join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            r#"
+version: 0
+routing:
+  mode: explicit_then_fallback
+  fallback_order: [project, user, team, group, org, global]
+budgets:
+  - id: personal-local
+    limits:
+      spend:
+        - id: budget-cap
+          window: 30d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 10
+          action: block
+    match:
+      project: noether
+policies: []
+"#,
+        )
+        .expect("write initial policy");
+        let policy = crate::policy::load_policy(&policy_path)
+            .await
+            .expect("load initial policy");
+        let state = AppState::with_reloadable_policy(
+            PathBuf::from(".noether/test-fixtures"),
+            None,
+            policy_path.clone(),
+            policy,
+            DecisionMode::Enforce,
+        );
+        std::fs::write(&policy_path, "version: nope\n").expect("write invalid policy");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/app/policy")
+                    .body(Body::empty())
+                    .expect("policy request"),
+            )
+            .await
+            .expect("policy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("policy body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("policy json");
+
+        assert_eq!(payload["status"], "reload_error");
+        assert!(
+            payload["reload_error"]
+                .as_str()
+                .expect("reload error")
+                .contains("invalid type")
+        );
     }
 }

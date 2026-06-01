@@ -5,6 +5,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+const DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN: f64 = 0.000_001;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionMode {
@@ -40,10 +42,26 @@ impl AuthorizeRequest {
         self.estimated_cost_usd
             .or_else(|| {
                 self.estimated_tokens
-                    .map(|tokens| tokens as f64 * 0.000_001)
+                    .map(|tokens| tokens as f64 * token_fallback_usd_per_token())
             })
             .unwrap_or(0.0)
     }
+}
+
+fn token_fallback_usd_per_token() -> f64 {
+    token_fallback_usd_per_token_from_env(std::env::var("NOET_TOKEN_FALLBACK_USD_PER_1K").ok())
+}
+
+fn token_fallback_usd_per_token_from_env(value: Option<String>) -> f64 {
+    token_fallback_usd_per_token_from_str(value.as_deref())
+}
+
+fn token_fallback_usd_per_token_from_str(value: Option<&str>) -> f64 {
+    value
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|per_1k| per_1k / 1000.0)
+        .unwrap_or(DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -696,6 +714,25 @@ limits:
         assert_eq!(
             decoded.limits.spend[0].warn_at_fractions,
             vec![0.5, 0.75, 0.9, 0.95, 0.99]
+        );
+    }
+
+    #[test]
+    fn estimated_cost_uses_configurable_token_fallback_rate() {
+        let rate = token_fallback_usd_per_token_from_str(Some("0.003"));
+
+        assert!((rate - 0.000_003).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn token_fallback_rate_rejects_zero_or_invalid_values() {
+        assert_eq!(
+            token_fallback_usd_per_token_from_str(Some("0")),
+            DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN
+        );
+        assert_eq!(
+            token_fallback_usd_per_token_from_str(Some("not-a-number")),
+            DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN
         );
     }
 }

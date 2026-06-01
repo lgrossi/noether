@@ -17,6 +17,10 @@ noether-codex -> Noether /v1/reservations/{id}/finalize only when usage is prese
 
 ## Capability matrix
 
+**Capability limit:** this wrapper authorizes a Codex run before launch and reports observable
+JSONL events, but Codex still owns provider transport. It cannot prove that an already-started
+Codex process blocks provider spend inside a provider pre-call hook.
+
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Pre-run authorization | Supported | Wrapper calls `/v1/authorize` before spawning Codex. |

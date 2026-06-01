@@ -7,6 +7,14 @@ use serde_json::Value;
 pub const REDACTED: &str = "<redacted>";
 
 pub fn redact_json_value(value: &Value) -> Value {
+    redact_json_value_with_context(None, false, value)
+}
+
+fn redact_json_value_with_context(key: Option<&str>, prompt_context: bool, value: &Value) -> Value {
+    let prompt_context = prompt_context || key.is_some_and(is_prompt_content_key);
+    if prompt_context && matches!(value, Value::String(_)) {
+        return Value::String(REDACTED.to_owned());
+    }
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
@@ -14,12 +22,20 @@ pub fn redact_json_value(value: &Value) -> Value {
                     if is_secret_key(key) {
                         (key.clone(), Value::String(REDACTED.to_owned()))
                     } else {
-                        (key.clone(), redact_json_value(child))
+                        (
+                            key.clone(),
+                            redact_json_value_with_context(Some(key), prompt_context, child),
+                        )
                     }
                 })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(redact_json_value).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_json_value_with_context(key, prompt_context, item))
+                .collect(),
+        ),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
     }
 }
@@ -96,6 +112,18 @@ pub fn is_secret_key(name: &str) -> bool {
         || normalized.contains("cookie")
 }
 
+fn is_prompt_content_key(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "prompt" | "content" | "message" | "messages" | "input" | "output" | "completion"
+    ) || normalized.contains("prompt")
+}
+
 fn collect_findings(value: &Value, path: &str, findings: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -158,11 +186,33 @@ mod tests {
         assert_eq!(redacted["apiKey"], REDACTED);
         assert_eq!(redacted["nested"]["access_token"], REDACTED);
         assert_eq!(redacted["nested"]["items"][0]["refresh-token"], REDACTED);
-        assert_eq!(redacted["nested"]["items"][0]["prompt"], "keep prompt");
-        assert_eq!(
-            redacted["messages"][0]["content"],
-            "body retention is explicit"
-        );
+        assert_eq!(redacted["nested"]["items"][0]["prompt"], REDACTED);
+        assert_eq!(redacted["messages"][0]["content"], REDACTED);
         assert!(redaction_findings(&redacted).is_empty());
+    }
+
+    #[test]
+    fn redacts_nested_prompt_content_parts_but_preserves_shape() {
+        let value = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "secret prompt" },
+                        { "type": "image_url", "image_url": { "url": "https://example.invalid/image.png" } }
+                    ]
+                }
+            ]
+        });
+
+        let redacted = redact_json_value(&value);
+
+        assert_eq!(redacted["messages"][0]["role"], REDACTED);
+        assert_eq!(redacted["messages"][0]["content"][0]["type"], REDACTED);
+        assert_eq!(redacted["messages"][0]["content"][0]["text"], REDACTED);
+        assert_eq!(
+            redacted["messages"][0]["content"][1]["image_url"]["url"],
+            REDACTED
+        );
     }
 }

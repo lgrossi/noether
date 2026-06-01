@@ -161,6 +161,10 @@
   background: var(--accent);
 }
 
+.state-dot.error {
+  background: var(--deny);
+}
+
 .rule-row {
   cursor: pointer;
 }
