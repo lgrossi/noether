@@ -202,7 +202,7 @@ mod tests {
 
         match body {
             CapturedBody::Json { value } => {
-                assert_eq!(value["prompt"], "keep");
+                assert_eq!(value["prompt"], crate::redaction::REDACTED);
                 assert_eq!(value["api_key"], crate::redaction::REDACTED);
             }
             CapturedBody::Text { .. } | CapturedBody::Binary { .. } | CapturedBody::Empty => {

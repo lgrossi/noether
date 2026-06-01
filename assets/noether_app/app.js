@@ -15,6 +15,9 @@ const number = (value) => new Intl.NumberFormat().format(Number(value || 0));
 const glyphs = { allow: "●", warn: "▲", deny: "✕", ask: "?" };
 const classes = { allow: "ok", warn: "warn", deny: "deny", ask: "ask" };
 let runFilterTimer = null;
+let runFetchController = null;
+let policyHighlightTimer = null;
+let reportUpdates = null;
 
 function html(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -43,7 +46,7 @@ async function fetchRuns({ reset = false } = {}) {
   if (state.runsFilter.rule !== "any") params.set("rule", state.runsFilter.rule);
   if (state.runsFilter.q.trim()) params.set("q", state.runsFilter.q.trim());
 
-  const page = await json(`/v1/app/runs?${params.toString()}`);
+  const page = await json(`/v1/app/runs?${params.toString()}`, { signal: runFetchController?.signal });
   if (!reset && state.runs) {
     return {
       ...page,
@@ -235,6 +238,11 @@ function renderPolicyHighlight() {
       : "";
     return `<span class="hl-line ${changed ? "changed" : ""}"><span class="gutter">${index + 1}</span><span class="code">${marker}<span class="draft-code">${highlightYaml(line) || " "}</span>${beforeHint}</span></span>`;
   }).join("");
+}
+
+function schedulePolicyHighlight() {
+  clearTimeout(policyHighlightTimer);
+  policyHighlightTimer = setTimeout(() => renderPolicyHighlight(), 200);
 }
 
 function policyLineDiffRows(active, draft) {
@@ -470,6 +478,8 @@ function syncRunFilterControls() {
 }
 
 async function reloadRuns() {
+  runFetchController?.abort();
+  runFetchController = new AbortController();
   state.runs = await fetchRuns({ reset: true });
   renderRuns();
   if (state.policy) {
@@ -1116,6 +1126,7 @@ function clock(value) {
 }
 
 function renderError(error) {
+  if (error?.name === "AbortError") return;
   const active = document.querySelector(".surface.active");
   if (active) active.insertAdjacentHTML("beforeend", `<div class="card empty">${html(error.message)}</div>`);
 }
@@ -1190,7 +1201,7 @@ document.addEventListener("input", (event) => {
   if (event.target.matches("[data-policy-source]")) {
     state.policySource = event.target.value;
     state.policyEditorDirty = true;
-    renderPolicyHighlight();
+    schedulePolicyHighlight();
     syncPolicyHighlightScroll(event.target);
   }
   if (event.target.matches("[data-runs-filter]")) {
@@ -1212,4 +1223,30 @@ document.addEventListener("scroll", (event) => {
 }, true);
 
 window.addEventListener("popstate", () => showMode(modeFromPath(), true));
+function startReportUpdates() {
+  if (reportUpdates || !("EventSource" in window)) return;
+  reportUpdates = new EventSource("/v1/reports/updates");
+  reportUpdates.addEventListener("report-update", () => {
+    const mode = modeFromPath();
+    if (mode === "runs") {
+      reloadRuns().catch(renderError);
+      return;
+    }
+    if (mode === "policy") {
+      state.runs = null;
+      load("policy", true).catch(renderError);
+      return;
+    }
+    if (mode === "replay") {
+      state.replay = null;
+      load("replay", true).catch(renderError);
+    }
+  });
+  reportUpdates.onerror = () => {
+    reportUpdates?.close();
+    reportUpdates = null;
+    setTimeout(startReportUpdates, 2000);
+  };
+}
+startReportUpdates();
 showMode(modeFromPath(), true);

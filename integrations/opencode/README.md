@@ -6,6 +6,10 @@ Noether events only. It does not claim to block provider calls or finalize provi
 
 ## Capability matrix
 
+**Capability limit:** this plugin records OpenCode activity and tool execution, but it cannot prove
+or block main model provider spend because OpenCode does not expose a documented provider pre-call
+transport hook. Treat provider-spend prevention claims as unsupported for this integration.
+
 | Capability | Status | Basis |
 | --- | --- | --- |
 | Provider pre-call authorization | Not supported by this integration | OpenCode plugin docs list event, tool, shell, TUI, session, message, permission, file, command, and LSP hooks; they do not document a provider/model pre-call hook. |
