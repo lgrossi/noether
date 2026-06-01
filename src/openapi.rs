@@ -38,7 +38,7 @@ pub fn api_docs_html() -> Html<&'static str> {
     <main>
       <h1>Noether Sidecar API</h1>
       <p class="boundary"><strong>Boundary:</strong> Noether is a decision sidecar. Integrations call Noether for authorization, finalization, and events. Integrations own provider transport; Noether does not call model providers as part of this API.</p>
-      <p>If the sidecar is started with <code>NOET_API_KEY</code>, send <code>Authorization: Bearer &lt;NOET_API_KEY&gt;</code> for Noether API calls.</p>
+      <p>If the sidecar is started with <code>NOET_API_KEY</code>, send <code>Authorization: Bearer &lt;NOET_API_KEY&gt;</code> for Noether API calls. Proxy integrations that must preserve a provider Authorization header can send <code>x-noet-api-key: &lt;NOET_API_KEY&gt;</code> instead.</p>
       <p>Machine-readable spec: <a href="/openapi.json"><code>/openapi.json</code></a></p>
       <h2>Core lifecycle</h2>
       <pre>integration -> POST /v1/authorize
@@ -83,6 +83,14 @@ mod tests {
         assert_eq!(
             spec["components"]["securitySchemes"]["NoetherApiKey"]["scheme"],
             "bearer"
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKeyHeader"]["in"],
+            "header"
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKeyHeader"]["name"],
+            "x-noet-api-key"
         );
         for path in [
             "/v1/authorize",

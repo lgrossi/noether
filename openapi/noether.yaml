@@ -26,6 +26,7 @@ tags:
   - name: Proxy
 security:
   - NoetherApiKey: []
+  - NoetherApiKeyHeader: []
   - {}
 paths:
   /v1/authorize:
@@ -717,7 +718,15 @@ components:
         Optional. Required only when the sidecar is started with `NOET_API_KEY`.
         Send `Authorization: Bearer <NOET_API_KEY>` for normal Noether API
         calls. Proxy integrations that must preserve a provider Authorization
-        header can use the documented `X-Noether-API-Key` header instead.
+        header can use `x-noet-api-key: <NOET_API_KEY>` instead.
+    NoetherApiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-noet-api-key
+      description: |
+        Optional alternate to `Authorization: Bearer <NOET_API_KEY>`.
+        Use this header for proxy routes when the provider Authorization header
+        must be preserved for upstream model traffic.
   responses:
     Error:
       description: Error response.
