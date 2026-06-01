@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::NoetError;
 use crate::ledger::{BudgetLedger, TraceReport, TraceReportItem, UsageReport};
@@ -82,12 +83,24 @@ pub fn usage_report(ledger: &BudgetLedger) -> Result<UsageReport, NoetError> {
     ledger.usage_report()
 }
 
+pub fn usage_report_value(ledger: &BudgetLedger) -> Result<Value, NoetError> {
+    serde_json::to_value(usage_report(ledger)?).map_err(NoetError::from)
+}
+
 pub fn decisions_report(ledger: &BudgetLedger) -> Result<Vec<TraceReportItem>, NoetError> {
     ledger.decisions_report()
 }
 
+pub fn decisions_report_value(ledger: &BudgetLedger) -> Result<Value, NoetError> {
+    serde_json::to_value(decisions_report(ledger)?).map_err(NoetError::from)
+}
+
 pub fn trace_report(ledger: &BudgetLedger, trace_id: &str) -> Result<TraceReport, NoetError> {
     ledger.trace_report(trace_id)
+}
+
+pub fn trace_report_value(ledger: &BudgetLedger, trace_id: &str) -> Result<Value, NoetError> {
+    serde_json::to_value(trace_report(ledger, trace_id)?).map_err(NoetError::from)
 }
 
 pub fn observation_kind_prefix(kind: Option<&str>) -> Option<&str> {
@@ -107,6 +120,14 @@ pub fn observations_report(
     ledger.observations_report(observation_kind_prefix(kind), trace_id)
 }
 
+pub fn observations_report_value(
+    ledger: &BudgetLedger,
+    kind: Option<&str>,
+    trace_id: Option<&str>,
+) -> Result<Value, NoetError> {
+    serde_json::to_value(observations_report(ledger, kind, trace_id)?).map_err(NoetError::from)
+}
+
 pub fn approval_audit_report(
     ledger: &BudgetLedger,
 ) -> Result<crate::approval_audit::ApprovalAuditReport, NoetError> {
@@ -114,6 +135,10 @@ pub fn approval_audit_report(
         ledger,
         crate::approval_audit::ApprovalAuditConfig::default(),
     )
+}
+
+pub fn approval_audit_report_value(ledger: &BudgetLedger) -> Result<Value, NoetError> {
+    serde_json::to_value(approval_audit_report(ledger)?).map_err(NoetError::from)
 }
 
 pub fn dashboard_report(
