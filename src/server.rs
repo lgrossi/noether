@@ -1203,6 +1203,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/app/app.css", get(noether_app_css))
         .route("/app/logo.svg", get(noether_app_logo))
         .route("/app/favicon.svg", get(noether_app_favicon))
+        .route("/favicon.ico", get(noether_app_favicon))
         .route("/openapi.json", get(openapi_json))
         .route("/docs", get(api_docs))
         .route("/api/docs", get(api_docs))
@@ -3930,6 +3931,38 @@ mod tests {
         assert!(metrics.contains("noet_requests_total 2"));
         assert!(metrics.contains("noet_decisions_allow_total 1"));
         assert!(metrics.contains(&format!("noet_replay_job_capacity {APP_REPLAY_MAX_JOBS}")));
+    }
+
+    #[tokio::test]
+    async fn favicon_ico_does_not_enter_capture_fallback() {
+        let app = build_router(test_state(None));
+
+        let favicon_response = app
+            .clone()
+            .oneshot(
+                Request::get("/favicon.ico")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("favicon response");
+        assert_eq!(favicon_response.status(), StatusCode::OK);
+
+        let metrics_response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+        let body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        let metrics = std::str::from_utf8(&body).expect("metrics utf8");
+        assert!(metrics.contains("noet_requests_total 2"));
+        assert!(metrics.contains("noet_responses_4xx_total 0"));
+        assert!(metrics.contains("noet_decisions_deny_total 0"));
     }
 
     #[tokio::test]
