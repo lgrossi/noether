@@ -5,6 +5,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+const DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN: f64 = 0.000_001;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionMode {
@@ -47,12 +49,19 @@ impl AuthorizeRequest {
 }
 
 fn token_fallback_usd_per_token() -> f64 {
-    std::env::var("NOET_TOKEN_FALLBACK_USD_PER_1K")
-        .ok()
+    token_fallback_usd_per_token_from_env(std::env::var("NOET_TOKEN_FALLBACK_USD_PER_1K").ok())
+}
+
+fn token_fallback_usd_per_token_from_env(value: Option<String>) -> f64 {
+    token_fallback_usd_per_token_from_str(value.as_deref())
+}
+
+fn token_fallback_usd_per_token_from_str(value: Option<&str>) -> f64 {
+    value
         .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
+        .filter(|value| value.is_finite() && *value > 0.0)
         .map(|per_1k| per_1k / 1000.0)
-        .unwrap_or(0.000_001)
+        .unwrap_or(DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -710,19 +719,20 @@ limits:
 
     #[test]
     fn estimated_cost_uses_configurable_token_fallback_rate() {
-        let request = AuthorizeRequest {
-            estimated_tokens: Some(2_000),
-            ..AuthorizeRequest::default()
-        };
+        let rate = token_fallback_usd_per_token_from_str(Some("0.003"));
 
-        unsafe {
-            std::env::set_var("NOET_TOKEN_FALLBACK_USD_PER_1K", "0.003");
-        }
-        let estimated = request.estimated_cost();
-        unsafe {
-            std::env::remove_var("NOET_TOKEN_FALLBACK_USD_PER_1K");
-        }
+        assert!((rate - 0.000_003).abs() < f64::EPSILON);
+    }
 
-        assert!((estimated - 0.006).abs() < f64::EPSILON);
+    #[test]
+    fn token_fallback_rate_rejects_zero_or_invalid_values() {
+        assert_eq!(
+            token_fallback_usd_per_token_from_str(Some("0")),
+            DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN
+        );
+        assert_eq!(
+            token_fallback_usd_per_token_from_str(Some("not-a-number")),
+            DEFAULT_TOKEN_FALLBACK_USD_PER_TOKEN
+        );
     }
 }

@@ -121,19 +121,21 @@ function renderTopStatus() {
   if (!top || !state.policy) return;
   const enforced = state.policy.decision_mode === "enforce";
   const changed = hasDraftChanges(state.policy);
+  const reloadError = state.policy.status === "reload_error";
   top.classList.toggle("on", enforced);
-  top.innerHTML = `<span class="pip"></span><span>${changed ? "draft pending" : state.policy.decision_mode}</span>`;
+  top.innerHTML = `<span class="pip"></span><span>${reloadError ? "reload error" : (changed ? "draft pending" : state.policy.decision_mode)}</span>`;
 }
 
 function renderPolicy() {
   const data = state.policy;
   const totals = state.runs?.totals || { runs: 0, allow: 0, warn: 0, deny: 0, ask: 0 };
   const draftChanged = hasDraftChanges(data);
+  const reloadError = data.status === "reload_error";
   const changeCount = draftChanged ? countChangedLines(data.source || "", data.proposal?.source || "") : 0;
   renderTopStatus();
   $("[data-policy-status]").innerHTML = `
-    <div class="big">${number(data.rule_stats.length)} rules</div>
-    <div class="sub">${draftChanged ? `${number(changeCount)} changed lines · replay before enforce` : `${data.decision_mode} · decisions logged`}</div>
+    <div class="big">${number(data.rule_stats.length)} rules${reloadError ? " · reload error" : ""}</div>
+    <div class="sub">${reloadError ? `Policy reload failed: ${html(data.reload_error || "unknown error")}` : (draftChanged ? `${number(changeCount)} changed lines · replay before enforce` : `${data.decision_mode} · decisions logged`)}</div>
   `;
   $("[data-policy-path]").textContent = data.path || "in-memory policy";
   $("[data-policy-title]").textContent = data.path ? data.path.split("/").pop() : "policy";
@@ -141,7 +143,7 @@ function renderPolicy() {
   $("[data-policy-source]").value = state.policySource;
   $("[data-policy-state]").innerHTML = draftChanged
     ? `<span class="state-dot draft"></span><span>draft pending</span>`
-    : `<span class="state-dot ${data.decision_mode === "enforce" ? "enforce" : "draft"}"></span><span>${html(data.decision_mode)}</span>`;
+    : `<span class="state-dot ${reloadError ? "error" : (data.decision_mode === "enforce" ? "enforce" : "draft")}"></span><span>${reloadError ? "reload error" : html(data.decision_mode)}</span>`;
   const enforceButton = $("[data-policy-enforce]");
   if (enforceButton) {
     enforceButton.disabled = !draftChanged;
@@ -157,7 +159,7 @@ function renderPolicy() {
   }
   $("[data-policy-save-state]").textContent = draftChanged
     ? `Draft has ${number(changeCount)} changed lines. Replay before enforcing.`
-    : `${data.decision_mode === "enforce" ? "Enforced policy is active" : "Dry-run policy is active"}. Edit and save to create a draft.`;
+    : (reloadError ? `Policy reload failed: ${data.reload_error || "unknown error"}` : `${data.decision_mode === "enforce" ? "Enforced policy is active" : "Dry-run policy is active"}. Edit and save to create a draft.`);
   $("[data-tail-summary]").innerHTML = `
     <span><b>${number(totals.runs)}</b> in ledger</span>
     <span><b style="color:var(--ok)">${number(totals.allow)}</b> allow</span>

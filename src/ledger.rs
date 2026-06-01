@@ -3767,6 +3767,11 @@ impl BudgetLedger {
             return None;
         }
         let estimated_cost = request.estimated_cost();
+        if allocation_bucket_available_usd(self, rule, request, now)
+            .is_some_and(|available_usd| estimated_cost > available_usd)
+        {
+            return None;
+        }
         let (matched_entity, specificity_rank) =
             matched_entity_and_rank(rule, request, &specificity_order(policy));
         let projections =
@@ -3800,6 +3805,12 @@ impl BudgetLedger {
         if !budget_model_allowed(rule, request) {
             return "requested provider/model is not allowed by requested budget".to_owned();
         }
+        if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
+            && request.estimated_cost() > available_usd
+        {
+            return allocation_limit_hit(rule, request, request.estimated_cost(), available_usd)
+                .reason;
+        }
         if let Some(hit) =
             spend_window_projections(self, rule, request, request.estimated_cost(), now)
                 .ok()
@@ -3831,21 +3842,35 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Vec<DecisionLimitHitReport> {
-        policy
+        let estimated_cost = request.estimated_cost();
+        let mut hits = Vec::new();
+        for rule in policy
             .budgets
             .iter()
             .filter(|rule| budget_rule_matches(rule, request))
-            .flat_map(|rule| {
-                spend_window_projections(self, rule, request, request.estimated_cost(), now)
+        {
+            if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
+                && estimated_cost > available_usd
+            {
+                hits.push(allocation_limit_hit(
+                    rule,
+                    request,
+                    estimated_cost,
+                    available_usd,
+                ));
+            }
+            hits.extend(
+                spend_window_projections(self, rule, request, estimated_cost, now)
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|projection| {
                         projection.projected_spend_usd > projection.max_usd
                             && matches!(projection.action, PolicyAction::Ask | PolicyAction::Block)
                     })
-                    .map(|projection| spend_limit_hit(&projection))
-            })
-            .collect()
+                    .map(|projection| spend_limit_hit(&projection)),
+            );
+        }
+        hits
     }
 
     fn create_reservation(
@@ -7701,6 +7726,29 @@ fn allocation_bucket_available_usd(
     Some(bucket.current_grant_usd + bucket.carryover_usd)
 }
 
+fn allocation_limit_hit(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+    estimated_cost: f64,
+    available_usd: f64,
+) -> DecisionLimitHitReport {
+    let reason = format!(
+        "estimated request cost ${estimated_cost:.6} exceeds protected allocation available ${available_usd:.6}"
+    );
+    DecisionLimitHitReport {
+        rule_id: format!("{}.allocation", rule.id),
+        reason,
+        severity: DecisionSeverity::Deny,
+        window_id: Some("protected_adoption_pool".to_owned()),
+        window_mode: None,
+        window_started_at: None,
+        window_ends_at: None,
+        projected_spend_usd: Some(estimated_cost),
+        max_usd: Some(available_usd),
+        scope_entity: allocation_bucket_entity_key(rule, request),
+    }
+}
+
 fn consume_allocation_bucket(
     ledger: &mut BudgetLedger,
     rule: &BudgetRule,
@@ -10610,6 +10658,34 @@ mod tests {
                 && explanation
                     .reason
                     .contains("protected allocation available")
+        }));
+    }
+
+    #[test]
+    fn requested_budget_falls_back_when_protected_allocation_is_exhausted() {
+        let mut policy = protected_adoption_policy("60s");
+        let mut fallback = policy.budgets[0].clone();
+        fallback.id = "fallback".to_owned();
+        fallback.priority = 1;
+        fallback.allocation = None;
+        policy.budgets.push(fallback);
+        let mut ledger = BudgetLedger::default();
+        let mut request = request(26.0);
+        request.budget_id = Some("ai-adoption".to_owned());
+        request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "ai-adoption"
+                && explanation
+                    .reason
+                    .contains("protected allocation available")
+        }));
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "fallback"
+                && explanation.reason == "selected fallback budget for org:example"
         }));
     }
 

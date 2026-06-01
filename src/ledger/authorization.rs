@@ -211,27 +211,14 @@ pub(super) fn apply_budget_limits(context: BudgetLimitEvaluation<'_>) -> bool {
     if let Some(available_usd) = allocation_bucket_available_usd(ledger, rule, request, now)
         && estimated_cost > available_usd
     {
-        let reason = format!(
-            "estimated request cost ${estimated_cost:.6} exceeds protected allocation available ${available_usd:.6}"
-        );
+        let hit = allocation_limit_hit(rule, request, estimated_cost, available_usd);
         *action = merge_policy_action(*action, PolicyAction::Block);
         explanations.push(DecisionExplanation {
-            rule_id: format!("{}.allocation", rule.id),
-            reason: reason.clone(),
-            severity: DecisionSeverity::Deny,
+            rule_id: hit.rule_id.clone(),
+            reason: hit.reason.clone(),
+            severity: hit.severity,
         });
-        limit_hits.push(DecisionLimitHitReport {
-            rule_id: format!("{}.allocation", rule.id),
-            reason,
-            severity: DecisionSeverity::Deny,
-            window_id: Some("protected_adoption_pool".to_owned()),
-            window_mode: None,
-            window_started_at: None,
-            window_ends_at: None,
-            projected_spend_usd: Some(estimated_cost),
-            max_usd: Some(available_usd),
-            scope_entity: allocation_bucket_entity_key(rule, request),
-        });
+        limit_hits.push(hit);
         return true;
     }
 
