@@ -23,7 +23,8 @@ use crate::fixture::{
 use crate::mock::{mock_json, mock_stream};
 use crate::proxy::ProxyRoutes;
 use crate::redaction::{redact_headers, redact_reqwest_headers};
-use crate::server::{AppState, RequestContext, apply_request_context_to_authorize_request};
+use crate::request_identity::{RequestContext, apply_request_context_to_authorize_request};
+use crate::server::AppState;
 
 const MAX_CAPTURED_STREAM_CHUNKS: usize = 128;
 const UPSTREAM_REQUEST_TIMEOUT_SECONDS: u64 = 600;

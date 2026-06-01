@@ -16,6 +16,7 @@ pub mod policy;
 pub mod proxy;
 pub mod redaction;
 pub mod reporting;
+pub mod request_identity;
 pub mod scenario;
 pub mod server;
 pub mod simulation;
