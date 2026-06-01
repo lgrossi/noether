@@ -1454,11 +1454,7 @@ struct SimulationStrategySurfaceSummary {
 
 async fn report_usage(State(state): State<AppState>) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
-            Ok(Json(serde_json::to_value(reporting::usage_report(
-                ledger,
-            )?)?))
-        })
+        .read_ledger(|ledger| Ok(Json(reporting::usage_report_value(ledger)?)))
         .await
 }
 
@@ -1466,11 +1462,7 @@ async fn report_decisions(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
-            Ok(Json(serde_json::to_value(reporting::decisions_report(
-                ledger,
-            )?)?))
-        })
+        .read_ledger(|ledger| Ok(Json(reporting::decisions_report_value(ledger)?)))
         .await
 }
 
@@ -1479,11 +1471,7 @@ async fn report_trace(
     AxumPath(trace_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(move |ledger| {
-            Ok(Json(serde_json::to_value(reporting::trace_report(
-                ledger, &trace_id,
-            )?)?))
-        })
+        .read_ledger(move |ledger| Ok(Json(reporting::trace_report_value(ledger, &trace_id)?)))
         .await
 }
 
@@ -1493,11 +1481,11 @@ async fn report_observations(
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
         .read_ledger(move |ledger| {
-            Ok(Json(serde_json::to_value(reporting::observations_report(
+            Ok(Json(reporting::observations_report_value(
                 ledger,
                 query.kind.as_deref(),
                 query.trace.as_deref(),
-            )?)?))
+            )?))
         })
         .await
 }
@@ -1506,11 +1494,7 @@ async fn report_approval_audit(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, NoetError> {
     state
-        .read_ledger(|ledger| {
-            Ok(Json(serde_json::to_value(
-                reporting::approval_audit_report(ledger)?,
-            )?))
-        })
+        .read_ledger(|ledger| Ok(Json(reporting::approval_audit_report_value(ledger)?)))
         .await
 }
 
