@@ -13,6 +13,7 @@ pub mod mock;
 pub mod noether_app;
 pub mod openapi;
 pub mod policy;
+pub mod policy_workbench;
 pub mod proxy;
 pub mod redaction;
 pub mod reporting;
