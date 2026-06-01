@@ -52,6 +52,7 @@ type ExtensionContext = {
 
 type NoetherConfig = {
 	noetherUrl: string;
+	apiKey?: string;
 	project?: string;
 	projectFromCwd: boolean;
 	subject?: string;
@@ -69,7 +70,7 @@ type NoetherConfig = {
 	queueMaxItems: number;
 	debugHooks: boolean;
 	debugHookLogDir?: string;
-	startLocalNoether?: (params: { cwd: string; bind: string; url: string }) => Promise<number>;
+	startLocalNoether?: (params: { cwd: string; bind: string; url: string; apiKey?: string }) => Promise<number>;
 	stopLocalNoether?: (params: { pid: number; cwd: string; bind: string; url: string }) => Promise<void>;
 };
 
@@ -187,6 +188,16 @@ type MutableAuthorizeRequest = ReturnType<typeof buildAuthorizeRequest> & {
 	metadata?: Record<string, unknown>;
 };
 
+class NoetherHttpError extends Error {
+	constructor(
+		readonly status: number,
+		readonly body: string,
+	) {
+		super(`Noether authorize returned ${status}${body ? `: ${truncateSingleLine(body)}` : ""}`);
+		this.name = "NoetherHttpError";
+	}
+}
+
 type LocalSidecarOwner =
 	| {
 			state: "starting";
@@ -229,6 +240,7 @@ export function extensionConfig(
 	});
 	return {
 		noetherUrl: stripTrailingSlash(env.NOET_URL || fileConfig.noetherUrl || DEFAULT_NOETHER_URL),
+		apiKey: emptyToUndefined(env.NOET_API_KEY) || fileConfig.apiKey,
 		project: emptyToUndefined(env.NOET_PI_PROJECT) || fileConfig.project,
 		projectFromCwd: booleanOverride(env.NOET_PI_PROJECT_FROM_CWD, fileConfig.projectFromCwd) ?? true,
 		subject: emptyToUndefined(env.NOET_PI_SUBJECT) || fileConfig.subject,
@@ -854,6 +866,7 @@ function safeForHookLog(value: unknown, depth = 8, seen = new WeakSet<object>())
 
 async function authorize(
 	noetherUrl: string,
+	apiKey: string | undefined,
 	request: unknown,
 	timeoutMs: number,
 	signal?: AbortSignal,
@@ -874,12 +887,12 @@ async function authorize(
 	try {
 		const response = await fetch(`${noetherUrl}/v1/authorize`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: jsonHeaders(apiKey),
 			body: JSON.stringify(request),
 			signal: controller.signal,
 		});
 		if (!response.ok) {
-			throw new Error(`Noether authorize returned ${response.status}`);
+			throw new NoetherHttpError(response.status, await response.text());
 		}
 		return (await response.json()) as AuthorizeDecision;
 	} finally {
@@ -920,7 +933,12 @@ function localNoetherBinary(cwd: string, configured?: string): string {
 	return "noet";
 }
 
-async function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+async function fetchWithTimeout(
+	url: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+	init?: RequestInit,
+): Promise<Response> {
 	const controller = new AbortController();
 	const abortFromParent = () => controller.abort(signal?.reason);
 	if (signal) {
@@ -932,7 +950,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSi
 	}
 	const timeout = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
 	try {
-		return await fetch(url, { signal: controller.signal });
+		return await fetch(url, { ...init, signal: controller.signal });
 	} finally {
 		clearTimeout(timeout);
 		if (signal) {
@@ -941,22 +959,35 @@ async function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSi
 	}
 }
 
-async function noetherHealthcheck(noetherUrl: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+async function noetherHealthcheck(
+	noetherUrl: string,
+	apiKey: string | undefined,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
 	try {
-		const response = await fetchWithTimeout(`${noetherUrl}/health`, timeoutMs, signal);
+		const response = await fetchWithTimeout(`${noetherUrl}/health`, timeoutMs, signal, {
+			headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+		});
+		if (response.status === 401 || response.status === 403) {
+			throw new NoetherHttpError(response.status, await response.text());
+		}
 		return response.ok;
-	} catch {
+	} catch (error) {
+		if (error instanceof NoetherHttpError) {
+			throw error;
+		}
 		return false;
 	}
 }
 
-async function spawnLocalNoether(params: { cwd: string; bind: string; command: string }): Promise<number> {
+async function spawnLocalNoether(params: { cwd: string; bind: string; command: string; apiKey?: string }): Promise<number> {
 	return await new Promise<number>((resolve, reject) => {
 		const child = spawn(params.command, ["up", "--root", params.cwd, "--bind", params.bind], {
 			cwd: params.cwd,
 			detached: true,
 			stdio: "ignore",
-			env: process.env,
+			env: params.apiKey ? { ...process.env, NOET_API_KEY: params.apiKey } : process.env,
 		});
 		child.once("error", reject);
 		child.once("spawn", () => {
@@ -1497,11 +1528,18 @@ function buildUserDecisionMessage(
 }
 
 function buildAuthorizeFailureMessage(error: unknown, failMode: FailMode): string {
+	if (isNoetherAuthFailure(error)) {
+		return "Noether authentication failed. Check NOET_API_KEY and trusted actor-header configuration. Request blocked.";
+	}
 	const timedOut =
 		error instanceof Error && error.message.includes("timed out")
 			? " Noether did not respond in time."
 			: "";
 	return failMode === "fail_closed" ? `Noether unavailable. Request blocked.${timedOut}` : "Noether unavailable. Continuing.";
+}
+
+function isNoetherAuthFailure(error: unknown): boolean {
+	return error instanceof NoetherHttpError && (error.status === 401 || error.status === 403);
 }
 
 function truncateSingleLine(value: string, maxLength = 160): string {
@@ -1558,18 +1596,27 @@ function buildTraceEvent(kind: string, payload: Record<string, unknown>, attribu
 	};
 }
 
-async function postEvent(noetherUrl: string, event: unknown, signal?: AbortSignal): Promise<void> {
-	await postJsonWithRetry(`${noetherUrl}/v1/events`, event, DEFAULT_DELIVERY_TIMEOUT_MS, DEFAULT_DELIVERY_MAX_ATTEMPTS, signal);
+async function postEvent(noetherUrl: string, apiKey: string | undefined, event: unknown, signal?: AbortSignal): Promise<void> {
+	await postJsonWithRetry(
+		`${noetherUrl}/v1/events`,
+		apiKey,
+		event,
+		DEFAULT_DELIVERY_TIMEOUT_MS,
+		DEFAULT_DELIVERY_MAX_ATTEMPTS,
+		signal,
+	);
 }
 
 async function finalizeReservation(
 	noetherUrl: string,
+	apiKey: string | undefined,
 	reservationId: string,
 	usage: Usage,
 	activeRequest: ActiveRequest,
 ): Promise<void> {
 	await postJsonWithRetry(
 		`${noetherUrl}/v1/reservations/${encodeURIComponent(reservationId)}/finalize`,
+		apiKey,
 		{
 			reservation_id: reservationId,
 			outcome: "success",
@@ -1599,6 +1646,7 @@ async function finalizeReservation(
 
 async function postJsonWithRetry(
 	url: string,
+	apiKey: string | undefined,
 	body: unknown,
 	timeoutMs: number,
 	maxAttempts: number,
@@ -1607,7 +1655,7 @@ async function postJsonWithRetry(
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		try {
-			await postJson(url, body, timeoutMs, signal);
+			await postJson(url, apiKey, body, timeoutMs, signal);
 			return;
 		} catch (error) {
 			lastError = error;
@@ -1619,7 +1667,13 @@ async function postJsonWithRetry(
 	throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-async function postJson(url: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+async function postJson(
+	url: string,
+	apiKey: string | undefined,
+	body: unknown,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<void> {
 	const controller = new AbortController();
 	const abortFromParent = () => controller.abort(signal?.reason);
 	if (signal) {
@@ -1636,7 +1690,7 @@ async function postJson(url: string, body: unknown, timeoutMs: number, signal?: 
 	try {
 		const response = await fetch(url, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: jsonHeaders(apiKey),
 			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
@@ -1649,6 +1703,12 @@ async function postJson(url: string, body: unknown, timeoutMs: number, signal?: 
 			signal.removeEventListener("abort", abortFromParent);
 		}
 	}
+}
+
+function jsonHeaders(apiKey: string | undefined): Record<string, string> {
+	return apiKey
+		? { "content-type": "application/json", authorization: `Bearer ${apiKey}` }
+		: { "content-type": "application/json" };
 }
 
 export function extractUsage(message: unknown): Usage | undefined {
@@ -1902,6 +1962,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		onDrop(drop) {
 			void postEvent(
 				config.noetherUrl,
+				config.apiKey,
 				buildTraceEvent(
 					"pi.delivery_drop",
 					{
@@ -1929,7 +1990,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		const event = buildTraceEvent(kind, payload, attribution);
 		delivery.enqueue(priority, async () => {
 			try {
-				await postEvent(config.noetherUrl, event);
+				await postEvent(config.noetherUrl, config.apiKey, event);
 			} catch (error) {
 				if (kind === "pi.delivery_error") {
 					return;
@@ -1937,6 +1998,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				try {
 					await postEvent(
 						config.noetherUrl,
+						config.apiKey,
 						buildTraceEvent(
 							"pi.delivery_error",
 							{
@@ -2017,7 +2079,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 			return;
 		}
 		const healthTimeoutMs = Math.min(config.authorizeTimeoutMs, 250);
-		if (await noetherHealthcheck(config.noetherUrl, healthTimeoutMs, ctx.signal)) {
+		if (await noetherHealthcheck(config.noetherUrl, config.apiKey, healthTimeoutMs, ctx.signal)) {
 			lastHealthyAt = Date.now();
 			return;
 		}
@@ -2034,7 +2096,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 						await clearLocalSidecarOwner(cwd);
 						continue;
 					}
-					if (await noetherHealthcheck(config.noetherUrl, healthTimeoutMs, ctx.signal)) {
+					if (await noetherHealthcheck(config.noetherUrl, config.apiKey, healthTimeoutMs, ctx.signal)) {
 						lastHealthyAt = Date.now();
 						return;
 					}
@@ -2050,8 +2112,13 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 						if (claimed) {
 							try {
 								const sidecarPid = config.startLocalNoether
-									? await config.startLocalNoether({ cwd, bind, url: config.noetherUrl })
-									: await spawnLocalNoether({ cwd, bind, command: localNoetherBinary(cwd, config.localBin) });
+										? await config.startLocalNoether({ cwd, bind, url: config.noetherUrl, apiKey: config.apiKey })
+										: await spawnLocalNoether({
+												cwd,
+												bind,
+												command: localNoetherBinary(cwd, config.localBin),
+												apiKey: config.apiKey,
+											});
 								await writeLocalSidecarOwner(cwd, {
 									state: "running",
 									pid: sidecarPid,
@@ -2081,7 +2148,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		try {
 			await ensureNoetherReady(ctx);
 		} catch (error) {
-			if (config.failMode === "fail_closed") {
+			if (config.failMode === "fail_closed" || isNoetherAuthFailure(error)) {
 				throw error;
 			}
 			console.warn(
@@ -2183,7 +2250,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 
 		try {
 			await ensureNoetherReady(ctx);
-			const decision = await authorize(config.noetherUrl, request, config.authorizeTimeoutMs, ctx.signal);
+			const decision = await authorize(config.noetherUrl, config.apiKey, request, config.authorizeTimeoutMs, ctx.signal);
 			span.decisionId = decision.decision_id;
 			span.reservationId = decision.reservation?.id;
 			span.outcome = decision.outcome;
@@ -2250,7 +2317,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 				3,
 			);
 		} catch (error) {
-			if (config.failMode === "fail_closed") {
+				if (config.failMode === "fail_closed" || isNoetherAuthFailure(error)) {
 				const message = buildAuthorizeFailureMessage(error, config.failMode);
 				surfaceExtensionMessage(ctx, message, "error");
 				logPolicyMessage(message, "error");
@@ -2367,7 +2434,7 @@ export default function registerNoetherExtension(pi: ExtensionAPI, config: Noeth
 		completedReservations.add(request.reservationId);
 		delivery.enqueue(5, async () => {
 			try {
-				await finalizeReservation(config.noetherUrl, request.reservationId!, usage, request);
+				await finalizeReservation(config.noetherUrl, config.apiKey, request.reservationId!, usage, request);
 			} catch {
 				enqueueEvent("pi.reservation_finalize_error", { usage }, { span: request, status: "exact" }, 3);
 			}

@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
 
-import { NoetherClient, NoetherDeniedError } from "../dist/index.js";
+import { NoetherClient, NoetherDeniedError, NoetherHttpError } from "../dist/index.js";
 
 test("client calls authorize, finalize, event, and health endpoints", async () => {
 	const seen = [];
 	const server = http.createServer(async (request, response) => {
 		const body = await readBody(request);
-		seen.push({ method: request.method, url: request.url, body: body && JSON.parse(body) });
+		seen.push({
+			method: request.method,
+			url: request.url,
+			authorization: request.headers.authorization,
+			body: body && JSON.parse(body),
+		});
 		response.setHeader("content-type", "application/json");
 		if (request.url === "/v1/authorize") {
 			response.end(JSON.stringify({
@@ -59,7 +64,7 @@ test("client calls authorize, finalize, event, and health endpoints", async () =
 	});
 	const baseUrl = await listen(server);
 	try {
-		const client = new NoetherClient({ url: baseUrl, timeoutMs: 500 });
+		const client = new NoetherClient({ url: baseUrl, timeoutMs: 500, apiKey: "secret-token" });
 		const decision = await client.authorize({
 			project: "noether",
 			subject: "user:local",
@@ -84,6 +89,7 @@ test("client calls authorize, finalize, event, and health endpoints", async () =
 			["POST", "/v1/events"],
 			["GET", "/health"],
 		]);
+		assert.equal(seen.every((item) => item.authorization === "Bearer secret-token"), true);
 	} finally {
 		await close(server);
 	}
@@ -96,6 +102,30 @@ test("fail_open returns synthetic allow decision when sidecar is unavailable", a
 	assert.equal(decision.outcome, "allow");
 	assert.equal(decision.action, "allow");
 	assert.equal(decision.explanations[0].rule_id, "sdk.sidecar_unavailable");
+});
+
+test("fail_open does not synthesize allow decisions for auth failures", async () => {
+	const server = http.createServer(async (_request, response) => {
+		response.statusCode = 401;
+		response.setHeader("content-type", "application/json");
+		response.end(JSON.stringify({ error: "missing or invalid Noether API key" }));
+	});
+	const baseUrl = await listen(server);
+	try {
+		const client = new NoetherClient({
+			url: baseUrl,
+			timeoutMs: 500,
+			failMode: "fail_open",
+			apiKey: "wrong-token",
+		});
+
+		await assert.rejects(
+			() => client.authorize({ project: "noether" }),
+			(error) => error instanceof NoetherHttpError && error.status === 401,
+		);
+	} finally {
+		await close(server);
+	}
 });
 
 test("fail_closed returns synthetic deny decision and withDecision blocks work", async () => {

@@ -719,15 +719,15 @@ impl LedgerPersistenceSnapshot {
                 .map(|explanation| explanation.reason.clone());
         }
 
-        if let Some(requested_budget_id) = request.budget_id.as_deref() {
-            if selected_budget_id.as_deref() != Some(requested_budget_id) {
-                fields.rejected_budget_id = Some(requested_budget_id.to_owned());
-                fields.rejected_budget_reason = decision
-                    .explanations
-                    .iter()
-                    .find(|explanation| explanation.rule_id == requested_budget_id)
-                    .map(|explanation| explanation.reason.clone());
-            }
+        if let Some(requested_budget_id) = request.budget_id.as_deref()
+            && selected_budget_id.as_deref() != Some(requested_budget_id)
+        {
+            fields.rejected_budget_id = Some(requested_budget_id.to_owned());
+            fields.rejected_budget_reason = decision
+                .explanations
+                .iter()
+                .find(|explanation| explanation.rule_id == requested_budget_id)
+                .map(|explanation| explanation.reason.clone());
         }
 
         fields.model_check = routing_model_check(decision, selected_budget_id.as_deref());
@@ -2019,15 +2019,13 @@ impl BudgetLedger {
             }
 
             if !action.halts_request() {
-                selected_budget_id = self.evaluate_budget_rules(
-                    policy,
-                    request,
-                    now,
-                    &mut action,
-                    &mut explanations,
-                    &mut limit_hits,
-                    &mut message_hints,
-                );
+                let mut outputs = BudgetEvaluationOutputs {
+                    action: &mut action,
+                    explanations: &mut explanations,
+                    limit_hits: &mut limit_hits,
+                    message_hints: &mut message_hints,
+                };
+                selected_budget_id = self.evaluate_budget_rules(policy, request, now, &mut outputs);
             }
         } else {
             explanations.push(DecisionExplanation {
@@ -2095,15 +2093,13 @@ impl BudgetLedger {
             }
 
             if !action.halts_request() {
-                selected_budget_id = self.evaluate_budget_rules(
-                    policy,
-                    request,
-                    now,
-                    &mut action,
-                    &mut explanations,
-                    &mut limit_hits,
-                    &mut message_hints,
-                );
+                let mut outputs = BudgetEvaluationOutputs {
+                    action: &mut action,
+                    explanations: &mut explanations,
+                    limit_hits: &mut limit_hits,
+                    message_hints: &mut message_hints,
+                };
+                selected_budget_id = self.evaluate_budget_rules(policy, request, now, &mut outputs);
             }
         } else {
             explanations.push(DecisionExplanation {
@@ -2263,18 +2259,7 @@ impl BudgetLedger {
             &request.metadata,
             decision.created_at,
         );
-        let routing_report = decision_routing_report(
-            routing.selected_budget_id.clone(),
-            routing.matched_entity.clone(),
-            routing.selection_reason.clone(),
-            routing.rejected_budget_id.clone(),
-            routing.rejected_budget_reason.clone(),
-            routing.model_check.clone(),
-            routing.budget_window_remaining_usd,
-            routing.budget_window_mode.clone(),
-            routing.budget_window_started_at,
-            routing.budget_window_ends_at,
-        );
+        let routing_report = decision_routing_report(&routing);
         batch.decisions.push(SimulationDecisionRow {
             decision_id: decision.decision_id.clone(),
             trace_id: trace_id.clone(),
@@ -3868,26 +3853,25 @@ impl BudgetLedger {
         policy: &PolicyFile,
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
-        action: &mut PolicyAction,
-        explanations: &mut Vec<DecisionExplanation>,
-        limit_hits: &mut Vec<DecisionLimitHitReport>,
-        message_hints: &mut Vec<AuthorizeMessageHint>,
+        outputs: &mut BudgetEvaluationOutputs<'_>,
     ) -> Option<String> {
         let estimated_cost = request.estimated_cost();
-        let candidate = self.select_budget_rule(policy, request, now, explanations);
+        let candidate = self.select_budget_rule(policy, request, now, outputs.explanations);
 
         let Some(candidate) = candidate else {
             let exhausted_rules = self.exhausted_budget_rules(policy, request, now);
             if !exhausted_rules.is_empty() {
-                *action = merge_policy_action(*action, PolicyAction::Block);
+                *outputs.action = merge_policy_action(*outputs.action, PolicyAction::Block);
                 for hit in exhausted_rules {
-                    explanations.push(DecisionExplanation {
+                    outputs.explanations.push(DecisionExplanation {
                         rule_id: hit.rule_id.clone(),
                         reason: hit.reason.clone(),
                         severity: hit.severity,
                     });
-                    message_hints.push(message_hint_from_limit_hit("spend_limit", &hit));
-                    limit_hits.push(hit);
+                    outputs
+                        .message_hints
+                        .push(message_hint_from_limit_hit("spend_limit", &hit));
+                    outputs.limit_hits.push(hit);
                 }
                 return None;
             }
@@ -3900,12 +3884,12 @@ impl BudgetLedger {
                 .iter()
                 .any(|rule| !budget_model_allowed(rule, request))
             {
-                *action = merge_policy_action(*action, PolicyAction::Block);
+                *outputs.action = merge_policy_action(*outputs.action, PolicyAction::Block);
                 for rule in scoped_rules
                     .into_iter()
                     .filter(|rule| !budget_model_allowed(rule, request))
                 {
-                    explanations.push(DecisionExplanation {
+                    outputs.explanations.push(DecisionExplanation {
                         rule_id: rule.id.clone(),
                         reason: "requested provider/model is not allowed by budget".to_owned(),
                         severity: DecisionSeverity::Deny,
@@ -3913,14 +3897,15 @@ impl BudgetLedger {
                 }
                 return None;
             }
-            if explanations
+            if outputs
+                .explanations
                 .iter()
                 .any(|explanation| explanation.rule_id == "no_fallback_budget")
             {
-                *action = merge_policy_action(*action, PolicyAction::Block);
+                *outputs.action = merge_policy_action(*outputs.action, PolicyAction::Block);
                 return None;
             }
-            explanations.push(DecisionExplanation {
+            outputs.explanations.push(DecisionExplanation {
                 rule_id: "no_budget_match".to_owned(),
                 reason: "no matching budget rule; request allowed".to_owned(),
                 severity: DecisionSeverity::Info,
@@ -3928,21 +3913,18 @@ impl BudgetLedger {
             return None;
         };
 
-        let Some(rule) = policy.budgets.iter().find(|rule| rule.id == candidate.id) else {
-            return None;
-        };
-        if apply_budget_limits(
-            self,
-            policy,
+        let rule = policy.budgets.iter().find(|rule| rule.id == candidate.id)?;
+        if apply_budget_limits(BudgetLimitEvaluation {
+            ledger: self,
             rule,
             request,
             estimated_cost,
             now,
-            action,
-            explanations,
-            limit_hits,
-            message_hints,
-        ) {
+            action: outputs.action,
+            explanations: outputs.explanations,
+            limit_hits: outputs.limit_hits,
+            message_hints: outputs.message_hints,
+        }) {
             return Some(rule.id.clone());
         }
         Some(rule.id.clone())
@@ -4064,7 +4046,6 @@ impl BudgetLedger {
                 .ok()
                 .into_iter()
                 .flatten()
-                .into_iter()
                 .filter(|projection| {
                     projection.projected_spend_usd > projection.max_usd
                         && matches!(projection.action, PolicyAction::Ask | PolicyAction::Block)
@@ -4359,18 +4340,7 @@ impl BudgetLedger {
             &request.metadata,
             decision.created_at,
         );
-        let routing_report = decision_routing_report(
-            routing.selected_budget_id.clone(),
-            routing.matched_entity.clone(),
-            routing.selection_reason.clone(),
-            routing.rejected_budget_id.clone(),
-            routing.rejected_budget_reason.clone(),
-            routing.model_check.clone(),
-            routing.budget_window_remaining_usd,
-            routing.budget_window_mode.clone(),
-            routing.budget_window_started_at,
-            routing.budget_window_ends_at,
-        );
+        let routing_report = decision_routing_report(&routing);
         conn.execute(
             "
             INSERT INTO decisions (
@@ -4520,18 +4490,7 @@ impl BudgetLedger {
             &request.metadata,
             decision.created_at,
         );
-        let routing_report = decision_routing_report(
-            routing.selected_budget_id.clone(),
-            routing.matched_entity.clone(),
-            routing.selection_reason.clone(),
-            routing.rejected_budget_id.clone(),
-            routing.rejected_budget_reason.clone(),
-            routing.model_check.clone(),
-            routing.budget_window_remaining_usd,
-            routing.budget_window_mode.clone(),
-            routing.budget_window_started_at,
-            routing.budget_window_ends_at,
-        );
+        let routing_report = decision_routing_report(&routing);
         let estimated_tokens = request.estimated_tokens.map(|value| value as i64);
         let explanations_json = serde_json::to_string(&decision.explanations)?;
         let metadata_json = serde_json::to_string(&request.metadata)?;
@@ -4725,15 +4684,15 @@ impl BudgetLedger {
                 .map(|explanation| explanation.reason.clone());
         }
 
-        if let Some(requested_budget_id) = request.budget_id.as_deref() {
-            if selected_budget_id.as_deref() != Some(requested_budget_id) {
-                fields.rejected_budget_id = Some(requested_budget_id.to_owned());
-                fields.rejected_budget_reason = decision
-                    .explanations
-                    .iter()
-                    .find(|explanation| explanation.rule_id == requested_budget_id)
-                    .map(|explanation| explanation.reason.clone());
-            }
+        if let Some(requested_budget_id) = request.budget_id.as_deref()
+            && selected_budget_id.as_deref() != Some(requested_budget_id)
+        {
+            fields.rejected_budget_id = Some(requested_budget_id.to_owned());
+            fields.rejected_budget_reason = decision
+                .explanations
+                .iter()
+                .find(|explanation| explanation.rule_id == requested_budget_id)
+                .map(|explanation| explanation.reason.clone());
         }
 
         fields.model_check = routing_model_check(decision, selected_budget_id.as_deref());
@@ -6338,18 +6297,7 @@ async fn persist_decision_async(
         &request.metadata,
         decision.created_at,
     );
-    let routing_report = decision_routing_report(
-        routing.selected_budget_id.clone(),
-        routing.matched_entity.clone(),
-        routing.selection_reason.clone(),
-        routing.rejected_budget_id.clone(),
-        routing.rejected_budget_reason.clone(),
-        routing.model_check.clone(),
-        routing.budget_window_remaining_usd,
-        routing.budget_window_mode.clone(),
-        routing.budget_window_started_at,
-        routing.budget_window_ends_at,
-    );
+    let routing_report = decision_routing_report(&routing);
     let estimated_tokens = request.estimated_tokens.map(|value| value as i64);
     let explanations_json = serde_json::to_string(&decision.explanations)?;
     let metadata_json = serde_json::to_string(&request.metadata)?;
@@ -6361,78 +6309,76 @@ async fn persist_decision_async(
     let max_retries = routing.retries.map(|value| value as i64);
     let created_at = decision.created_at.to_rfc3339();
 
-    if let Some(reservation) = &decision.reservation {
-        if let Some(stored) = snapshot.reservations.get(&reservation.id) {
-            if stored.limit_window_spends.len() == 1 && stored.allocation_spends.is_empty() {
-                let spend = &stored.limit_window_spends[0];
-                if let Some(window) = snapshot.limit_windows.get(&(
-                    spend.rule_id.clone(),
-                    spend.limit_id.clone(),
-                    spend.scope_key.clone(),
-                )) {
-                    let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
-                    let limit_window_spends_json =
-                        serde_json::to_string(&stored.limit_window_spends)?;
-                    let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
-                    let reservation_created_at = reservation.created_at.to_rfc3339();
-                    let reservation_expires_at = reservation.expires_at.to_rfc3339();
-                    let window_started_at = window.started_at.to_rfc3339();
-                    let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
-                    conn.execute(
-                        ASYNC_AUTHORIZE_FAST_SQL,
-                        &[
-                            &decision.decision_id.as_str(),
-                            &trace_id.as_deref(),
-                            &session_id.as_deref(),
-                            &request_id.as_deref(),
-                            &request.subject.as_deref(),
-                            &request.project.as_deref(),
-                            &request.provider.as_deref(),
-                            &request.model.as_deref(),
-                            &estimated_tokens,
-                            &request.estimated_cost_usd,
-                            &outcome,
-                            &action_text(decision.action),
-                            &explanations_json,
-                            &metadata_json,
-                            &entities_json,
-                            &routing.selected_budget_id.as_deref(),
-                            &routing.matched_entity.as_deref(),
-                            &routing.selection_reason.as_deref(),
-                            &routing.rejected_budget_id.as_deref(),
-                            &routing.rejected_budget_reason.as_deref(),
-                            &routing.model_check.as_deref(),
-                            &routing.budget_window_remaining_usd,
-                            &routing_json,
-                            &limit_hits_json,
-                            &max_tool_calls,
-                            &max_agent_steps,
-                            &max_retries,
-                            &app_run_key,
-                            &created_at,
-                            &spend.rule_id.as_str(),
-                            &spend.limit_id.as_str(),
-                            &spend.scope_key.as_str(),
-                            &window_started_at,
-                            &window.used_usd,
-                            &reservation.id.as_str(),
-                            &reservation.amount_usd,
-                            &reservation.currency.as_str(),
-                            &reservation_status_text(reservation.status),
-                            &reservation_created_at,
-                            &reservation_expires_at,
-                            &budget_rule_ids_json,
-                            &limit_window_spends_json,
-                            &allocation_spends_json,
-                            &bucket_start,
-                        ],
-                    )
-                    .await?;
-                    persist_advisory_cadence_async(conn, &snapshot.pending_advisory_cadence)
-                        .await?;
-                    return Ok(());
-                }
-            }
+    if let Some(reservation) = &decision.reservation
+        && let Some(stored) = snapshot.reservations.get(&reservation.id)
+        && stored.limit_window_spends.len() == 1
+        && stored.allocation_spends.is_empty()
+    {
+        let spend = &stored.limit_window_spends[0];
+        if let Some(window) = snapshot.limit_windows.get(&(
+            spend.rule_id.clone(),
+            spend.limit_id.clone(),
+            spend.scope_key.clone(),
+        )) {
+            let budget_rule_ids_json = serde_json::to_string(&stored.budget_rule_ids)?;
+            let limit_window_spends_json = serde_json::to_string(&stored.limit_window_spends)?;
+            let allocation_spends_json = serde_json::to_string(&stored.allocation_spends)?;
+            let reservation_created_at = reservation.created_at.to_rfc3339();
+            let reservation_expires_at = reservation.expires_at.to_rfc3339();
+            let window_started_at = window.started_at.to_rfc3339();
+            let bucket_start = rolling_bucket_start(reservation.created_at).to_rfc3339();
+            conn.execute(
+                ASYNC_AUTHORIZE_FAST_SQL,
+                &[
+                    &decision.decision_id.as_str(),
+                    &trace_id.as_deref(),
+                    &session_id.as_deref(),
+                    &request_id.as_deref(),
+                    &request.subject.as_deref(),
+                    &request.project.as_deref(),
+                    &request.provider.as_deref(),
+                    &request.model.as_deref(),
+                    &estimated_tokens,
+                    &request.estimated_cost_usd,
+                    &outcome,
+                    &action_text(decision.action),
+                    &explanations_json,
+                    &metadata_json,
+                    &entities_json,
+                    &routing.selected_budget_id.as_deref(),
+                    &routing.matched_entity.as_deref(),
+                    &routing.selection_reason.as_deref(),
+                    &routing.rejected_budget_id.as_deref(),
+                    &routing.rejected_budget_reason.as_deref(),
+                    &routing.model_check.as_deref(),
+                    &routing.budget_window_remaining_usd,
+                    &routing_json,
+                    &limit_hits_json,
+                    &max_tool_calls,
+                    &max_agent_steps,
+                    &max_retries,
+                    &app_run_key,
+                    &created_at,
+                    &spend.rule_id.as_str(),
+                    &spend.limit_id.as_str(),
+                    &spend.scope_key.as_str(),
+                    &window_started_at,
+                    &window.used_usd,
+                    &reservation.id.as_str(),
+                    &reservation.amount_usd,
+                    &reservation.currency.as_str(),
+                    &reservation_status_text(reservation.status),
+                    &reservation_created_at,
+                    &reservation_expires_at,
+                    &budget_rule_ids_json,
+                    &limit_window_spends_json,
+                    &allocation_spends_json,
+                    &bucket_start,
+                ],
+            )
+            .await?;
+            persist_advisory_cadence_async(conn, &snapshot.pending_advisory_cadence).await?;
+            return Ok(());
         }
     }
 
@@ -6679,63 +6625,47 @@ async fn persist_finalization_async(
     snapshot: &LedgerPersistenceSnapshot,
 ) -> Result<bool, NoetError> {
     let now = Utc::now().to_rfc3339();
-    if let Some(stored) = snapshot.reservations.get(&reservation.id) {
-        if stored.limit_window_spends.len() == 1 {
-            let delta = finalization_amount_delta(reservation, stored);
-            let spend = &stored.limit_window_spends[0];
-            let window_key = (
-                spend.rule_id.clone(),
-                spend.limit_id.clone(),
-                spend.scope_key.clone(),
-            );
-            let Some(window) = snapshot.limit_windows.get(&window_key) else {
-                return Ok(false);
-            };
-            let window_started_at = window.started_at.to_rfc3339();
-            if let Some(usage) = &payload.usage {
-                let trace_id = string_value(&payload.metadata, "trace_id");
-                let input_tokens = usage.input_tokens.map(|value| value as i64);
-                let output_tokens = usage.output_tokens.map(|value| value as i64);
-                let total_tokens = usage.total_tokens.map(|value| value as i64);
-                let latency_ms = usage.latency_ms.map(|value| value as i64);
-                let cost_usd = usage.cost_usd.or(Some(reservation.amount_usd));
-                let metadata_json = serde_json::to_string(&payload.metadata)?;
-                let usage_id = Uuid::new_v4().to_string();
-                conn.execute(
-                    &statements.finalize_with_usage_fast,
-                    &[
-                        &reservation.id.as_str(),
-                        &reservation.amount_usd,
-                        &reservation_status_text(reservation.status),
-                        &now,
-                        &usage_id,
-                        &trace_id.as_deref(),
-                        &usage.provider.as_deref(),
-                        &usage.model.as_deref(),
-                        &input_tokens,
-                        &output_tokens,
-                        &total_tokens,
-                        &cost_usd,
-                        &latency_ms,
-                        &usage.stop_reason.as_deref(),
-                        &metadata_json,
-                        &spend.rule_id.as_str(),
-                        &spend.limit_id.as_str(),
-                        &spend.scope_key.as_str(),
-                        &window_started_at,
-                        &delta,
-                    ],
-                )
-                .await?;
-                return Ok(true);
-            }
+    if let Some(stored) = snapshot.reservations.get(&reservation.id)
+        && stored.limit_window_spends.len() == 1
+    {
+        let delta = finalization_amount_delta(reservation, stored);
+        let spend = &stored.limit_window_spends[0];
+        let window_key = (
+            spend.rule_id.clone(),
+            spend.limit_id.clone(),
+            spend.scope_key.clone(),
+        );
+        let Some(window) = snapshot.limit_windows.get(&window_key) else {
+            return Ok(false);
+        };
+        let window_started_at = window.started_at.to_rfc3339();
+        if let Some(usage) = &payload.usage {
+            let trace_id = string_value(&payload.metadata, "trace_id");
+            let input_tokens = usage.input_tokens.map(|value| value as i64);
+            let output_tokens = usage.output_tokens.map(|value| value as i64);
+            let total_tokens = usage.total_tokens.map(|value| value as i64);
+            let latency_ms = usage.latency_ms.map(|value| value as i64);
+            let cost_usd = usage.cost_usd.or(Some(reservation.amount_usd));
+            let metadata_json = serde_json::to_string(&payload.metadata)?;
+            let usage_id = Uuid::new_v4().to_string();
             conn.execute(
-                &statements.finalize_without_usage_fast,
+                &statements.finalize_with_usage_fast,
                 &[
                     &reservation.id.as_str(),
                     &reservation.amount_usd,
                     &reservation_status_text(reservation.status),
                     &now,
+                    &usage_id,
+                    &trace_id.as_deref(),
+                    &usage.provider.as_deref(),
+                    &usage.model.as_deref(),
+                    &input_tokens,
+                    &output_tokens,
+                    &total_tokens,
+                    &cost_usd,
+                    &latency_ms,
+                    &usage.stop_reason.as_deref(),
+                    &metadata_json,
                     &spend.rule_id.as_str(),
                     &spend.limit_id.as_str(),
                     &spend.scope_key.as_str(),
@@ -6746,6 +6676,22 @@ async fn persist_finalization_async(
             .await?;
             return Ok(true);
         }
+        conn.execute(
+            &statements.finalize_without_usage_fast,
+            &[
+                &reservation.id.as_str(),
+                &reservation.amount_usd,
+                &reservation_status_text(reservation.status),
+                &now,
+                &spend.rule_id.as_str(),
+                &spend.limit_id.as_str(),
+                &spend.scope_key.as_str(),
+                &window_started_at,
+                &delta,
+            ],
+        )
+        .await?;
+        return Ok(true);
     }
 
     conn.execute(
@@ -7313,18 +7259,16 @@ fn decision_report_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tr
         .as_deref()
         .and_then(parse_optional_json::<DecisionRoutingReport>)
         .or_else(|| {
-            decision_routing_report(
-                primary_rule_id.clone(),
-                matched_entity.clone(),
-                selection_reason.clone(),
-                rejected_budget_id.clone(),
-                rejected_budget_reason.clone(),
-                model_check.clone(),
+            decision_routing_report(&RoutingPersistenceFields {
+                selected_budget_id: primary_rule_id.clone(),
+                matched_entity: matched_entity.clone(),
+                selection_reason: selection_reason.clone(),
+                rejected_budget_id: rejected_budget_id.clone(),
+                rejected_budget_reason: rejected_budget_reason.clone(),
+                model_check: model_check.clone(),
                 budget_window_remaining_usd,
-                None,
-                None,
-                None,
-            )
+                ..Default::default()
+            })
         });
     if let Some(routing) = routing.as_mut()
         && routing.selected_budget_id.is_none()
@@ -7430,18 +7374,16 @@ fn decision_report_item_from_postgres_row(row: &PostgresRow) -> TraceReportItem 
         .as_deref()
         .and_then(parse_optional_json::<DecisionRoutingReport>)
         .or_else(|| {
-            decision_routing_report(
-                primary_rule_id.clone(),
-                matched_entity.clone(),
-                selection_reason.clone(),
-                rejected_budget_id.clone(),
-                rejected_budget_reason.clone(),
-                model_check.clone(),
+            decision_routing_report(&RoutingPersistenceFields {
+                selected_budget_id: primary_rule_id.clone(),
+                matched_entity: matched_entity.clone(),
+                selection_reason: selection_reason.clone(),
+                rejected_budget_id: rejected_budget_id.clone(),
+                rejected_budget_reason: rejected_budget_reason.clone(),
+                model_check: model_check.clone(),
                 budget_window_remaining_usd,
-                None,
-                None,
-                None,
-            )
+                ..Default::default()
+            })
         });
     if let Some(routing) = routing.as_mut()
         && routing.selected_budget_id.is_none()
@@ -7677,39 +7619,28 @@ fn agent_run_id_from_metadata_json(metadata_json: &str) -> Option<String> {
         })
 }
 
-fn decision_routing_report(
-    selected_budget_id: Option<String>,
-    matched_entity: Option<String>,
-    selection_reason: Option<String>,
-    rejected_budget_id: Option<String>,
-    rejected_budget_reason: Option<String>,
-    model_check: Option<String>,
-    budget_window_remaining_usd: Option<f64>,
-    budget_window_mode: Option<String>,
-    budget_window_started_at: Option<DateTime<Utc>>,
-    budget_window_ends_at: Option<DateTime<Utc>>,
-) -> Option<DecisionRoutingReport> {
-    let has_fields = selected_budget_id.is_some()
-        || matched_entity.is_some()
-        || selection_reason.is_some()
-        || rejected_budget_id.is_some()
-        || rejected_budget_reason.is_some()
-        || model_check.is_some()
-        || budget_window_remaining_usd.is_some()
-        || budget_window_mode.is_some()
-        || budget_window_started_at.is_some()
-        || budget_window_ends_at.is_some();
+fn decision_routing_report(fields: &RoutingPersistenceFields) -> Option<DecisionRoutingReport> {
+    let has_fields = fields.selected_budget_id.is_some()
+        || fields.matched_entity.is_some()
+        || fields.selection_reason.is_some()
+        || fields.rejected_budget_id.is_some()
+        || fields.rejected_budget_reason.is_some()
+        || fields.model_check.is_some()
+        || fields.budget_window_remaining_usd.is_some()
+        || fields.budget_window_mode.is_some()
+        || fields.budget_window_started_at.is_some()
+        || fields.budget_window_ends_at.is_some();
     has_fields.then_some(DecisionRoutingReport {
-        selected_budget_id,
-        matched_entity,
-        selection_reason,
-        rejected_budget_id,
-        rejected_budget_reason,
-        model_check,
-        budget_window_remaining_usd,
-        budget_window_mode,
-        budget_window_started_at,
-        budget_window_ends_at,
+        selected_budget_id: fields.selected_budget_id.clone(),
+        matched_entity: fields.matched_entity.clone(),
+        selection_reason: fields.selection_reason.clone(),
+        rejected_budget_id: fields.rejected_budget_id.clone(),
+        rejected_budget_reason: fields.rejected_budget_reason.clone(),
+        model_check: fields.model_check.clone(),
+        budget_window_remaining_usd: fields.budget_window_remaining_usd,
+        budget_window_mode: fields.budget_window_mode.clone(),
+        budget_window_started_at: fields.budget_window_started_at,
+        budget_window_ends_at: fields.budget_window_ends_at,
     })
 }
 
@@ -7784,18 +7715,37 @@ fn warning_advisory_cooldown(
         .unwrap_or(WARN_ADVISORY_COOLDOWN)
 }
 
-fn apply_budget_limits(
-    ledger: &mut BudgetLedger,
-    _policy: &PolicyFile,
-    rule: &BudgetRule,
-    request: &AuthorizeRequest,
+struct BudgetEvaluationOutputs<'a> {
+    action: &'a mut PolicyAction,
+    explanations: &'a mut Vec<DecisionExplanation>,
+    limit_hits: &'a mut Vec<DecisionLimitHitReport>,
+    message_hints: &'a mut Vec<AuthorizeMessageHint>,
+}
+
+struct BudgetLimitEvaluation<'a> {
+    ledger: &'a mut BudgetLedger,
+    rule: &'a BudgetRule,
+    request: &'a AuthorizeRequest,
     estimated_cost: f64,
     now: DateTime<Utc>,
-    action: &mut PolicyAction,
-    explanations: &mut Vec<DecisionExplanation>,
-    limit_hits: &mut Vec<DecisionLimitHitReport>,
-    message_hints: &mut Vec<AuthorizeMessageHint>,
-) -> bool {
+    action: &'a mut PolicyAction,
+    explanations: &'a mut Vec<DecisionExplanation>,
+    limit_hits: &'a mut Vec<DecisionLimitHitReport>,
+    message_hints: &'a mut Vec<AuthorizeMessageHint>,
+}
+
+fn apply_budget_limits(context: BudgetLimitEvaluation<'_>) -> bool {
+    let BudgetLimitEvaluation {
+        ledger,
+        rule,
+        request,
+        estimated_cost,
+        now,
+        action,
+        explanations,
+        limit_hits,
+        message_hints,
+    } = context;
     if let Some(limit) = &rule.limits.request_cost
         && estimated_cost > limit.max_usd
     {

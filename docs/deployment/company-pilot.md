@@ -32,6 +32,41 @@ sudo noet up --config /etc/noet/config.yaml
 Bind to localhost when a local reverse proxy or IAP sidecar runs on the same host. Bind to a private
 interface only when the network boundary already prevents untrusted access.
 
+For direct trusted-integration access, configure a shared bearer token:
+
+```bash
+sudo env NOET_API_KEY='redacted-shared-secret' noet up --config /etc/noet/config.yaml
+```
+
+`NOET_API_KEY` is intentionally minimal pilot auth. It is not RBAC and does not replace the company
+security boundary, but it prevents accidental unauthenticated API access when integrations call the
+sidecar directly.
+
+Noether API and SDK calls can send `Authorization: Bearer <NOET_API_KEY>`. Transparent proxy calls
+that must preserve a provider `Authorization` header should instead send
+`x-noet-api-key: <NOET_API_KEY>` for Noether auth; Noether strips that header before forwarding
+traffic upstream.
+
+When an IAP or authenticated reverse proxy provides user identity, configure the trusted actor
+header explicitly:
+
+```bash
+sudo env \
+  NOET_API_KEY='redacted-shared-secret' \
+  NOET_ACTOR_HEADER='x-goog-authenticated-user-email' \
+  noet up --config /etc/noet/config.yaml
+```
+
+`NOET_ACTOR_HEADER` is strict. If it is configured, every request must include that header after the
+proxy authenticates the caller. Noether returns a clear `401` explaining the missing trusted actor
+header when the proxy is misconfigured. The proxy must strip any client-supplied copy of this header
+before injecting the authenticated value.
+
+When the trusted actor header is present, Noether treats it as the user identity for policy/audit:
+client-provided `subject` and `user:*` entities are replaced by the actor-derived `user:*` identity,
+while non-user entities such as `project:*` remain. Client-provided user claims are retained only as
+audit metadata (`client_claimed_subject` / `client_claimed_user_entities`).
+
 ## PostgreSQL start command
 
 Use PostgreSQL for serverless, multi-instance, or company-operated database deployments:
@@ -106,7 +141,7 @@ groups, treat these as different sensitivity levels:
 | `/policy`, `/runs`, `/replay`, `/`, `/app/*` | browser app | Includes policy editing, replay, and run evidence surfaces. |
 | `/v1/app/policy*`, `/v1/app/replay*` | policy mutation and replay | Highest sensitivity; can save drafts, enforce policy, or rollback. |
 | `/v1/app/runs*`, `/v1/reports/*`, `/v1/simulations*`, `/simulations` | reporting/read path | May expose usage, project, subject, model, trace, and event metadata. |
-| `/openapi.json`, `/docs`, `/health` | support/read path | Still keep inside the boundary so deployment posture is not leaked publicly. |
+| `/openapi.json`, `/docs`, `/health`, `/metrics` | support/read path | Still keep inside the boundary so deployment posture is not leaked publicly. |
 
 ## Pilot validation checklist
 
@@ -114,10 +149,12 @@ After deploying behind the company boundary:
 
 1. Confirm unauthenticated public access is impossible from outside the boundary.
 2. Confirm an allowed user can load `/policy`, `/runs`, `/replay`, and `/docs`.
-3. Confirm `GET /health` returns `status=ok`, the expected `decision_mode`, and
-   `policy_loaded=true`.
-4. Run one trusted integration authorization through `POST /v1/authorize`.
-5. Finalize the returned reservation through `POST /v1/reservations/{id}/finalize`.
+3. Confirm `GET /health` returns `status=ok`, the expected `decision_mode`, `policy_loaded=true`,
+   and the expected `auth_configured` posture. If `NOET_ACTOR_HEADER` is configured, include the
+   trusted actor header in the health request or verify your proxy injects it.
+4. Confirm `GET /metrics` returns request, decision, error, and replay counters.
+5. Run one trusted integration authorization through `POST /v1/authorize`.
+6. Finalize the returned reservation through `POST /v1/reservations/{id}/finalize`.
 6. Confirm `/runs` and `GET /v1/reports/usage` show the finalized run.
 7. Save a policy draft, run replay, and enforce only after reviewing the replay result.
 8. Confirm the active storage backend is included in the company's backup process. For SQLite, that

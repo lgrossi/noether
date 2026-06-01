@@ -17,6 +17,7 @@ tags:
   - name: Reservations
   - name: Events
   - name: Health
+  - name: Metrics
 paths:
   /v1/authorize:
     post:
@@ -141,6 +142,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Read pilot metrics in Prometheus text format.
+      operationId: metrics
+      responses:
+        "200":
+          description: Sidecar counters and gauges.
+          content:
+            text/plain:
+              schema:
+                type: string
 components:
   responses:
     Error:
@@ -367,7 +380,17 @@ components:
           additionalProperties: true
     HealthResponse:
       type: object
-      required: [status, decision_mode, policy_loaded, upstream_configured, route_count]
+      required:
+        - status
+        - decision_mode
+        - policy_loaded
+        - upstream_configured
+        - route_count
+        - ledger_backend
+        - auth_configured
+        - request_body_limit_bytes
+        - replay_jobs
+        - replay_job_capacity
       properties:
         status:
           type: string
@@ -381,6 +404,24 @@ components:
           type: boolean
         route_count:
           type: integer
+          minimum: 0
+        ledger_backend:
+          type: string
+        auth_configured:
+          type: boolean
+        request_body_limit_bytes:
+          type: integer
+          minimum: 0
+        replay_jobs:
+          type: integer
+          minimum: 0
+        replay_job_capacity:
+          type: integer
+          minimum: 0
+        postgres_async_finalize_failures:
+          type:
+            - integer
+            - "null"
           minimum: 0
     ErrorResponse:
       type: object

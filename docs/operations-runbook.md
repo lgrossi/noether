@@ -12,18 +12,33 @@ curl -fsS http://127.0.0.1:4040/health
 ```
 
 Managed `noet up` deployments default to port `4051`; low-level `noet serve` defaults to `4040`.
+If `NOET_API_KEY` is configured, include `Authorization: Bearer $NOET_API_KEY`.
+If `NOET_ACTOR_HEADER` is configured, include that trusted actor header or run the check through the
+IAP/reverse proxy that injects it. A `401` with `missing trusted actor header` means the proxy did
+not inject the configured identity header.
 
 Expected company-pilot posture:
 
 - `status=ok`
 - `policy_loaded=true`
 - expected `decision_mode`
+- expected `auth_configured`
+- expected `ledger_backend`
 - expected route count and upstream posture for the deployment
+- expected trusted actor-header behavior when `NOET_ACTOR_HEADER` is configured
 
 Run the health check from inside the company security boundary. Do not expose `/health` publicly just
 because it does not return prompt content.
 
 ## Hot-path monitoring
+
+Use:
+
+```bash
+curl -fsS http://127.0.0.1:4040/metrics
+```
+
+If `NOET_API_KEY` is configured, include `Authorization: Bearer $NOET_API_KEY`.
 
 `POST /v1/authorize` is synchronous in the provider path for governed integrations. Monitor:
 
@@ -32,6 +47,8 @@ because it does not return prompt content.
 - sidecar unavailability from integrations;
 - fail-open/fail-closed activation count;
 - policy deny/warn/ask rates.
+- `/metrics` counters for requests, authorization failures, decision outcomes, errors, and replay
+  jobs.
 
 For strict integrations, alert on authorization errors because they may block provider work. For
 fail-open integrations, alert because provider work may proceed without governance.
@@ -82,6 +99,9 @@ Log:
 - authorization errors and latency;
 - integration delivery errors;
 - policy enforce/rollback audit entries.
+
+Set `NOET_LOG_FORMAT=json` for deployment logs that should be ingested as structured JSON. The
+default remains human-readable text.
 
 Avoid logging raw prompt/provider bodies by default. If a reverse proxy logs request bodies, disable
 that for Noether unless explicitly required and approved.

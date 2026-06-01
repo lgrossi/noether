@@ -5,7 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 
 [workspace]
-members = ["xtask"]
+members = ["sdk/rust", "xtask"]
 resolver = "3"
 
 [[bin]]
@@ -35,7 +35,7 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 tower = "0.5.2"
 tower-http = { version = "0.6.10", features = ["limit", "trace"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tokio-postgres = "0.7"
 url = "2.5.8"
 uuid = { version = "1.23.1", features = ["v4"] }

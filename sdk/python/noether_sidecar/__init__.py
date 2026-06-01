@@ -46,17 +46,21 @@ class NoetherClient:
         url: str = "http://127.0.0.1:4051",
         timeout: float = 1.0,
         fail_mode: FailMode = "fail_closed",
+        api_key: str | None = None,
     ) -> None:
         if fail_mode not in ("fail_open", "fail_closed"):
             raise ValueError("fail_mode must be fail_open or fail_closed")
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.fail_mode = fail_mode
+        self.api_key = api_key
 
     def authorize(self, request: JsonObject) -> JsonObject:
         try:
             return self._post_json("/v1/authorize", request)
         except Exception as error:
+            if _is_auth_failure(error):
+                raise
             return _synthetic_decision(self.fail_mode, error)
 
     def require_authorization(self, request: JsonObject) -> JsonObject:
@@ -97,6 +101,8 @@ class NoetherClient:
     ) -> JsonObject:
         body = None
         headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -134,6 +140,10 @@ def _synthetic_decision(fail_mode: FailMode, error: Exception) -> JsonObject:
         "created_at": datetime.now(UTC).isoformat(),
         "metadata": {"error": str(error)},
     }
+
+
+def _is_auth_failure(error: Exception) -> bool:
+    return isinstance(error, NoetherHttpError) and error.status in (401, 403)
 
 
 __all__ = [

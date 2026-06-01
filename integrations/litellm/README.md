@@ -32,6 +32,7 @@ Configure Noether through environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOET_URL` | `http://127.0.0.1:4051` | Noether sidecar URL. |
+| `NOET_API_KEY` | unset | Optional bearer token for `NOET_API_KEY`-protected sidecars. |
 | `NOET_LITELLM_FAIL_MODE` | `fail_closed` | `fail_open` allows when Noether is unavailable; `fail_closed` rejects. |
 | `NOET_LITELLM_TIMEOUT` | `1.0` | Noether request timeout in seconds. |
 | `NOET_LITELLM_PROJECT` | unset | Default project sent to `/v1/authorize`. |

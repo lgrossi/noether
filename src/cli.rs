@@ -98,6 +98,14 @@ struct ServeArgs {
     #[arg(long, env = "NOET_DATABASE_URL")]
     database_url: Option<String>,
 
+    /// Optional bearer token required for HTTP requests.
+    #[arg(long, env = "NOET_API_KEY")]
+    api_key: Option<String>,
+
+    /// Trusted IAP/reverse-proxy header carrying authenticated actor identity.
+    #[arg(long, env = "NOET_ACTOR_HEADER")]
+    actor_header: Option<String>,
+
     /// PostgreSQL durability/latency profile: strict or performance.
     #[arg(long, env = "NOET_POSTGRES_PROFILE", default_value = "strict")]
     postgres_profile: String,
@@ -474,6 +482,8 @@ pub async fn run() -> Result<(), NoetError> {
                 policy,
                 noether_config: Default::default(),
                 decision_mode: args.decision_mode,
+                api_key: args.api_key,
+                actor_header: args.actor_header,
                 on_bound: None,
             })
             .await
@@ -973,6 +983,12 @@ async fn run_runtime(args: RuntimeArgs) -> Result<(), NoetError> {
         policy: Some(policy),
         noether_config,
         decision_mode,
+        api_key: std::env::var("NOET_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        actor_header: std::env::var("NOET_ACTOR_HEADER")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         on_bound,
     };
     let result = tokio::select! {
@@ -1812,21 +1828,19 @@ fn evaluate_scenario_assertions(
         })
         .collect();
     let mut failures = Vec::new();
+    let reports = ScenarioAssertionReports {
+        decision_reports: &decision_reports,
+        usage_json: &usage_json,
+        decisions_json: &decisions_json,
+        trace_reports,
+        usage_text: &usage_text,
+        decisions_text: &decisions_text,
+        trace_texts: &trace_texts,
+        dashboard,
+    };
 
     for assertion in &scenario.assertions {
-        evaluate_scenario_assertion(
-            assertion,
-            None,
-            &decision_reports,
-            &usage_json,
-            &decisions_json,
-            trace_reports,
-            &usage_text,
-            &decisions_text,
-            &trace_texts,
-            dashboard,
-            &mut failures,
-        );
+        evaluate_scenario_assertion(assertion, None, &reports, &mut failures);
     }
 
     for request in &scenario.requests {
@@ -1884,14 +1898,7 @@ fn evaluate_scenario_assertions(
             evaluate_scenario_assertion(
                 assertion,
                 Some(request.id.as_str()),
-                &decision_reports,
-                &usage_json,
-                &decisions_json,
-                trace_reports,
-                &usage_text,
-                &decisions_text,
-                &trace_texts,
-                dashboard,
+                &reports,
                 &mut failures,
             );
         }
@@ -1907,24 +1914,28 @@ fn evaluate_scenario_assertions(
     }
 }
 
+struct ScenarioAssertionReports<'a> {
+    decision_reports: &'a BTreeMap<String, &'a TraceReportItem>,
+    usage_json: &'a Value,
+    decisions_json: &'a Value,
+    trace_reports: &'a BTreeMap<String, TraceReport>,
+    usage_text: &'a str,
+    decisions_text: &'a str,
+    trace_texts: &'a BTreeMap<String, String>,
+    dashboard: &'a str,
+}
+
 fn evaluate_scenario_assertion(
     assertion: &ScenarioAssertion,
     default_request_id: Option<&str>,
-    decision_reports: &BTreeMap<String, &TraceReportItem>,
-    usage_json: &Value,
-    decisions_json: &Value,
-    trace_reports: &BTreeMap<String, TraceReport>,
-    usage_text: &str,
-    decisions_text: &str,
-    trace_texts: &BTreeMap<String, String>,
-    dashboard: &str,
+    reports: &ScenarioAssertionReports,
     failures: &mut Vec<String>,
 ) {
     match assertion {
         ScenarioAssertion::DecisionOutcome {
             request_id,
             outcome,
-        } => match decision_reports.get(request_id.as_str()) {
+        } => match reports.decision_reports.get(request_id.as_str()) {
             Some(item) if decision_matches_outcome(item.kind.as_str(), *outcome) => {}
             Some(item) => failures.push(format!(
                 "request {request_id} expected outcome {:?} but report kind was {}",
@@ -1935,7 +1946,7 @@ fn evaluate_scenario_assertion(
         ScenarioAssertion::SelectedBudget {
             request_id,
             budget_id,
-        } => match decision_reports.get(request_id.as_str()) {
+        } => match reports.decision_reports.get(request_id.as_str()) {
             Some(item)
                 if item
                     .routing
@@ -1950,33 +1961,41 @@ fn evaluate_scenario_assertion(
             )),
             None => failures.push(format!("missing decision report for request {request_id}")),
         },
-        ScenarioAssertion::Denied { request_id } => match decision_reports.get(request_id.as_str())
-        {
-            Some(item)
-                if decision_matches_outcome(
-                    item.kind.as_str(),
-                    crate::contract::DecisionOutcome::Deny,
-                ) => {}
-            Some(item) => failures.push(format!(
-                "request {request_id} expected deny outcome but report kind was {}",
-                item.kind
-            )),
-            None => failures.push(format!("missing decision report for request {request_id}")),
-        },
+        ScenarioAssertion::Denied { request_id } => {
+            match reports.decision_reports.get(request_id.as_str()) {
+                Some(item)
+                    if decision_matches_outcome(
+                        item.kind.as_str(),
+                        crate::contract::DecisionOutcome::Deny,
+                    ) => {}
+                Some(item) => failures.push(format!(
+                    "request {request_id} expected deny outcome but report kind was {}",
+                    item.kind
+                )),
+                None => failures.push(format!("missing decision report for request {request_id}")),
+            }
+        }
         ScenarioAssertion::TotalCostUsd { amount_usd } => {
-            if (usage_json["total_cost_usd"].as_f64().unwrap_or_default() - amount_usd).abs() > 1e-9
+            if (reports.usage_json["total_cost_usd"]
+                .as_f64()
+                .unwrap_or_default()
+                - amount_usd)
+                .abs()
+                > 1e-9
             {
                 failures.push(format!(
                     "expected total_cost_usd {:.6} but saw {:.6}",
                     amount_usd,
-                    usage_json["total_cost_usd"].as_f64().unwrap_or_default()
+                    reports.usage_json["total_cost_usd"]
+                        .as_f64()
+                        .unwrap_or_default()
                 ));
             }
         }
         ScenarioAssertion::LimitHit {
             request_id,
             rule_id,
-        } => match decision_reports.get(request_id.as_str()) {
+        } => match reports.decision_reports.get(request_id.as_str()) {
             Some(item)
                 if item
                     .limit_hits
@@ -1995,7 +2014,7 @@ fn evaluate_scenario_assertion(
             requested_budget_id.as_deref(),
             selected_budget_id.as_deref(),
             matched_entity.as_deref(),
-            decision_reports,
+            reports.decision_reports,
             failures,
         ),
         ScenarioAssertion::ReportJson {
@@ -2008,9 +2027,9 @@ fn evaluate_scenario_assertion(
                 *report,
                 request_id.as_deref().or(default_request_id),
                 pointer,
-                usage_json,
-                decisions_json,
-                trace_reports,
+                reports.usage_json,
+                reports.decisions_json,
+                reports.trace_reports,
             );
             match actual {
                 Some(value) if value == *equals => {}
@@ -2032,9 +2051,9 @@ fn evaluate_scenario_assertion(
             if !report_text_value(
                 *report,
                 request_id.as_deref().or(default_request_id),
-                usage_text,
-                decisions_text,
-                trace_texts,
+                reports.usage_text,
+                reports.decisions_text,
+                reports.trace_texts,
             )
             .is_some_and(|report_text| report_text.contains(text))
             {
@@ -2042,7 +2061,7 @@ fn evaluate_scenario_assertion(
             }
         }
         ScenarioAssertion::DashboardContains { text } => {
-            if !dashboard.contains(text) {
+            if !reports.dashboard.contains(text) {
                 failures.push(format!("dashboard output missing {text}"));
             }
         }
@@ -3008,10 +3027,10 @@ fn run_story(
             top_row.model.as_deref().unwrap_or("unknown model")
         ));
     }
-    if let Some(item) = latest_decision {
-        if let Some(detail) = decision_supporting_line(item) {
-            points.push(detail);
-        }
+    if let Some(item) = latest_decision
+        && let Some(detail) = decision_supporting_line(item)
+    {
+        points.push(detail);
     }
     if stats.warn > 0 {
         points.push(format!(
@@ -3019,14 +3038,14 @@ fn run_story(
             stats.warn
         ));
     }
-    if let Some(adoption) = &usage.protected_adoption {
-        if adoption.unused_protected_opportunity_usd > 0.0 {
-            points.push(format!(
-                "{} of protected opportunity is still available across {} low adopters.",
-                format_money(adoption.unused_protected_opportunity_usd),
-                adoption.low_adopters.len()
-            ));
-        }
+    if let Some(adoption) = &usage.protected_adoption
+        && adoption.unused_protected_opportunity_usd > 0.0
+    {
+        points.push(format!(
+            "{} of protected opportunity is still available across {} low adopters.",
+            format_money(adoption.unused_protected_opportunity_usd),
+            adoption.low_adopters.len()
+        ));
     }
     let tool_events = activity
         .iter()
@@ -4121,24 +4140,24 @@ fn decision_supporting_line(item: &TraceReportItem) -> Option<String> {
         return Some(line);
     }
 
-    if item.kind.ends_with(".deny") {
-        if let Some(reason) = decision_rejected_reason(item) {
-            let mut line = match decision_rejected_budget(item) {
-                Some(budget) => format!("Budget {budget} rejected the request: {reason}."),
-                None => format!("Noether blocked the request: {reason}."),
-            };
-            if let Some(remaining) = item
-                .routing
-                .as_ref()
-                .and_then(|routing| routing.budget_window_remaining_usd)
-            {
-                line.push_str(&format!(
-                    " Recorded budget-window remaining at evaluation time: {}.",
-                    format_money(remaining)
-                ));
-            }
-            return Some(line);
+    if item.kind.ends_with(".deny")
+        && let Some(reason) = decision_rejected_reason(item)
+    {
+        let mut line = match decision_rejected_budget(item) {
+            Some(budget) => format!("Budget {budget} rejected the request: {reason}."),
+            None => format!("Noether blocked the request: {reason}."),
+        };
+        if let Some(remaining) = item
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.budget_window_remaining_usd)
+        {
+            line.push_str(&format!(
+                " Recorded budget-window remaining at evaluation time: {}.",
+                format_money(remaining)
+            ));
         }
+        return Some(line);
     }
 
     item.routing.as_ref().map(|routing| {

@@ -903,9 +903,9 @@ fn authorize_request(
             format!("user:bench-{}", index % 12),
         ],
         subject: Some(format!("user:bench-{}", index % 12)),
-        project: (index >= 1_000_000 || index % 19 != 0).then_some("noether".to_owned()),
+        project: (index >= 1_000_000 || !index.is_multiple_of(19)).then_some("noether".to_owned()),
         provider: Some("openai-codex".to_owned()),
-        model: Some(if index % 7 == 0 {
+        model: Some(if index.is_multiple_of(7) {
             "gpt-large-bench".to_owned()
         } else {
             "gpt-small-bench".to_owned()
@@ -929,7 +929,7 @@ fn finalize_payload(
         "actual_cost_usd": 0.001 + ((index % 200) as f64 / 100000.0),
         "usage": {
             "provider": "openai-codex",
-            "model": if index % 7 == 0 { "gpt-large-bench" } else { "gpt-small-bench" },
+            "model": if index.is_multiple_of(7) { "gpt-large-bench" } else { "gpt-small-bench" },
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
