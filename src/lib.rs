@@ -3,6 +3,7 @@ pub mod capture;
 pub mod cli;
 pub mod config;
 pub mod contract;
+pub mod dashboard;
 pub mod error;
 pub mod fixture;
 pub mod ledger;

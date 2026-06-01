@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::time::Duration;
 
 use noether::contract::{
@@ -63,11 +65,16 @@ impl NoetherClient {
         self
     }
 
-    pub async fn authorize(&self, request: &AuthorizeRequest) -> AuthorizeDecision {
+    pub async fn authorize(
+        &self,
+        request: &AuthorizeRequest,
+    ) -> Result<AuthorizeDecision, NoetherClientError> {
         match self.post("v1/authorize", request).await {
-            Ok(decision) => decision,
-            Err(error) if is_auth_failure(&error) => synthetic_auth_failure_decision(&error),
-            Err(error) => synthetic_decision(self.fail_mode, &error),
+            Ok(decision) => Ok(decision),
+            Err(error) if is_sidecar_unavailable(&error) => {
+                Ok(synthetic_decision(self.fail_mode, &error))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -75,7 +82,7 @@ impl NoetherClient {
         &self,
         request: &AuthorizeRequest,
     ) -> Result<AuthorizeDecision, NoetherClientError> {
-        let decision = self.authorize(request).await;
+        let decision = self.authorize(request).await?;
         if decision.outcome == DecisionOutcome::Deny {
             let reason = decision
                 .explanations
@@ -162,6 +169,12 @@ pub struct HealthResponse {
     pub policy_loaded: bool,
     pub upstream_configured: bool,
     pub route_count: u64,
+    pub ledger_backend: String,
+    pub auth_configured: bool,
+    pub request_body_limit_bytes: u64,
+    pub replay_jobs: u64,
+    pub replay_job_capacity: u64,
+    pub postgres_async_finalize_failures: Option<u64>,
 }
 
 async fn decode_response<T>(response: reqwest::Response) -> Result<T, NoetherClientError>
@@ -209,28 +222,8 @@ fn synthetic_decision(fail_mode: FailMode, error: &NoetherClientError) -> Author
     }
 }
 
-fn synthetic_auth_failure_decision(error: &NoetherClientError) -> AuthorizeDecision {
-    AuthorizeDecision {
-        decision_id: "sdk-auth_failure".to_owned(),
-        outcome: DecisionOutcome::Deny,
-        action: PolicyAction::Block,
-        reservation: None,
-        explanations: vec![DecisionExplanation {
-            rule_id: "sdk.sidecar_auth_failed".to_owned(),
-            reason: format!("Noether authentication failed; refusing fail-open behavior: {error}"),
-            severity: DecisionSeverity::Deny,
-        }],
-        metadata: None,
-        created_at: chrono::Utc::now(),
-    }
-}
-
-fn is_auth_failure(error: &NoetherClientError) -> bool {
-    matches!(
-        error,
-        NoetherClientError::Http { status, .. }
-            if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN
-    )
+fn is_sidecar_unavailable(error: &NoetherClientError) -> bool {
+    matches!(error, NoetherClientError::Transport(error) if error.is_connect() || error.is_timeout())
 }
 
 fn percent_encode_path_component(input: &str) -> String {
@@ -275,7 +268,8 @@ mod tests {
                 model: Some("gpt-4.1".to_owned()),
                 ..authorize_request()
             })
-            .await;
+            .await
+            .expect("authorize");
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert_eq!(
             decision
@@ -332,7 +326,11 @@ mod tests {
 
         assert_eq!(client.health().await.expect("health").status, "ok");
         assert_eq!(
-            client.authorize(&authorize_request()).await.outcome,
+            client
+                .authorize(&authorize_request())
+                .await
+                .expect("authorize")
+                .outcome,
             DecisionOutcome::Allow
         );
     }
@@ -344,7 +342,10 @@ mod tests {
             .with_timeout(Duration::from_millis(50))
             .expect("timeout")
             .with_fail_mode(FailMode::FailOpen);
-        let open_decision = fail_open.authorize(&authorize_request()).await;
+        let open_decision = fail_open
+            .authorize(&authorize_request())
+            .await
+            .expect("fail-open decision");
         assert_eq!(open_decision.outcome, DecisionOutcome::Allow);
         assert_eq!(open_decision.action, PolicyAction::Allow);
 
@@ -352,7 +353,10 @@ mod tests {
             .expect("client")
             .with_timeout(Duration::from_millis(50))
             .expect("timeout");
-        let closed_decision = fail_closed.authorize(&authorize_request()).await;
+        let closed_decision = fail_closed
+            .authorize(&authorize_request())
+            .await
+            .expect("fail-closed decision");
         assert_eq!(closed_decision.outcome, DecisionOutcome::Deny);
         assert_eq!(closed_decision.action, PolicyAction::Block);
 
@@ -370,11 +374,39 @@ mod tests {
             .with_api_key("wrong-token")
             .with_fail_mode(FailMode::FailOpen);
 
-        let decision = client.authorize(&authorize_request()).await;
+        let error = client
+            .authorize(&authorize_request())
+            .await
+            .expect_err("auth failure");
 
-        assert_eq!(decision.outcome, DecisionOutcome::Deny);
-        assert_eq!(decision.action, PolicyAction::Block);
-        assert_eq!(decision.explanations[0].rule_id, "sdk.sidecar_auth_failed");
+        assert!(matches!(
+            error,
+            NoetherClientError::Http {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_open_does_not_synthesize_allow_for_sidecar_http_errors() {
+        let server = TestServer::start_rejecting_authorize(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let client = NoetherClient::new(&server.url)
+            .expect("client")
+            .with_fail_mode(FailMode::FailOpen);
+
+        let error = client
+            .authorize(&authorize_request())
+            .await
+            .expect_err("http failure");
+
+        assert!(matches!(
+            error,
+            NoetherClientError::Http {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                ..
+            }
+        ));
     }
 
     struct TestServer {
@@ -479,7 +511,13 @@ mod tests {
                 "decision_mode":"dry_run",
                 "policy_loaded":true,
                 "upstream_configured":false,
-                "route_count":0
+                "route_count":0,
+                "ledger_backend":"sqlite",
+                "auth_configured":false,
+                "request_body_limit_bytes":16777216,
+                "replay_jobs":0,
+                "replay_job_capacity":8,
+                "postgres_async_finalize_failures":null
             }));
         }
         Json(json!({"error":"not found"}))

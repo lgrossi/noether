@@ -38,6 +38,7 @@ pub fn api_docs_html() -> Html<&'static str> {
     <main>
       <h1>Noether Sidecar API</h1>
       <p class="boundary"><strong>Boundary:</strong> Noether is a decision sidecar. Integrations call Noether for authorization, finalization, and events. Integrations own provider transport; Noether does not call model providers as part of this API.</p>
+      <p>If the sidecar is started with <code>NOET_API_KEY</code>, send <code>Authorization: Bearer &lt;NOET_API_KEY&gt;</code> for Noether API calls.</p>
       <p>Machine-readable spec: <a href="/openapi.json"><code>/openapi.json</code></a></p>
       <h2>Core lifecycle</h2>
       <pre>integration -> POST /v1/authorize
@@ -79,6 +80,31 @@ mod tests {
         assert!(spec["paths"]["/v1/events"]["post"].is_object());
         assert!(spec["paths"]["/health"]["get"].is_object());
         assert!(spec["paths"]["/metrics"]["get"].is_object());
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKey"]["scheme"],
+            "bearer"
+        );
+        for path in [
+            "/v1/authorize",
+            "/v1/reservations/{id}/finalize",
+            "/v1/events",
+            "/health",
+            "/metrics",
+        ] {
+            let operation = if path == "/health" || path == "/metrics" {
+                &spec["paths"][path]["get"]
+            } else {
+                &spec["paths"][path]["post"]
+            };
+            assert!(
+                operation["responses"]["401"].is_object(),
+                "missing 401 response for {path}"
+            );
+            assert!(
+                operation["responses"]["403"].is_object(),
+                "missing 403 response for {path}"
+            );
+        }
     }
 
     #[test]

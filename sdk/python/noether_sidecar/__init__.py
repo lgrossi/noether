@@ -59,7 +59,7 @@ class NoetherClient:
         try:
             return self._post_json("/v1/authorize", request)
         except Exception as error:
-            if _is_auth_failure(error):
+            if isinstance(error, NoetherHttpError):
                 raise
             return _synthetic_decision(self.fail_mode, error)
 
@@ -140,10 +140,6 @@ def _synthetic_decision(fail_mode: FailMode, error: Exception) -> JsonObject:
         "created_at": datetime.now(UTC).isoformat(),
         "metadata": {"error": str(error)},
     }
-
-
-def _is_auth_failure(error: Exception) -> bool:
-    return isinstance(error, NoetherHttpError) and error.status in (401, 403)
 
 
 __all__ = [

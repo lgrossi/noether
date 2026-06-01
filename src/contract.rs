@@ -13,7 +13,7 @@ pub enum DecisionMode {
     Enforce,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AuthorizeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_id: Option<String>,
@@ -151,7 +151,7 @@ pub enum FinalizeOutcome {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FinalizeReservation {
     #[serde(default)]
     pub reservation_id: Option<String>,

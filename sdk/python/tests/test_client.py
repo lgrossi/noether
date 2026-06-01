@@ -85,6 +85,22 @@ class NoetherClientTests(TestCase):
         finally:
             server.stop()
 
+    def test_fail_open_does_not_synthesize_allow_for_sidecar_http_errors(self) -> None:
+        server = TestServer(authorize_status=500)
+        server.start()
+        try:
+            client = NoetherClient(
+                url=server.url,
+                timeout=0.5,
+                fail_mode="fail_open",
+            )
+
+            with self.assertRaises(NoetherHttpError) as captured:
+                client.authorize({"project": "noether"})
+            self.assertEqual(captured.exception.status, 500)
+        finally:
+            server.stop()
+
     def test_fail_closed_blocks_with_decision(self) -> None:
         client = NoetherClient(url="http://127.0.0.1:9", timeout=0.05, fail_mode="fail_closed")
 

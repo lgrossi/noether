@@ -153,10 +153,6 @@ export class NoetherDeniedError extends NoetherError {
 	}
 }
 
-function isNoetherAuthFailure(error: unknown): boolean {
-	return error instanceof NoetherHttpError && (error.status === 401 || error.status === 403);
-}
-
 export class NoetherClient {
 	readonly url: string;
 	readonly timeoutMs: number;
@@ -179,7 +175,7 @@ export class NoetherClient {
 		try {
 			return await this.postJson<AuthorizeDecision>("/v1/authorize", request);
 		} catch (error) {
-			if (isNoetherAuthFailure(error)) {
+			if (error instanceof NoetherHttpError) {
 				throw error;
 			}
 			return syntheticDecision(this.failMode, error);
