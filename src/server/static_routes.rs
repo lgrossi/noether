@@ -37,7 +37,7 @@ pub(super) async fn noether_app_html() -> impl IntoResponse {
     (
         [(
             HeaderName::from_static("content-security-policy"),
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
         )],
         Html(noether_app::app_shell()),
     )

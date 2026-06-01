@@ -484,10 +484,10 @@ fn matches_model_optional(expected: &Option<String>, request: &AuthorizeRequest)
         return false;
     };
     if expected.contains(':') {
-        let Some(provider) = request.provider.as_deref() else {
-            return false;
-        };
-        model_pattern_matches(expected, &format!("{provider}:{model}"))
+        model_pattern_matches(expected, model)
+            || request.provider.as_deref().is_some_and(|provider| {
+                model_pattern_matches(expected, &format!("{provider}:{model}"))
+            })
     } else {
         model_pattern_matches(expected, model)
     }
@@ -1197,6 +1197,40 @@ policies:
         let explanations = matching_policy_explanations(&policy, &request);
 
         assert_eq!(explanations.len(), 2);
+    }
+
+    #[test]
+    fn policy_rule_model_match_supports_raw_model_ids_with_colons() {
+        let policy: PolicyFile = serde_yaml::from_str(
+            r#"
+version: 0
+budgets:
+  - id: dev
+    limits:
+      spend:
+        - id: daily-cap
+          window: 1d
+          mode: tumbling
+          anchor:
+            kind: first_seen
+          max_usd: 1
+          action: block
+policies:
+  - id: match-raw-model-id
+    action: warn
+    reason: raw model matched
+    when:
+      match:
+        model: openai:gpt-4*
+"#,
+        )
+        .expect("policy parses");
+        let mut request = request_with_entities(["project:noether"]);
+        request.model = Some("openai:gpt-4.1".to_owned());
+
+        let explanations = matching_policy_explanations(&policy, &request);
+
+        assert_eq!(explanations.len(), 1);
     }
 
     #[test]

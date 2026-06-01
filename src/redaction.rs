@@ -7,11 +7,12 @@ use serde_json::Value;
 pub const REDACTED: &str = "<redacted>";
 
 pub fn redact_json_value(value: &Value) -> Value {
-    redact_json_value_with_key(None, value)
+    redact_json_value_with_context(None, false, value)
 }
 
-fn redact_json_value_with_key(key: Option<&str>, value: &Value) -> Value {
-    if key.is_some_and(is_prompt_content_key) && matches!(value, Value::String(_)) {
+fn redact_json_value_with_context(key: Option<&str>, prompt_context: bool, value: &Value) -> Value {
+    let prompt_context = prompt_context || key.is_some_and(is_prompt_content_key);
+    if prompt_context && matches!(value, Value::String(_)) {
         return Value::String(REDACTED.to_owned());
     }
     match value {
@@ -21,7 +22,10 @@ fn redact_json_value_with_key(key: Option<&str>, value: &Value) -> Value {
                     if is_secret_key(key) {
                         (key.clone(), Value::String(REDACTED.to_owned()))
                     } else {
-                        (key.clone(), redact_json_value_with_key(Some(key), child))
+                        (
+                            key.clone(),
+                            redact_json_value_with_context(Some(key), prompt_context, child),
+                        )
                     }
                 })
                 .collect(),
@@ -29,7 +33,7 @@ fn redact_json_value_with_key(key: Option<&str>, value: &Value) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| redact_json_value_with_key(key, item))
+                .map(|item| redact_json_value_with_context(key, prompt_context, item))
                 .collect(),
         ),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
@@ -185,5 +189,30 @@ mod tests {
         assert_eq!(redacted["nested"]["items"][0]["prompt"], REDACTED);
         assert_eq!(redacted["messages"][0]["content"], REDACTED);
         assert!(redaction_findings(&redacted).is_empty());
+    }
+
+    #[test]
+    fn redacts_nested_prompt_content_parts_but_preserves_shape() {
+        let value = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "secret prompt" },
+                        { "type": "image_url", "image_url": { "url": "https://example.invalid/image.png" } }
+                    ]
+                }
+            ]
+        });
+
+        let redacted = redact_json_value(&value);
+
+        assert_eq!(redacted["messages"][0]["role"], REDACTED);
+        assert_eq!(redacted["messages"][0]["content"][0]["type"], REDACTED);
+        assert_eq!(redacted["messages"][0]["content"][0]["text"], REDACTED);
+        assert_eq!(
+            redacted["messages"][0]["content"][1]["image_url"]["url"],
+            REDACTED
+        );
     }
 }

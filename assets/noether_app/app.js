@@ -1233,8 +1233,12 @@ function startReportUpdates() {
       return;
     }
     if (mode === "policy") {
-      state.runs = null;
-      load("policy", true).catch(renderError);
+      if (state.policyEditorDirty) {
+        reloadRuns().catch(renderError);
+      } else {
+        state.runs = null;
+        load("policy", true).catch(renderError);
+      }
       return;
     }
     if (mode === "replay") {
