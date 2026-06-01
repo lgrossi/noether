@@ -38,6 +38,7 @@ pub fn api_docs_html() -> Html<&'static str> {
     <main>
       <h1>Noether Sidecar API</h1>
       <p class="boundary"><strong>Boundary:</strong> Noether is a decision sidecar. Integrations call Noether for authorization, finalization, and events. Integrations own provider transport; Noether does not call model providers as part of this API.</p>
+      <p>If the sidecar is started with <code>NOET_API_KEY</code>, send <code>Authorization: Bearer &lt;NOET_API_KEY&gt;</code> for Noether API calls. Proxy integrations that must preserve a provider Authorization header can send <code>x-noet-api-key: &lt;NOET_API_KEY&gt;</code> instead.</p>
       <p>Machine-readable spec: <a href="/openapi.json"><code>/openapi.json</code></a></p>
       <h2>Core lifecycle</h2>
       <pre>integration -> POST /v1/authorize
@@ -79,6 +80,104 @@ mod tests {
         assert!(spec["paths"]["/v1/events"]["post"].is_object());
         assert!(spec["paths"]["/health"]["get"].is_object());
         assert!(spec["paths"]["/metrics"]["get"].is_object());
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKey"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKeyHeader"]["in"],
+            "header"
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["NoetherApiKeyHeader"]["name"],
+            "x-noet-api-key"
+        );
+        for path in [
+            "/v1/authorize",
+            "/v1/reservations/{id}/finalize",
+            "/v1/events",
+            "/v1/reports/usage",
+            "/v1/reports/decisions",
+            "/v1/reports/traces/{trace_id}",
+            "/v1/reports/observations",
+            "/v1/reports/approval-audit",
+            "/v1/reports/updates",
+            "/v1/app/policy",
+            "/v1/app/policy/proposal",
+            "/v1/app/policy/suggestions/{suggestion_id}/apply",
+            "/v1/app/policy/enforce",
+            "/v1/app/policy/rollback",
+            "/v1/app/runs",
+            "/v1/app/runs/{run_id}",
+            "/v1/app/replay",
+            "/v1/app/replay/jobs",
+            "/v1/app/replay/jobs/{job_id}",
+            "/v1/simulations",
+            "/v1/simulations/{simulation_id}",
+            "/v1/simulations/{simulation_id}/dashboard",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/usage",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/decisions",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/dashboard",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/health",
+            "/metrics",
+        ] {
+            let operations = spec["paths"][path].as_object().expect("path item object");
+            for (method, operation) in operations {
+                assert!(
+                    operation["responses"]["401"].is_object(),
+                    "missing 401 response for {method} {path}"
+                );
+                assert!(
+                    operation["responses"]["403"].is_object(),
+                    "missing 403 response for {method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openapi_covers_public_json_and_proxy_api_routes() {
+        let spec = openapi_json_value().expect("openapi parses");
+        let paths = spec["paths"].as_object().expect("paths object");
+        let expected = [
+            "/v1/authorize",
+            "/v1/reservations/{id}/finalize",
+            "/v1/events",
+            "/v1/reports/usage",
+            "/v1/reports/decisions",
+            "/v1/reports/traces/{trace_id}",
+            "/v1/reports/observations",
+            "/v1/reports/approval-audit",
+            "/v1/reports/updates",
+            "/v1/app/policy",
+            "/v1/app/policy/proposal",
+            "/v1/app/policy/suggestions/{suggestion_id}/apply",
+            "/v1/app/policy/enforce",
+            "/v1/app/policy/rollback",
+            "/v1/app/runs",
+            "/v1/app/runs/{run_id}",
+            "/v1/app/replay",
+            "/v1/app/replay/jobs",
+            "/v1/app/replay/jobs/{job_id}",
+            "/v1/simulations",
+            "/v1/simulations/{simulation_id}",
+            "/v1/simulations/{simulation_id}/dashboard",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/usage",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/decisions",
+            "/v1/simulations/{simulation_id}/strategies/{strategy_id}/dashboard",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/responses",
+            "/health",
+            "/metrics",
+        ];
+
+        for path in expected {
+            assert!(paths.contains_key(path), "missing OpenAPI path {path}");
+        }
     }
 
     #[test]

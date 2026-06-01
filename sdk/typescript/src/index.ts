@@ -146,15 +146,18 @@ export class NoetherHttpError extends NoetherError {
 	}
 }
 
+export class NoetherTransportError extends NoetherError {
+	constructor(cause: unknown) {
+		super("Noether request failed", cause);
+		this.name = "NoetherTransportError";
+	}
+}
+
 export class NoetherDeniedError extends NoetherError {
 	constructor(readonly decision: AuthorizeDecision) {
 		super(`Noether denied request: ${decision.explanations.map((item) => item.reason).join("; ")}`);
 		this.name = "NoetherDeniedError";
 	}
-}
-
-function isNoetherAuthFailure(error: unknown): boolean {
-	return error instanceof NoetherHttpError && (error.status === 401 || error.status === 403);
 }
 
 export class NoetherClient {
@@ -179,7 +182,7 @@ export class NoetherClient {
 		try {
 			return await this.postJson<AuthorizeDecision>("/v1/authorize", request);
 		} catch (error) {
-			if (isNoetherAuthFailure(error)) {
+			if (!(error instanceof NoetherTransportError)) {
 				throw error;
 			}
 			return syntheticDecision(this.failMode, error);
@@ -249,7 +252,7 @@ export class NoetherClient {
 			if (error instanceof NoetherError) {
 				throw error;
 			}
-			throw new NoetherError("Noether request failed", error);
+			throw new NoetherTransportError(error);
 		} finally {
 			clearTimeout(timeout);
 		}

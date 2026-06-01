@@ -128,6 +128,52 @@ test("fail_open does not synthesize allow decisions for auth failures", async ()
 	}
 });
 
+test("fail_open does not synthesize allow decisions for sidecar HTTP errors", async () => {
+	const server = http.createServer(async (_request, response) => {
+		response.statusCode = 500;
+		response.setHeader("content-type", "application/json");
+		response.end(JSON.stringify({ error: "internal server error" }));
+	});
+	const baseUrl = await listen(server);
+	try {
+		const client = new NoetherClient({
+			url: baseUrl,
+			timeoutMs: 500,
+			failMode: "fail_open",
+		});
+
+		await assert.rejects(
+			() => client.authorize({ project: "noether" }),
+			(error) => error instanceof NoetherHttpError && error.status === 500,
+		);
+	} finally {
+		await close(server);
+	}
+});
+
+test("fail_open does not synthesize allow decisions for malformed success responses", async () => {
+	const server = http.createServer(async (_request, response) => {
+		response.statusCode = 200;
+		response.setHeader("content-type", "application/json");
+		response.end("{not-json");
+	});
+	const baseUrl = await listen(server);
+	try {
+		const client = new NoetherClient({
+			url: baseUrl,
+			timeoutMs: 500,
+			failMode: "fail_open",
+		});
+
+		await assert.rejects(
+			() => client.authorize({ project: "noether" }),
+			SyntaxError,
+		);
+	} finally {
+		await close(server);
+	}
+});
+
 test("fail_closed returns synthetic deny decision and withDecision blocks work", async () => {
 	const client = new NoetherClient({ url: "http://127.0.0.1:9", timeoutMs: 50, failMode: "fail_closed" });
 	const decision = await client.authorize({ project: "noether" });

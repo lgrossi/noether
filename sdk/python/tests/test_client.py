@@ -85,6 +85,43 @@ class NoetherClientTests(TestCase):
         finally:
             server.stop()
 
+    def test_fail_open_does_not_synthesize_allow_for_sidecar_http_errors(self) -> None:
+        server = TestServer(authorize_status=500)
+        server.start()
+        try:
+            client = NoetherClient(
+                url=server.url,
+                timeout=0.5,
+                fail_mode="fail_open",
+            )
+
+            with self.assertRaises(NoetherHttpError) as captured:
+                client.authorize({"project": "noether"})
+            self.assertEqual(captured.exception.status, 500)
+        finally:
+            server.stop()
+
+    def test_fail_open_does_not_synthesize_allow_for_malformed_success_responses(self) -> None:
+        server = TestServer(authorize_raw_body="{not-json")
+        server.start()
+        try:
+            client = NoetherClient(
+                url=server.url,
+                timeout=0.5,
+                fail_mode="fail_open",
+            )
+
+            with self.assertRaises(json.JSONDecodeError):
+                client.authorize({"project": "noether"})
+        finally:
+            server.stop()
+
+    def test_fail_open_does_not_synthesize_allow_for_unserializable_requests(self) -> None:
+        client = NoetherClient(url="http://127.0.0.1:9", timeout=0.05, fail_mode="fail_open")
+
+        with self.assertRaises(TypeError):
+            client.authorize({"metadata": {"bad": object()}})
+
     def test_fail_closed_blocks_with_decision(self) -> None:
         client = NoetherClient(url="http://127.0.0.1:9", timeout=0.05, fail_mode="fail_closed")
 
@@ -102,7 +139,7 @@ class NoetherClientTests(TestCase):
 
 
 class TestServer:
-    def __init__(self, authorize_status: int = 200) -> None:
+    def __init__(self, authorize_status: int = 200, authorize_raw_body: str | None = None) -> None:
         self.seen: list[dict[str, Any]] = []
         seen = self.seen
 
@@ -140,6 +177,12 @@ class TestServer:
                     }
                 )
                 if self.path == "/v1/authorize":
+                    if authorize_raw_body is not None:
+                        self.send_response(authorize_status)
+                        self.send_header("content-type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(authorize_raw_body.encode("utf-8"))
+                        return
                     if authorize_status != 200:
                         self.write_json(
                             {"error": "missing or invalid Noether API key"},

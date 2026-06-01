@@ -28,6 +28,10 @@ class NoetherHttpError(NoetherError):
         self.body = body
 
 
+class NoetherTransportError(NoetherError):
+    pass
+
+
 class NoetherDeniedError(NoetherError):
     def __init__(self, decision: JsonObject) -> None:
         explanations = decision.get("explanations") or []
@@ -59,7 +63,7 @@ class NoetherClient:
         try:
             return self._post_json("/v1/authorize", request)
         except Exception as error:
-            if _is_auth_failure(error):
+            if not isinstance(error, NoetherTransportError):
                 raise
             return _synthetic_decision(self.fail_mode, error)
 
@@ -118,7 +122,7 @@ class NoetherClient:
         except urllib.error.HTTPError as error:
             raise NoetherHttpError(error.code, error.read().decode("utf-8")) from error
         except urllib.error.URLError as error:
-            raise NoetherError("Noether request failed") from error
+            raise NoetherTransportError("Noether request failed") from error
         return json.loads(raw)
 
 
@@ -142,13 +146,10 @@ def _synthetic_decision(fail_mode: FailMode, error: Exception) -> JsonObject:
     }
 
 
-def _is_auth_failure(error: Exception) -> bool:
-    return isinstance(error, NoetherHttpError) and error.status in (401, 403)
-
-
 __all__ = [
     "NoetherClient",
     "NoetherDeniedError",
     "NoetherError",
     "NoetherHttpError",
+    "NoetherTransportError",
 ]
