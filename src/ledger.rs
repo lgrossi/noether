@@ -1361,11 +1361,7 @@ impl AsyncPostgresLedger {
         init_postgres_schema_async(&client).await?;
         let statements = prepare_async_postgres_statements(&client).await?;
         let mut ledger = BudgetLedger::default();
-        load_limit_windows_async(&client, &mut ledger).await?;
-        load_allocation_buckets_async(&client, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&client, &mut ledger, None, Utc::now()).await?;
-        load_active_reservations_async(&client, &mut ledger, None).await?;
-        load_advisory_cadence_async(&client, &mut ledger).await?;
+        load_async_authorization_state(&client, &mut ledger, None, Utc::now(), None).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
             statements: Arc::new(statements),
@@ -1438,11 +1434,14 @@ impl AsyncPostgresLedger {
         } else {
             None
         };
-        load_limit_windows_async(&tx, &mut ledger).await?;
-        load_allocation_buckets_async(&tx, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&tx, &mut ledger, policy.as_deref(), now).await?;
-        load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
-        load_advisory_cadence_async(&tx, &mut ledger).await?;
+        load_async_authorization_state(
+            &tx,
+            &mut ledger,
+            policy.as_deref(),
+            now,
+            pending_finalizations.as_ref(),
+        )
+        .await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
@@ -1483,10 +1482,7 @@ impl AsyncPostgresLedger {
             } else {
                 None
             };
-            load_limit_windows_async(&tx, &mut ledger).await?;
-            load_allocation_buckets_async(&tx, &mut ledger).await?;
-            load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref())
-                .await?;
+            load_async_finalization_state(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
             if !ledger.reservations.contains_key(&reservation_id) {
                 load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
             }
@@ -1622,6 +1618,10 @@ impl BudgetLedger {
     }
 
     fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
+        self.state_snapshot()
+    }
+
+    fn state_snapshot(&self) -> LedgerPersistenceSnapshot {
         LedgerPersistenceSnapshot {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
@@ -1631,6 +1631,29 @@ impl BudgetLedger {
             selected_budget_id: self.last_selected_budget_id.clone(),
             limit_hits: self.last_limit_hits.clone(),
         }
+    }
+
+    fn load_store_state(&mut self) -> Result<(), NoetError> {
+        self.load_limit_windows()?;
+        self.load_allocation_buckets()?;
+        self.load_active_reservations()?;
+        self.load_advisory_cadence_for_store()
+    }
+
+    fn load_advisory_cadence_for_store(&mut self) -> Result<(), NoetError> {
+        match &self.store {
+            LedgerStore::Postgres(_) => self.load_advisory_cadence_postgres(),
+            LedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite(),
+            LedgerStore::InMemory => Ok(()),
+        }
+    }
+
+    fn persist_authorization_state(&self, has_reservation: bool) -> Result<(), NoetError> {
+        if has_reservation {
+            self.persist_limit_windows()?;
+            self.persist_allocation_buckets()?;
+        }
+        Ok(())
     }
 
     pub fn open_sqlite(path: &Path) -> Result<Self, NoetError> {
@@ -1653,10 +1676,7 @@ impl BudgetLedger {
             store: LedgerStore::Sqlite(conn),
             ..Self::default()
         };
-        ledger.load_limit_windows()?;
-        ledger.load_allocation_buckets()?;
-        ledger.load_active_reservations()?;
-        ledger.load_advisory_cadence_sqlite()?;
+        ledger.load_store_state()?;
         Ok(ledger)
     }
 
@@ -1673,10 +1693,7 @@ impl BudgetLedger {
             store: LedgerStore::Postgres(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn)))),
             ..Self::default()
         };
-        ledger.load_limit_windows()?;
-        ledger.load_allocation_buckets()?;
-        ledger.load_active_reservations()?;
-        ledger.load_advisory_cadence_postgres()?;
+        ledger.load_store_state()?;
         Ok(ledger)
     }
 
@@ -1807,11 +1824,7 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
-        match &self.store {
-            LedgerStore::Postgres(_) => self.load_advisory_cadence_postgres()?,
-            LedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite()?,
-            LedgerStore::InMemory => {}
-        }
+        self.load_advisory_cadence_for_store()?;
         let outcome = AuthorizationEngine::new(self).evaluate(policy, request, now);
 
         let reservation = if outcome.action.halts_request() {
@@ -1838,10 +1851,7 @@ impl BudgetLedger {
         };
         let sqlite_tx = self.begin_sqlite_transaction()?;
         let persist_result = (|| {
-            if has_reservation {
-                self.persist_limit_windows()?;
-                self.persist_allocation_buckets()?;
-            }
+            self.persist_authorization_state(has_reservation)?;
             self.persist_decision(
                 policy,
                 request,
@@ -5843,6 +5853,30 @@ async fn load_advisory_cadence_async(
         })
         .collect();
     Ok(())
+}
+
+async fn load_async_authorization_state(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+    policy: Option<&PolicyFile>,
+    now: DateTime<Utc>,
+    pending_finalizations: Option<&HashSet<String>>,
+) -> Result<(), NoetError> {
+    load_limit_windows_async(conn, ledger).await?;
+    load_allocation_buckets_async(conn, ledger).await?;
+    load_rolling_spend_buckets_async(conn, ledger, policy, now).await?;
+    load_active_reservations_async(conn, ledger, pending_finalizations).await?;
+    load_advisory_cadence_async(conn, ledger).await
+}
+
+async fn load_async_finalization_state(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+    pending_finalizations: Option<&HashSet<String>>,
+) -> Result<(), NoetError> {
+    load_limit_windows_async(conn, ledger).await?;
+    load_allocation_buckets_async(conn, ledger).await?;
+    load_active_reservations_async(conn, ledger, pending_finalizations).await
 }
 
 async fn load_rolling_spend_buckets_async(
