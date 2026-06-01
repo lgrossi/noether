@@ -8835,6 +8835,19 @@ mod tests {
     }
 
     #[test]
+    fn budget_evaluator_warns_at_default_full_threshold() {
+        let policy = policy(1.0, 1.0);
+        let mut ledger = BudgetLedger::default();
+
+        let decision = ledger.authorize(Some(&policy), &request(1.0));
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(decision.metadata.as_ref().is_some_and(|metadata| {
+            metadata.to_string().contains("\"threshold_percent\":100")
+        }));
+    }
+
+    #[test]
     fn budget_evaluator_warns_only_when_crossing_threshold() {
         let policy = policy(1.0, 0.5);
         let mut ledger = BudgetLedger::default();
@@ -10580,6 +10593,22 @@ mod tests {
         assert_eq!(alice_bucket.carryover_usd, 0.0);
         assert_eq!(bob_bucket.current_grant_usd, 24.75);
         assert_eq!(bob_bucket.carryover_usd, 0.0);
+    }
+
+    #[test]
+    fn protected_adoption_allocation_blocks_when_entity_grant_is_exhausted() {
+        let policy = protected_adoption_policy("60s");
+        let mut ledger = BudgetLedger::default();
+        let mut request = request(26.0);
+        request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "ai-adoption.allocation"
+                && explanation.reason.contains("protected allocation available")
+        }));
     }
 
     #[test]

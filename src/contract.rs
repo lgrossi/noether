@@ -40,10 +40,19 @@ impl AuthorizeRequest {
         self.estimated_cost_usd
             .or_else(|| {
                 self.estimated_tokens
-                    .map(|tokens| tokens as f64 * 0.000_001)
+                    .map(|tokens| tokens as f64 * token_fallback_usd_per_token())
             })
             .unwrap_or(0.0)
     }
+}
+
+fn token_fallback_usd_per_token() -> f64 {
+    std::env::var("NOET_TOKEN_FALLBACK_USD_PER_1K")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|per_1k| per_1k / 1000.0)
+        .unwrap_or(0.000_001)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -697,5 +706,23 @@ limits:
             decoded.limits.spend[0].warn_at_fractions,
             vec![0.5, 0.75, 0.9, 0.95, 0.99]
         );
+    }
+
+    #[test]
+    fn estimated_cost_uses_configurable_token_fallback_rate() {
+        let request = AuthorizeRequest {
+            estimated_tokens: Some(2_000),
+            ..AuthorizeRequest::default()
+        };
+
+        unsafe {
+            std::env::set_var("NOET_TOKEN_FALLBACK_USD_PER_1K", "0.003");
+        }
+        let estimated = request.estimated_cost();
+        unsafe {
+            std::env::remove_var("NOET_TOKEN_FALLBACK_USD_PER_1K");
+        }
+
+        assert!((estimated - 0.006).abs() < f64::EPSILON);
     }
 }

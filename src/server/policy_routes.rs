@@ -28,11 +28,18 @@ pub(super) async fn app_policy(
     let suggestions = app_policy_suggestions(&rule_stats);
     let proposal = app_policy_proposal(&state.policy_proposal_path).await?;
     let source = app_display_policy_source(policy.as_ref())?;
+    let reload_error = state.policy_reload_error().await;
     Ok(Json(AppPolicyResponse {
         path: path.map(|path| path.display().to_string()),
         source,
         policy: policy.as_ref().clone(),
         decision_mode: state.decision_mode,
+        status: if reload_error.is_some() {
+            "reload_error".to_owned()
+        } else {
+            "ok".to_owned()
+        },
+        reload_error,
         rule_stats,
         suggestions,
         proposal,

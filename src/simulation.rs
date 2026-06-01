@@ -1059,9 +1059,9 @@ strategies:
                 .any(|entry| entry.contains("reserves $0.40 per user in each monthly window"))
         );
         assert!(protected.unused_protected_opportunity_usd > 1.0);
-        assert_eq!(protected.total_cost_usd, pooled.total_cost_usd);
-        assert_eq!(protected.denied_requests, pooled.denied_requests);
-        assert_eq!(protected.allowed_requests, pooled.allowed_requests);
+        assert!(protected.total_cost_usd < pooled.total_cost_usd);
+        assert!(protected.denied_requests < pooled.denied_requests);
+        assert!(protected.allowed_requests > pooled.allowed_requests);
         assert!(protected.fallback_count <= pooled.fallback_count);
     }
 

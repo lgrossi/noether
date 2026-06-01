@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::header::HeaderName;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,8 +33,14 @@ pub(super) async fn report_updates_stream(
     )
 }
 
-pub(super) async fn noether_app_html() -> Html<&'static str> {
-    Html(noether_app::app_shell())
+pub(super) async fn noether_app_html() -> impl IntoResponse {
+    (
+        [(
+            HeaderName::from_static("content-security-policy"),
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
+        )],
+        Html(noether_app::app_shell()),
+    )
 }
 
 pub(super) async fn noether_app_js() -> impl IntoResponse {
