@@ -1361,11 +1361,7 @@ impl AsyncPostgresLedger {
         init_postgres_schema_async(&client).await?;
         let statements = prepare_async_postgres_statements(&client).await?;
         let mut ledger = BudgetLedger::default();
-        load_limit_windows_async(&client, &mut ledger).await?;
-        load_allocation_buckets_async(&client, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&client, &mut ledger, None, Utc::now()).await?;
-        load_active_reservations_async(&client, &mut ledger, None).await?;
-        load_advisory_cadence_async(&client, &mut ledger).await?;
+        load_async_authorization_state(&client, &mut ledger, None, Utc::now(), None).await?;
         connections.push(Arc::new(tokio::sync::Mutex::new(AsyncPostgresConnection {
             client,
             statements: Arc::new(statements),
@@ -1438,11 +1434,14 @@ impl AsyncPostgresLedger {
         } else {
             None
         };
-        load_limit_windows_async(&tx, &mut ledger).await?;
-        load_allocation_buckets_async(&tx, &mut ledger).await?;
-        load_rolling_spend_buckets_async(&tx, &mut ledger, policy.as_deref(), now).await?;
-        load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
-        load_advisory_cadence_async(&tx, &mut ledger).await?;
+        load_async_authorization_state(
+            &tx,
+            &mut ledger,
+            policy.as_deref(),
+            now,
+            pending_finalizations.as_ref(),
+        )
+        .await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
         let snapshot = ledger.persistence_snapshot();
         let decision_elapsed = started.elapsed();
@@ -1483,10 +1482,7 @@ impl AsyncPostgresLedger {
             } else {
                 None
             };
-            load_limit_windows_async(&tx, &mut ledger).await?;
-            load_allocation_buckets_async(&tx, &mut ledger).await?;
-            load_active_reservations_async(&tx, &mut ledger, pending_finalizations.as_ref())
-                .await?;
+            load_async_finalization_state(&tx, &mut ledger, pending_finalizations.as_ref()).await?;
             if !ledger.reservations.contains_key(&reservation_id) {
                 load_reservation_async(&tx, &mut ledger, &reservation_id).await?;
             }
@@ -1622,6 +1618,10 @@ impl BudgetLedger {
     }
 
     fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
+        self.state_snapshot()
+    }
+
+    fn state_snapshot(&self) -> LedgerPersistenceSnapshot {
         LedgerPersistenceSnapshot {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
@@ -1631,6 +1631,29 @@ impl BudgetLedger {
             selected_budget_id: self.last_selected_budget_id.clone(),
             limit_hits: self.last_limit_hits.clone(),
         }
+    }
+
+    fn load_store_state(&mut self) -> Result<(), NoetError> {
+        self.load_limit_windows()?;
+        self.load_allocation_buckets()?;
+        self.load_active_reservations()?;
+        self.load_advisory_cadence_for_store()
+    }
+
+    fn load_advisory_cadence_for_store(&mut self) -> Result<(), NoetError> {
+        match &self.store {
+            LedgerStore::Postgres(_) => self.load_advisory_cadence_postgres(),
+            LedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite(),
+            LedgerStore::InMemory => Ok(()),
+        }
+    }
+
+    fn persist_authorization_state(&self, has_reservation: bool) -> Result<(), NoetError> {
+        if has_reservation {
+            self.persist_limit_windows()?;
+            self.persist_allocation_buckets()?;
+        }
+        Ok(())
     }
 
     pub fn open_sqlite(path: &Path) -> Result<Self, NoetError> {
@@ -1653,10 +1676,7 @@ impl BudgetLedger {
             store: LedgerStore::Sqlite(conn),
             ..Self::default()
         };
-        ledger.load_limit_windows()?;
-        ledger.load_allocation_buckets()?;
-        ledger.load_active_reservations()?;
-        ledger.load_advisory_cadence_sqlite()?;
+        ledger.load_store_state()?;
         Ok(ledger)
     }
 
@@ -1673,10 +1693,7 @@ impl BudgetLedger {
             store: LedgerStore::Postgres(Arc::new(SyncPostgresClient(StdMutex::new(pg_conn)))),
             ..Self::default()
         };
-        ledger.load_limit_windows()?;
-        ledger.load_allocation_buckets()?;
-        ledger.load_active_reservations()?;
-        ledger.load_advisory_cadence_postgres()?;
+        ledger.load_store_state()?;
         Ok(ledger)
     }
 
@@ -1807,74 +1824,40 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
-        match &self.store {
-            LedgerStore::Postgres(_) => self.load_advisory_cadence_postgres()?,
-            LedgerStore::Sqlite(_) => self.load_advisory_cadence_sqlite()?,
-            LedgerStore::InMemory => {}
-        }
-        let mut action = PolicyAction::Allow;
-        let mut explanations = Vec::new();
-        let mut limit_hits = Vec::new();
-        let mut message_hints = Vec::new();
-        let mut notifications = Vec::new();
-        let mut selected_budget_id = None;
+        self.load_advisory_cadence_for_store()?;
+        let outcome = AuthorizationEngine::new(self).evaluate(policy, request, now);
 
-        if let Some(policy) = policy {
-            for (policy_action, explanation) in matching_policy_explanations(policy, request) {
-                action = merge_policy_action(action, policy_action);
-                explanations.push(explanation);
-            }
-
-            if !action.halts_request() {
-                let mut outputs = BudgetEvaluationOutputs {
-                    action: &mut action,
-                    explanations: &mut explanations,
-                    limit_hits: &mut limit_hits,
-                    message_hints: &mut message_hints,
-                };
-                selected_budget_id = self.evaluate_budget_rules(policy, request, now, &mut outputs);
-            }
-        } else {
-            explanations.push(DecisionExplanation {
-                rule_id: "no_policy".to_owned(),
-                reason: "no policy file configured; request allowed".to_owned(),
-                severity: DecisionSeverity::Info,
-            });
-        }
-
-        if action == PolicyAction::Allow && message_hints.is_empty() {
-            notifications = self.enablement_notifications(policy, request, now);
-        }
-
-        let reservation = if action.halts_request() {
+        let reservation = if outcome.action.halts_request() {
             None
         } else {
-            Some(self.create_reservation(policy, request, now, selected_budget_id.as_deref()))
+            Some(self.create_reservation(
+                policy,
+                request,
+                now,
+                outcome.selected_budget_id.as_deref(),
+            ))
         };
-        self.last_selected_budget_id = selected_budget_id.clone();
-        self.last_limit_hits = limit_hits.clone();
+        self.last_selected_budget_id = outcome.selected_budget_id.clone();
+        self.last_limit_hits = outcome.limit_hits.clone();
         let has_reservation = reservation.is_some();
         let decision = AuthorizeDecision {
             decision_id: Uuid::new_v4().to_string(),
-            outcome: action.decision_outcome(),
-            action,
+            outcome: outcome.action.decision_outcome(),
+            action: outcome.action,
             reservation,
-            explanations,
-            metadata: authorize_metadata(&message_hints, &notifications),
+            explanations: outcome.explanations,
+            metadata: authorize_metadata(&outcome.message_hints, &outcome.notifications),
             created_at: now,
         };
         let sqlite_tx = self.begin_sqlite_transaction()?;
         let persist_result = (|| {
-            if has_reservation {
-                self.persist_limit_windows()?;
-                self.persist_allocation_buckets()?;
-            }
+            self.persist_authorization_state(has_reservation)?;
             self.persist_decision(
                 policy,
                 request,
                 &decision,
-                selected_budget_id.as_deref(),
-                &limit_hits,
+                outcome.selected_budget_id.as_deref(),
+                &outcome.limit_hits,
             )
         })();
         self.finish_sqlite_transaction(sqlite_tx, persist_result)?;
@@ -1887,53 +1870,26 @@ impl BudgetLedger {
         request: &AuthorizeRequest,
         now: DateTime<Utc>,
     ) -> Result<AuthorizeDecision, NoetError> {
-        let mut action = PolicyAction::Allow;
-        let mut explanations = Vec::new();
-        let mut limit_hits = Vec::new();
-        let mut message_hints = Vec::new();
-        let mut selected_budget_id = None;
+        let outcome = AuthorizationEngine::new(self).evaluate_replay(policy, request, now);
 
-        if let Some(policy) = policy {
-            for (policy_action, explanation) in matching_policy_explanations(policy, request) {
-                action = merge_policy_action(action, policy_action);
-                explanations.push(explanation);
-            }
-
-            if !action.halts_request() {
-                let mut outputs = BudgetEvaluationOutputs {
-                    action: &mut action,
-                    explanations: &mut explanations,
-                    limit_hits: &mut limit_hits,
-                    message_hints: &mut message_hints,
-                };
-                selected_budget_id = self.evaluate_budget_rules(policy, request, now, &mut outputs);
-            }
-        } else {
-            explanations.push(DecisionExplanation {
-                rule_id: "no_policy".to_owned(),
-                reason: "no policy file configured; request allowed".to_owned(),
-                severity: DecisionSeverity::Info,
-            });
-        }
-
-        let reservation = if action.halts_request() {
+        let reservation = if outcome.action.halts_request() {
             None
         } else {
             Some(self.create_replay_reservation(
                 policy,
                 request,
                 now,
-                selected_budget_id.as_deref(),
+                outcome.selected_budget_id.as_deref(),
             ))
         };
 
         Ok(AuthorizeDecision {
             decision_id: format!("replay-decision-{}", self.reservations.len()),
-            outcome: action.decision_outcome(),
-            action,
+            outcome: outcome.action.decision_outcome(),
+            action: outcome.action,
             reservation,
-            explanations,
-            metadata: message_hints_metadata(&message_hints),
+            explanations: outcome.explanations,
+            metadata: message_hints_metadata(&outcome.message_hints),
             created_at: now,
         })
     }
@@ -5899,6 +5855,30 @@ async fn load_advisory_cadence_async(
     Ok(())
 }
 
+async fn load_async_authorization_state(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+    policy: Option<&PolicyFile>,
+    now: DateTime<Utc>,
+    pending_finalizations: Option<&HashSet<String>>,
+) -> Result<(), NoetError> {
+    load_limit_windows_async(conn, ledger).await?;
+    load_allocation_buckets_async(conn, ledger).await?;
+    load_rolling_spend_buckets_async(conn, ledger, policy, now).await?;
+    load_active_reservations_async(conn, ledger, pending_finalizations).await?;
+    load_advisory_cadence_async(conn, ledger).await
+}
+
+async fn load_async_finalization_state(
+    conn: &(impl GenericClient + Sync),
+    ledger: &mut BudgetLedger,
+    pending_finalizations: Option<&HashSet<String>>,
+) -> Result<(), NoetError> {
+    load_limit_windows_async(conn, ledger).await?;
+    load_allocation_buckets_async(conn, ledger).await?;
+    load_active_reservations_async(conn, ledger, pending_finalizations).await
+}
+
 async fn load_rolling_spend_buckets_async(
     conn: &(impl GenericClient + Sync),
     ledger: &mut BudgetLedger,
@@ -7525,11 +7505,11 @@ fn warning_advisory_cooldown(
 mod authorization;
 pub use authorization::binding_limit_hit;
 use authorization::{
-    BudgetEvaluationOutputs, BudgetLimitEvaluation, apply_budget_limits, authorize_metadata,
-    biggest_policy_rolling_spend_window_duration, biggest_spend_window_duration,
-    biggest_spend_window_projection, limit_hit_identifier, message_hint_from_limit_hit,
-    message_hints_metadata, request_user_key, spend_limit_hit, spend_limit_identifier,
-    spend_limit_scope_key, spend_window_projections,
+    AuthorizationEngine, BudgetEvaluationOutputs, BudgetLimitEvaluation, apply_budget_limits,
+    authorize_metadata, biggest_policy_rolling_spend_window_duration,
+    biggest_spend_window_duration, biggest_spend_window_projection, limit_hit_identifier,
+    message_hint_from_limit_hit, message_hints_metadata, request_user_key, spend_limit_hit,
+    spend_limit_identifier, spend_limit_scope_key, spend_window_projections,
 };
 
 struct EnablementHeadroom {

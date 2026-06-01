@@ -1,5 +1,93 @@
 use super::*;
 
+pub(super) struct AuthorizationOutcome {
+    pub(super) action: PolicyAction,
+    pub(super) explanations: Vec<DecisionExplanation>,
+    pub(super) limit_hits: Vec<DecisionLimitHitReport>,
+    pub(super) message_hints: Vec<AuthorizeMessageHint>,
+    pub(super) notifications: Vec<AuthorizeNotification>,
+    pub(super) selected_budget_id: Option<String>,
+}
+
+pub(super) struct AuthorizationEngine<'a> {
+    ledger: &'a mut BudgetLedger,
+}
+
+impl<'a> AuthorizationEngine<'a> {
+    pub(super) fn new(ledger: &'a mut BudgetLedger) -> Self {
+        Self { ledger }
+    }
+
+    pub(super) fn evaluate(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> AuthorizationOutcome {
+        let mut outcome = self.evaluate_core(policy, request, now);
+        if outcome.action == PolicyAction::Allow && outcome.message_hints.is_empty() {
+            outcome.notifications = self.ledger.enablement_notifications(policy, request, now);
+        }
+        outcome
+    }
+
+    pub(super) fn evaluate_replay(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> AuthorizationOutcome {
+        self.evaluate_core(policy, request, now)
+    }
+
+    fn evaluate_core(
+        &mut self,
+        policy: Option<&PolicyFile>,
+        request: &AuthorizeRequest,
+        now: DateTime<Utc>,
+    ) -> AuthorizationOutcome {
+        let mut action = PolicyAction::Allow;
+        let mut explanations = Vec::new();
+        let mut limit_hits = Vec::new();
+        let mut message_hints = Vec::new();
+        let mut selected_budget_id = None;
+
+        if let Some(policy) = policy {
+            for (policy_action, explanation) in matching_policy_explanations(policy, request) {
+                action = merge_policy_action(action, policy_action);
+                explanations.push(explanation);
+            }
+
+            if !action.halts_request() {
+                let mut outputs = BudgetEvaluationOutputs {
+                    action: &mut action,
+                    explanations: &mut explanations,
+                    limit_hits: &mut limit_hits,
+                    message_hints: &mut message_hints,
+                };
+                selected_budget_id =
+                    self.ledger
+                        .evaluate_budget_rules(policy, request, now, &mut outputs);
+            }
+        } else {
+            explanations.push(DecisionExplanation {
+                rule_id: "no_policy".to_owned(),
+                reason: "no policy file configured; request allowed".to_owned(),
+                severity: DecisionSeverity::Info,
+            });
+        }
+
+        AuthorizationOutcome {
+            action,
+            explanations,
+            limit_hits,
+            message_hints,
+            notifications: Vec::new(),
+            selected_budget_id,
+        }
+    }
+}
+
 pub(super) struct BudgetEvaluationOutputs<'a> {
     pub(super) action: &'a mut PolicyAction,
     pub(super) explanations: &'a mut Vec<DecisionExplanation>,

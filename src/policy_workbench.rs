@@ -86,21 +86,21 @@ pub(crate) struct AppRunUsage {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReplayRunAggregate {
-    pub(crate) run_id: String,
-    pub(crate) trace_id: Option<String>,
-    pub(crate) baseline_decision: String,
-    pub(crate) proposed_decision: String,
-    pub(crate) cost_usd: f64,
-    pub(crate) tokens: u64,
-    pub(crate) rule: Option<String>,
-    pub(crate) summary: String,
+struct ReplayRunAggregate {
+    run_id: String,
+    trace_id: Option<String>,
+    baseline_decision: String,
+    proposed_decision: String,
+    cost_usd: f64,
+    tokens: u64,
+    rule: Option<String>,
+    summary: String,
 }
 
 #[derive(Default)]
-pub(crate) struct AppRuleEvidence {
-    pub(crate) reasons: std::collections::BTreeMap<String, u64>,
-    pub(crate) models: std::collections::BTreeMap<String, u64>,
+struct AppRuleEvidence {
+    reasons: std::collections::BTreeMap<String, u64>,
+    models: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -416,7 +416,7 @@ pub(crate) fn app_decision_reason(item: &TraceReportItem) -> Option<String> {
     routing.rejected_budget_reason.clone()
 }
 
-pub(crate) fn model_ref_to_policy_pattern(model_ref: &str) -> String {
+fn model_ref_to_policy_pattern(model_ref: &str) -> String {
     model_ref
         .split_once('/')
         .map(|(provider, model)| format!("{provider}:{model}"))
@@ -447,7 +447,7 @@ pub(crate) fn apply_suggestion_to_policy_source(
     serde_yaml::to_string(&policy).map_err(NoetError::from)
 }
 
-pub(crate) fn most_common(values: &std::collections::BTreeMap<String, u64>) -> Option<String> {
+fn most_common(values: &std::collections::BTreeMap<String, u64>) -> Option<String> {
     values
         .iter()
         .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
@@ -585,7 +585,7 @@ pub(crate) fn app_replay_spend_seeds(
     Ok(seeds)
 }
 
-pub(crate) fn app_replay_recommendations(
+fn app_replay_recommendations(
     changed_runs: &[AppReplayChangedRun],
     spend_delta_usd: f64,
 ) -> Vec<AppReplayRecommendation> {
@@ -776,7 +776,7 @@ pub(crate) fn replay_historical_requests(
     ))
 }
 
-pub(crate) fn decision_outcome_label(outcome: DecisionOutcome) -> &'static str {
+fn decision_outcome_label(outcome: DecisionOutcome) -> &'static str {
     match outcome {
         DecisionOutcome::Allow => "allow",
         DecisionOutcome::Warn => "warn",
@@ -802,7 +802,7 @@ pub(crate) fn string_metadata_value(request: &AuthorizeRequest, key: &str) -> Op
         .map(str::to_owned)
 }
 
-pub(crate) fn replay_change_summary(request: &AuthorizeRequest) -> String {
+fn replay_change_summary(request: &AuthorizeRequest) -> String {
     [
         request.project.as_deref(),
         request.subject.as_deref(),
