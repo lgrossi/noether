@@ -17,6 +17,7 @@ pub mod policy;
 pub mod policy_workbench;
 pub mod proxy;
 pub mod redaction;
+pub mod replay_workbench;
 pub mod reporting;
 pub mod request_identity;
 pub mod scenario;
