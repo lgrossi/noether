@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use crate::contract::{DecisionMode, DecisionOutcome};
+use crate::contract::DecisionMode;
 use crate::error::NoetError;
 use crate::ledger::TraceReportItem;
 use crate::policy::PolicyFile;

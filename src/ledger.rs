@@ -65,7 +65,7 @@ enum LedgerStore {
 }
 
 #[derive(Clone, Default)]
-struct LedgerPersistenceSnapshot {
+struct LedgerStateSnapshot {
     limit_windows: HashMap<(String, String, String), WindowState>,
     allocation_buckets: HashMap<(String, String), AllocationBucketState>,
     rolling_spend_buckets: HashMap<(String, String, String, DateTime<Utc>), f64>,
@@ -651,7 +651,7 @@ fn upsert_simulation_allocation_buckets_postgres(
     Ok(())
 }
 
-impl LedgerPersistenceSnapshot {
+impl LedgerStateSnapshot {
     fn routing_persistence_fields(
         &self,
         policy: Option<&PolicyFile>,
@@ -1027,7 +1027,7 @@ impl AsyncPostgresLedgerOptions {
 struct AsyncFinalizeWrite {
     reservation: Reservation,
     payload: FinalizeReservation,
-    snapshot: LedgerPersistenceSnapshot,
+    snapshot: LedgerStateSnapshot,
 }
 
 const ASYNC_AUTHORIZE_FAST_SQL: &str = "
@@ -1443,7 +1443,7 @@ impl AsyncPostgresLedger {
         )
         .await?;
         let decision = ledger.try_authorize_at(policy.as_deref(), &request, now)?;
-        let snapshot = ledger.persistence_snapshot();
+        let snapshot = ledger.state_snapshot();
         let decision_elapsed = started.elapsed();
         let db_started = Instant::now();
         persist_decision_async(&tx, &snapshot, policy.as_deref(), &request, &decision).await?;
@@ -1496,7 +1496,7 @@ impl AsyncPostgresLedger {
                 tx.commit().await?;
                 return Ok(reservation);
             }
-            let snapshot = ledger.persistence_snapshot();
+            let snapshot = ledger.state_snapshot();
             let decision_elapsed = started.elapsed();
             let write = AsyncFinalizeWrite {
                 reservation: reservation.clone(),
@@ -1617,12 +1617,8 @@ impl BudgetLedger {
         self.advisory_config = config;
     }
 
-    fn persistence_snapshot(&self) -> LedgerPersistenceSnapshot {
-        self.state_snapshot()
-    }
-
-    fn state_snapshot(&self) -> LedgerPersistenceSnapshot {
-        LedgerPersistenceSnapshot {
+    fn state_snapshot(&self) -> LedgerStateSnapshot {
+        LedgerStateSnapshot {
             limit_windows: self.limit_windows.clone(),
             allocation_buckets: self.allocation_buckets.clone(),
             rolling_spend_buckets: self.rolling_spend_buckets.clone(),
@@ -6009,7 +6005,7 @@ fn stored_reservation_from_async_row(row: &AsyncPostgresRow) -> (String, StoredR
 
 async fn persist_limit_windows_async(
     conn: &(impl GenericClient + Sync),
-    snapshot: &LedgerPersistenceSnapshot,
+    snapshot: &LedgerStateSnapshot,
 ) -> Result<(), NoetError> {
     for ((rule_id, limit_id, scope_key), window) in &snapshot.limit_windows {
         conn.execute(
@@ -6035,7 +6031,7 @@ async fn persist_limit_windows_async(
 
 async fn persist_allocation_buckets_async(
     conn: &(impl GenericClient + Sync),
-    snapshot: &LedgerPersistenceSnapshot,
+    snapshot: &LedgerStateSnapshot,
 ) -> Result<(), NoetError> {
     for ((rule_id, entity_key), bucket) in &snapshot.allocation_buckets {
         conn.execute(
@@ -6065,7 +6061,7 @@ async fn persist_allocation_buckets_async(
 
 async fn persist_decision_async(
     conn: &(impl GenericClient + Sync),
-    snapshot: &LedgerPersistenceSnapshot,
+    snapshot: &LedgerStateSnapshot,
     policy: Option<&PolicyFile>,
     request: &AuthorizeRequest,
     decision: &AuthorizeDecision,
@@ -6409,7 +6405,7 @@ async fn persist_finalization_async(
     statements: &AsyncPostgresStatements,
     reservation: &Reservation,
     payload: &FinalizeReservation,
-    snapshot: &LedgerPersistenceSnapshot,
+    snapshot: &LedgerStateSnapshot,
 ) -> Result<bool, NoetError> {
     let now = Utc::now().to_rfc3339();
     if let Some(stored) = snapshot.reservations.get(&reservation.id)
@@ -6547,7 +6543,7 @@ async fn persist_finalization_async(
 async fn apply_finalization_spend_deltas_async(
     conn: &(impl GenericClient + Sync),
     reservation: &Reservation,
-    snapshot: &LedgerPersistenceSnapshot,
+    snapshot: &LedgerStateSnapshot,
     apply_limit_windows: bool,
 ) -> Result<(), NoetError> {
     let Some(stored) = snapshot.reservations.get(&reservation.id) else {
@@ -8631,6 +8627,55 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert!(decision.reservation.is_some());
+    }
+
+    #[test]
+    fn authorization_engine_evaluates_without_reserving_or_persisting_state() {
+        let policy = policy(1.0, 0.8);
+        let mut ledger = BudgetLedger::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap();
+
+        let outcome = AuthorizationEngine::new(&mut ledger).evaluate_replay(
+            Some(&policy),
+            &request(0.25),
+            now,
+        );
+        let snapshot = ledger.state_snapshot();
+
+        assert_eq!(outcome.action, PolicyAction::Allow);
+        assert_eq!(outcome.selected_budget_id.as_deref(), Some("dev-budget"));
+        assert!(outcome.limit_hits.is_empty());
+        assert!(snapshot.reservations.is_empty());
+        assert!(snapshot.limit_windows.is_empty());
+        assert!(snapshot.selected_budget_id.is_none());
+    }
+
+    #[test]
+    fn ledger_state_snapshot_captures_authorization_reservation_state() {
+        let policy = policy(1.0, 0.8);
+        let mut ledger = BudgetLedger::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap();
+
+        let decision = ledger
+            .try_authorize_at(Some(&policy), &request(0.25), now)
+            .expect("authorize");
+        let reservation = decision.reservation.expect("reservation");
+        let snapshot = ledger.state_snapshot();
+
+        assert_eq!(snapshot.selected_budget_id.as_deref(), Some("dev-budget"));
+        assert!(snapshot.reservations.contains_key(&reservation.id));
+        assert!(snapshot.limit_hits.is_empty());
+        assert_eq!(
+            snapshot
+                .limit_windows
+                .get(&(
+                    "dev-budget".to_owned(),
+                    "budget-cap".to_owned(),
+                    "project:noether".to_owned(),
+                ))
+                .map(|window| window.used_usd),
+            Some(0.25)
+        );
     }
 
     #[test]
