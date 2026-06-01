@@ -882,7 +882,11 @@ policies:
         .expect("policy parses");
 
         let error = validate_policy(&policy).expect_err("policy rule match should be invalid");
-        assert!(error.to_string().contains("policy bad-policy project must not be empty"));
+        assert!(
+            error
+                .to_string()
+                .contains("policy bad-policy project must not be empty")
+        );
     }
 
     #[test]
