@@ -2,6 +2,10 @@
 
 LiteLLM owns provider routing and transport. Noether is only the decision sidecar:
 
+**Capability limit:** provider-spend prevention depends on the LiteLLM proxy honoring Noether's
+authorize decision before it sends to the provider. Keep this callback in the hot path and use
+`NOET_LITELLM_FAIL_MODE=fail_closed` for enforcement deployments.
+
 ```text
 client -> LiteLLM Proxy -> Noether /v1/authorize
 client -> LiteLLM Proxy -> provider

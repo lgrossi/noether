@@ -6,6 +6,10 @@ tool actions and records lifecycle events; it does not claim to authorize the ma
 
 ## Capability matrix
 
+**Capability limit:** this hook can block Claude Code tool/permission flows, but it cannot prove or
+block main model provider spend because Claude Code does not expose a documented provider pre-call
+transport hook. Treat provider-spend prevention claims as unsupported for this integration.
+
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Main model provider pre-call authorization | Not supported | Claude Code public hooks do not expose a provider request before transport. |
