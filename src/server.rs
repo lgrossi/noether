@@ -38,8 +38,9 @@ use crate::error::NoetError;
 use crate::ledger::{AsyncPostgresLedger, AsyncPostgresLedgerOptions, BudgetLedger};
 pub use crate::ledger_backend::LedgerBackend;
 use crate::policy::PolicyFile;
-use crate::policy_workbench::{AppPolicyResponse, AppReplayJob};
+use crate::policy_workbench::AppPolicyResponse;
 use crate::proxy::ProxyRoute;
+use crate::replay_workbench::AppReplayJob;
 use crate::request_identity::{
     NOETHER_API_KEY_HEADER, RequestContext, add_request_context_metadata,
     add_request_context_to_event, apply_request_context_to_authorize_request,
@@ -937,12 +938,12 @@ mod tests {
     use crate::fixture::{CapturedBody, ResponseSource, list_fixture_paths, read_fixture};
     use crate::ledger::ReplaySpendSeed;
     use crate::policy::PolicyFile;
-    use crate::policy_workbench::{
-        AppPolicyProposal, AppRuleStat, ReplayScopeOptions, app_policy_suggestions,
-        app_replay_proposal, replay_historical_requests,
-    };
+    use crate::policy_workbench::{AppPolicyProposal, AppRuleStat, app_policy_suggestions};
     use crate::proxy::{ProxyRoute, ProxyRoutes};
     use crate::redaction::REDACTED;
+    use crate::replay_workbench::{
+        ReplayScopeOptions, app_replay_proposal, replay_historical_requests,
+    };
     use crate::reporting;
 
     use super::simulations::percent_encode_path_component;
