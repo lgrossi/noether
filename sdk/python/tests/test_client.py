@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,20 @@ class NoetherClientTests(TestCase):
         self.assertEqual(decision["outcome"], "allow")
         self.assertEqual(decision["action"], "allow")
         self.assertEqual(decision["explanations"][0]["rule_id"], "sdk.sidecar_unavailable")
+
+    def test_fail_open_returns_synthetic_allow_when_sidecar_stalls(self) -> None:
+        server = TestServer(authorize_delay_seconds=0.2)
+        server.start()
+        try:
+            client = NoetherClient(url=server.url, timeout=0.05, fail_mode="fail_open")
+
+            decision = client.authorize({"project": "noether"})
+
+            self.assertEqual(decision["outcome"], "allow")
+            self.assertEqual(decision["action"], "allow")
+            self.assertEqual(decision["explanations"][0]["rule_id"], "sdk.sidecar_unavailable")
+        finally:
+            server.stop()
 
     def test_fail_open_does_not_synthesize_allow_for_auth_failures(self) -> None:
         server = TestServer(authorize_status=401)
@@ -139,7 +154,12 @@ class NoetherClientTests(TestCase):
 
 
 class TestServer:
-    def __init__(self, authorize_status: int = 200, authorize_raw_body: str | None = None) -> None:
+    def __init__(
+        self,
+        authorize_status: int = 200,
+        authorize_raw_body: str | None = None,
+        authorize_delay_seconds: float = 0.0,
+    ) -> None:
         self.seen: list[dict[str, Any]] = []
         seen = self.seen
 
@@ -177,6 +197,8 @@ class TestServer:
                     }
                 )
                 if self.path == "/v1/authorize":
+                    if authorize_delay_seconds:
+                        time.sleep(authorize_delay_seconds)
                     if authorize_raw_body is not None:
                         self.send_response(authorize_status)
                         self.send_header("content-type", "application/json")
@@ -230,7 +252,10 @@ class TestServer:
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    return
 
             def log_message(self, _format: str, *_args: Any) -> None:
                 return

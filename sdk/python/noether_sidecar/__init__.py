@@ -123,6 +123,8 @@ class NoetherClient:
             raise NoetherHttpError(error.code, error.read().decode("utf-8")) from error
         except urllib.error.URLError as error:
             raise NoetherTransportError("Noether request failed") from error
+        except TimeoutError as error:
+            raise NoetherTransportError("Noether request timed out") from error
         return json.loads(raw)
 
 
