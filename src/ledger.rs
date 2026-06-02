@@ -3082,7 +3082,7 @@ impl BudgetLedger {
         if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
-                SELECT scope_key, COALESCE(SUM(amount_usd), 0)::DOUBLE PRECISION
+                SELECT scope_key, COALESCE(SUM(amount_usd), 0)::DOUBLE PRECISION, MIN(created_at)
                 FROM reservation_limit_scopes
                 WHERE rule_id = $1
                   AND limit_id = $2
@@ -3103,6 +3103,7 @@ impl BudgetLedger {
                 .map(|row| SpendScopeTotal {
                     scope_key: row.get(0),
                     amount_usd: row.get(1),
+                    first_spend_at: parse_time(row.get::<_, String>(2)),
                 })
                 .collect());
         }
@@ -3111,7 +3112,7 @@ impl BudgetLedger {
         };
         let mut stmt = conn.prepare(
             "
-            SELECT scope_key, COALESCE(SUM(amount_usd), 0)
+            SELECT scope_key, COALESCE(SUM(amount_usd), 0), MIN(created_at)
             FROM reservation_limit_scopes
             WHERE rule_id = ?1
               AND limit_id = ?2
@@ -3127,6 +3128,7 @@ impl BudgetLedger {
                 Ok(SpendScopeTotal {
                     scope_key: row.get(0)?,
                     amount_usd: row.get(1)?,
+                    first_spend_at: parse_time(row.get::<_, String>(2)?),
                 })
             },
         )?

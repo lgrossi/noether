@@ -108,6 +108,7 @@ pub struct ReplaySpendSeed {
 pub struct SpendScopeTotal {
     pub scope_key: String,
     pub amount_usd: f64,
+    pub first_spend_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

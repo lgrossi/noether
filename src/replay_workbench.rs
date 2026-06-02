@@ -129,6 +129,8 @@ pub(crate) struct AppReplayJob {
     pub(crate) history_window_days: i64,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) active_policy_hash: String,
+    pub(crate) proposed_policy_hash: String,
     pub(crate) error: Option<String>,
     pub(crate) result: Option<AppReplayResponse>,
     pub(crate) snapshot: Option<AppReplaySnapshot>,

@@ -3509,6 +3509,70 @@ budgets:
     }
 
     #[tokio::test]
+    async fn noether_app_replay_hides_running_job_for_previous_draft() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&require_project_policy()).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        state.replay_jobs.lock().await.insert(
+            "stale-job".to_owned(),
+            AppReplayJob {
+                status: "running".to_owned(),
+                history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
+                created_at: chrono::Utc::now(),
+                completed_at: None,
+                active_policy_hash: "old-active-policy".to_owned(),
+                proposed_policy_hash: "old-proposed-policy".to_owned(),
+                error: None,
+                result: None,
+                snapshot: None,
+            },
+        );
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value = serde_json::from_slice(&body).expect("replay json");
+        assert_eq!(replay["current_job"], serde_json::Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/app/replay/jobs/stale-job")
+                    .body(Body::empty())
+                    .expect("job status request"),
+            )
+            .await
+            .expect("job status response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("start job request"),
+            )
+            .await
+            .expect("start job response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn noether_app_full_replay_job_seeds_prior_spend_windows() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
@@ -3572,6 +3636,85 @@ budgets:
         assert_eq!(proposal["scope"]["window_seeded"], true);
         assert_eq!(proposal["proposed"]["deny"], 1);
         assert_eq!(proposal["changed_runs"][0]["to"], "deny");
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_expires_tumbling_seed_before_later_replay_request() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut policy = strict_policy();
+        policy.budgets[0].limits.spend[0].window = "10m".to_owned();
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let replay_window_start =
+                chrono::Utc::now() - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+            ledger
+                .try_authorize_at(
+                    Some(&policy),
+                    &report_request(
+                        "trace-expiring-seed",
+                        "request-expiring-seed",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start - chrono::Duration::minutes(9),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-after-seed-expired",
+                        "request-after-seed-expired",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(2),
+                )
+                .expect("historical authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["allow"], 1);
+        assert_eq!(proposal["proposed"]["deny"], 0);
+        assert_eq!(
+            proposal["changed_runs"]
+                .as_array()
+                .expect("changed runs")
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
