@@ -1965,9 +1965,24 @@ impl BudgetLedger {
         let actual_cost = payload
             .actual_cost_usd
             .or_else(|| payload.usage.as_ref().and_then(|usage| usage.cost_usd));
-        if let Some(actual_cost) = actual_cost {
+        let (delta, limit_window_spends, allocation_spends) = if let Some(actual_cost) = actual_cost
+        {
             let delta = actual_cost - stored.estimated_cost_usd;
-            for spend in &stored.limit_window_spends {
+            let spends = (
+                delta,
+                stored.limit_window_spends.clone(),
+                stored.allocation_spends.clone(),
+            );
+            stored.reservation.amount_usd = actual_cost;
+            spends
+        } else {
+            (0.0, Vec::new(), Vec::new())
+        };
+
+        stored.reservation.status = ReservationStatus::Finalized;
+        let reservation = stored.reservation.clone();
+        if delta != 0.0 {
+            for spend in &limit_window_spends {
                 let key = (
                     spend.rule_id.clone(),
                     spend.limit_id.clone(),
@@ -1977,16 +1992,16 @@ impl BudgetLedger {
                     window.used_usd = (window.used_usd + delta).max(0.0);
                 }
             }
-            stored.reservation.amount_usd = actual_cost;
+            for spend in &allocation_spends {
+                reconcile_allocation_bucket_delta(self, spend, delta);
+            }
         }
-
-        stored.reservation.status = ReservationStatus::Finalized;
-        let reservation = stored.reservation.clone();
         let sqlite_tx = self.begin_sqlite_transaction()?;
         let persist_result = (|| {
             self.persist_finalization(&reservation, payload)?;
             self.persist_windows()?;
-            self.persist_limit_windows()
+            self.persist_limit_windows()?;
+            self.persist_allocation_buckets()
         })();
         self.finish_sqlite_transaction(sqlite_tx, persist_result)?;
         Ok(reservation)
@@ -3767,6 +3782,9 @@ impl BudgetLedger {
             return None;
         }
         let estimated_cost = request.estimated_cost();
+        if protected_allocation_requires_missing_identity(rule, request) {
+            return None;
+        }
         if allocation_bucket_available_usd(self, rule, request, now)
             .is_some_and(|available_usd| estimated_cost > available_usd)
         {
@@ -3804,6 +3822,9 @@ impl BudgetLedger {
         }
         if !budget_model_allowed(rule, request) {
             return "requested provider/model is not allowed by requested budget".to_owned();
+        }
+        if let Some(reason) = missing_allocation_identity_reason(rule, request) {
+            return reason;
         }
         if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
             && request.estimated_cost() > available_usd
@@ -3849,6 +3870,10 @@ impl BudgetLedger {
             .iter()
             .filter(|rule| budget_rule_matches(rule, request))
         {
+            if let Some(hit) = missing_allocation_identity_hit_for_request(rule, request) {
+                hits.push(hit);
+                continue;
+            }
             if let Some(available_usd) = allocation_bucket_available_usd(self, rule, request, now)
                 && estimated_cost > available_usd
             {
@@ -7701,6 +7726,53 @@ fn allocation_bucket_entity_key(rule: &BudgetRule, request: &AuthorizeRequest) -
     }
 }
 
+fn protected_allocation_by(rule: &BudgetRule) -> Option<&str> {
+    let allocation = rule.allocation.as_ref()?;
+    if allocation.standard != "protected_adoption_pool" {
+        return None;
+    }
+    allocation.by.as_deref()
+}
+
+fn protected_allocation_requires_missing_identity(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+) -> bool {
+    protected_allocation_by(rule).is_some() && allocation_bucket_entity_key(rule, request).is_none()
+}
+
+fn missing_allocation_identity_reason(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+) -> Option<String> {
+    if !protected_allocation_requires_missing_identity(rule, request) {
+        return None;
+    }
+    Some(format!(
+        "missing protected allocation {} identity",
+        protected_allocation_by(rule).unwrap_or("entity")
+    ))
+}
+
+fn missing_allocation_identity_hit_for_request(
+    rule: &BudgetRule,
+    request: &AuthorizeRequest,
+) -> Option<DecisionLimitHitReport> {
+    let reason = missing_allocation_identity_reason(rule, request)?;
+    Some(DecisionLimitHitReport {
+        rule_id: format!("{}.allocation", rule.id),
+        reason,
+        severity: DecisionSeverity::Deny,
+        window_id: Some("protected_adoption_pool".to_owned()),
+        window_mode: None,
+        window_started_at: None,
+        window_ends_at: None,
+        projected_spend_usd: Some(request.estimated_cost()),
+        max_usd: None,
+        scope_entity: None,
+    })
+}
+
 fn allocation_bucket_available_usd(
     ledger: &BudgetLedger,
     rule: &BudgetRule,
@@ -7781,6 +7853,34 @@ fn consume_allocation_bucket(
         carryover_usd,
         current_grant_usd,
     })
+}
+
+fn reconcile_allocation_bucket_delta(
+    ledger: &mut BudgetLedger,
+    spend: &AllocationReservationSpend,
+    delta_usd: f64,
+) {
+    if delta_usd == 0.0 {
+        return;
+    }
+    let Some(bucket) = ledger
+        .allocation_buckets
+        .get_mut(&(spend.rule_id.clone(), spend.entity_key.clone()))
+    else {
+        return;
+    };
+    if delta_usd > 0.0 {
+        let extra_carryover = bucket.carryover_usd.min(delta_usd);
+        bucket.carryover_usd = (bucket.carryover_usd - extra_carryover).max(0.0);
+        let extra_current = bucket.current_grant_usd.min(delta_usd - extra_carryover);
+        bucket.current_grant_usd = (bucket.current_grant_usd - extra_current).max(0.0);
+    } else {
+        let mut refund = (-delta_usd).min(spend.carryover_usd + spend.current_grant_usd);
+        let current_refund = refund.min(spend.current_grant_usd);
+        bucket.current_grant_usd += current_refund;
+        refund -= current_refund;
+        bucket.carryover_usd += refund.min(spend.carryover_usd);
+    }
 }
 
 fn rolled_allocation_bucket_state(
@@ -10662,6 +10762,26 @@ mod tests {
     }
 
     #[test]
+    fn protected_adoption_allocation_requires_identity_key() {
+        let policy = protected_adoption_policy("60s");
+        let mut ledger = BudgetLedger::default();
+        let mut request = request(1.0);
+        request.entities = vec!["org:example".to_owned()];
+        request.subject = None;
+
+        let decision = ledger.authorize(Some(&policy), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "ai-adoption.allocation"
+                && explanation
+                    .reason
+                    .contains("missing protected allocation user")
+        }));
+        assert!(decision.reservation.is_none());
+    }
+
+    #[test]
     fn requested_budget_falls_back_when_protected_allocation_is_exhausted() {
         let mut policy = protected_adoption_policy("60s");
         let mut fallback = policy.budgets[0].clone();
@@ -10687,6 +10807,62 @@ mod tests {
             explanation.rule_id == "fallback"
                 && explanation.reason == "selected fallback budget for org:example"
         }));
+    }
+
+    #[test]
+    fn spend_window_full_threshold_warning_uses_tolerant_crossing() {
+        let mut policy = policy(10.0, 1.0);
+        policy.budgets[0].limits.spend[0].action = PolicyAction::Warn;
+        let mut ledger = BudgetLedger::default();
+        ledger.limit_windows.insert(
+            (
+                "dev-budget".to_owned(),
+                "budget-cap".to_owned(),
+                "project:noether".to_owned(),
+            ),
+            WindowState {
+                started_at: Utc::now(),
+                used_usd: 9.999_999_999_999,
+            },
+        );
+
+        let decision = ledger.authorize(Some(&policy), &request(0.000_000_000_000_5));
+
+        assert_eq!(decision.outcome, DecisionOutcome::Warn);
+        assert!(decision.explanations.iter().any(|explanation| {
+            explanation.rule_id == "dev-budget.spend_window.budget-cap"
+                && explanation.reason.contains("warning threshold")
+        }));
+    }
+
+    #[test]
+    fn finalization_reconciles_protected_allocation_to_actual_cost() {
+        let policy = protected_adoption_policy("60s");
+        let mut ledger = BudgetLedger::default();
+        let mut request = request(1.0);
+        request.entities = vec!["org:example".to_owned(), "user:alice".to_owned()];
+
+        let decision = ledger.authorize(Some(&policy), &request);
+        let reservation_id = decision.reservation.expect("reservation").id;
+        ledger
+            .finalize(
+                &reservation_id,
+                &FinalizeReservation {
+                    reservation_id: None,
+                    outcome: crate::contract::FinalizeOutcome::Success,
+                    usage: None,
+                    actual_cost_usd: Some(2.5),
+                    metadata: Default::default(),
+                },
+            )
+            .expect("finalize");
+
+        let bucket = ledger
+            .allocation_buckets
+            .get(&("ai-adoption".to_owned(), "user:alice".to_owned()))
+            .expect("alice bucket");
+        assert_eq!(bucket.current_grant_usd, 22.5);
+        assert_eq!(bucket.carryover_usd, 0.0);
     }
 
     #[test]

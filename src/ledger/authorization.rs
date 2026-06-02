@@ -221,6 +221,16 @@ pub(super) fn apply_budget_limits(context: BudgetLimitEvaluation<'_>) -> bool {
         limit_hits.push(hit);
         return true;
     }
+    if let Some(hit) = missing_allocation_identity_hit_for_request(rule, request) {
+        *action = merge_policy_action(*action, PolicyAction::Block);
+        explanations.push(DecisionExplanation {
+            rule_id: hit.rule_id.clone(),
+            reason: hit.reason.clone(),
+            severity: hit.severity,
+        });
+        limit_hits.push(hit);
+        return true;
+    }
 
     for projection in spend_window_projections(ledger, rule, request, estimated_cost, now)
         .expect("selected budget has valid spend window scopes")
@@ -443,12 +453,16 @@ pub(super) fn newly_crossed_warn_at_fraction(projection: &SpendWindowProjection)
         .copied()
         .filter(|warn_at_fraction| {
             let threshold = projection.max_usd * *warn_at_fraction;
-            projection.current_spend_usd < threshold
-                && if (*warn_at_fraction - 1.0).abs() < f64::EPSILON {
-                    (projection.projected_spend_usd - threshold).abs() < f64::EPSILON
-                } else {
-                    projection.projected_spend_usd >= threshold
-                }
+            if projection.current_spend_usd >= threshold {
+                return false;
+            }
+            if (*warn_at_fraction - 1.0).abs() < f64::EPSILON {
+                let tolerance = threshold.abs().max(1.0) * 1e-9;
+                projection.projected_spend_usd + tolerance >= threshold
+                    && projection.projected_spend_usd <= threshold + tolerance
+            } else {
+                projection.projected_spend_usd >= threshold
+            }
         })
         .max_by(|left, right| left.total_cmp(right))
 }
