@@ -120,7 +120,7 @@ pub fn app_shell() -> &'static str {
             <select data-runs-filter="rule"><option value="any">any</option></select>
           </label>
           <label class="chip search">search
-            <input data-runs-filter="q" placeholder="trace, model, rule..." autocomplete="off">
+            <input data-runs-filter="q" placeholder="trace, model, rule, entity=project:noether entity:user:lgrossi..." autocomplete="off">
           </label>
           <button class="btn ghost" type="button" data-runs-clear>clear</button>
           <span style="margin-left:auto" class="mono" data-runs-filter-state>/ to search</span>
@@ -143,7 +143,7 @@ pub fn app_shell() -> &'static str {
 
         <div class="replay-head">
           <div class="pickers">
-            <div class="picker"><span class="k">against</span><span class="v">real · local ledger</span></div>
+            <div class="picker"><span class="k">against</span><span class="v">recorded history</span></div>
             <div class="picker"><span class="k">strategies</span><span class="v">current · draft</span></div>
             <div class="picker"><span class="k">scope</span><span class="v">all projects · recent history</span></div>
           </div>

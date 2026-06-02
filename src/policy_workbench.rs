@@ -27,7 +27,7 @@ pub(crate) struct AppPolicyResponse {
     pub(crate) proposal: Option<AppPolicyProposal>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct AppPolicyProposal {
     pub(crate) path: String,
     pub(crate) source: String,
@@ -71,7 +71,7 @@ pub(crate) struct AppSuggestion {
     pub(crate) evidence: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct AppRunTotals {
     pub(crate) runs: u64,
     pub(crate) allow: u64,

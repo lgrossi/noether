@@ -29,6 +29,7 @@ pub(super) struct AppRunsQuery {
     offset: usize,
     decision: Option<String>,
     rule: Option<String>,
+    entity: Option<String>,
     q: Option<String>,
 }
 
@@ -111,11 +112,11 @@ pub(super) async fn app_runs(
             let decisions = reporting::decisions_report(ledger)?;
             let usage_by_agent_run = app_usage_by_agent_run(&ledger.usage_activity_report()?);
             let all_runs = app_agent_runs(&decisions, &usage_by_agent_run);
-            let totals = app_run_totals_from_rows(&all_runs);
             let filtered = all_runs
                 .into_iter()
                 .filter(|run| app_run_matches_query(run, &query))
                 .collect::<Vec<_>>();
+            let totals = app_run_totals_from_rows(&filtered);
             let filtered_total = filtered.len() as u64;
             let runs = filtered
                 .into_iter()
@@ -144,6 +145,11 @@ fn app_runs_query_is_unfiltered(query: &AppRunsQuery) -> bool {
             .rule
             .as_deref()
             .map(|value| value.is_empty() || value == "any")
+            .unwrap_or(true)
+        && query
+            .entity
+            .as_deref()
+            .map(|value| value.trim().is_empty() || value == "any")
             .unwrap_or(true)
         && query.q.as_deref().map(str::trim).unwrap_or("").is_empty()
 }
@@ -252,11 +258,10 @@ fn app_run_row(
             .unwrap_or(0),
         provider,
         model,
-        cost_usd: estimated_cost.or_else(|| {
-            run_usage
-                .map(|usage| usage.cost_usd)
-                .filter(|cost| *cost > 0.0)
-        }),
+        cost_usd: run_usage
+            .map(|usage| usage.cost_usd)
+            .filter(|cost| *cost > 0.0)
+            .or(estimated_cost),
         estimated_tokens: reporting::summary_value(&item.summary, "estimated_tokens")
             .and_then(|value| value.parse::<u64>().ok()),
         actual_tokens: run_usage
@@ -268,8 +273,28 @@ fn app_run_row(
             .routing
             .as_ref()
             .and_then(|routing| routing.matched_entity.clone()),
-        entities: item.entities.clone(),
+        entities: app_run_entities(item),
         timeline: Vec::new(),
+    }
+}
+
+fn app_run_entities(item: &TraceReportItem) -> Vec<String> {
+    let mut entities = item.entities.clone();
+    if let Some(project) = reporting::summary_value(&item.summary, "project") {
+        push_unique_entity(&mut entities, format!("project:{project}"));
+    }
+    if let Some(subject) = reporting::summary_value(&item.summary, "subject") {
+        push_unique_entity(&mut entities, format!("user:{subject}"));
+    }
+    entities
+}
+
+fn push_unique_entity(entities: &mut Vec<String>, entity: String) {
+    if !entities
+        .iter()
+        .any(|existing| normalize_entity(existing) == normalize_entity(&entity))
+    {
+        entities.push(entity);
     }
 }
 
@@ -423,6 +448,11 @@ fn app_summary_fields(summary: &str) -> BTreeMap<String, String> {
 }
 
 fn app_run_matches_query(run: &AppRunRow, query: &AppRunsQuery) -> bool {
+    let search = query
+        .q
+        .as_deref()
+        .map(parse_app_run_search)
+        .unwrap_or_default();
     if let Some(decision) = query.decision.as_deref()
         && !decision.is_empty()
         && decision != "any"
@@ -437,24 +467,366 @@ fn app_run_matches_query(run: &AppRunRow, query: &AppRunsQuery) -> bool {
     {
         return false;
     }
-    if let Some(q) = query.q.as_deref() {
-        let q = q.trim().to_ascii_lowercase();
-        if !q.is_empty()
-            && ![
-                run.id.as_str(),
-                run.agent_run_id.as_deref().unwrap_or(""),
-                run.summary.as_str(),
-                run.trace_id.as_deref().unwrap_or(""),
-                run.rule.as_deref().unwrap_or(""),
-                run.provider.as_deref().unwrap_or(""),
-                run.model.as_deref().unwrap_or(""),
-                run.matched_entity.as_deref().unwrap_or(""),
-            ]
+    if let Some(entity) = query.entity.as_deref()
+        && !entity.trim().is_empty()
+        && entity != "any"
+        && !run_matches_entity_exact(run, entity)
+    {
+        return false;
+    }
+    if !search.entity_groups.iter().all(|group| {
+        group
             .iter()
-            .any(|value| value.to_ascii_lowercase().contains(&q))
+            .any(|entity| run_matches_entity_exact(run, entity))
+    }) {
+        return false;
+    }
+    if !search.free_text.is_empty() {
+        let q = search.free_text.to_ascii_lowercase();
+        if ![
+            run.id.as_str(),
+            run.agent_run_id.as_deref().unwrap_or(""),
+            run.summary.as_str(),
+            run.trace_id.as_deref().unwrap_or(""),
+            run.rule.as_deref().unwrap_or(""),
+            run.provider.as_deref().unwrap_or(""),
+            run.model.as_deref().unwrap_or(""),
+            run.matched_entity.as_deref().unwrap_or(""),
+            run.entities.join(" ").as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains(&q))
         {
             return false;
         }
     }
     true
+}
+
+#[derive(Default)]
+struct AppRunSearch {
+    entity_groups: Vec<Vec<String>>,
+    free_text: String,
+}
+
+fn parse_app_run_search(query: &str) -> AppRunSearch {
+    let mut entity_groups = BTreeMap::<String, Vec<String>>::new();
+    let mut free_parts = Vec::new();
+    for raw_part in query.split_whitespace() {
+        let part = search_part_without_query_prefix(raw_part);
+        if let Some(entity) = search_entity_value(part) {
+            for value in entity
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let value = value.trim_end_matches(',');
+                entity_groups
+                    .entry(entity_namespace(value).to_owned())
+                    .or_default()
+                    .push(value.to_owned());
+            }
+        } else {
+            free_parts.push(part);
+        }
+    }
+    AppRunSearch {
+        entity_groups: entity_groups.into_values().collect(),
+        free_text: free_parts.join(" ").trim().to_owned(),
+    }
+}
+
+fn search_part_without_query_prefix(part: &str) -> &str {
+    let lower = part.to_ascii_lowercase();
+    if lower.starts_with("q:") || lower.starts_with("q=") {
+        part.get(2..).unwrap_or(part)
+    } else {
+        part
+    }
+}
+
+fn search_entity_value(part: &str) -> Option<&str> {
+    let lower = part.to_ascii_lowercase();
+    if lower.starts_with("entity=") {
+        part.get("entity=".len()..)
+    } else if lower.starts_with("entity:") {
+        part.get("entity:".len()..)
+    } else if looks_like_entity_token(part) {
+        Some(part)
+    } else {
+        None
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+}
+
+fn looks_like_entity_token(part: &str) -> bool {
+    let Some((namespace, value)) = part.split_once(':') else {
+        return false;
+    };
+    !namespace.is_empty()
+        && !value.is_empty()
+        && matches!(
+            namespace.to_ascii_lowercase().as_str(),
+            "project" | "user" | "team" | "org"
+        )
+        && namespace
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-')
+}
+
+fn entity_namespace(entity: &str) -> &str {
+    entity
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or("")
+}
+
+fn run_matches_entity_exact(run: &AppRunRow, entity: &str) -> bool {
+    let entity = normalize_entity(entity);
+    run.matched_entity
+        .as_deref()
+        .is_some_and(|value| normalize_entity(value) == entity)
+        || run
+            .entities
+            .iter()
+            .any(|value| normalize_entity(value) == entity)
+}
+
+fn normalize_entity(entity: &str) -> String {
+    entity.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_with_entities(entities: Vec<&str>, matched_entity: Option<&str>) -> AppRunRow {
+        AppRunRow {
+            occurred_at: chrono::Utc::now(),
+            id: "run-1".to_owned(),
+            agent_run_id: Some("agent-run-1".to_owned()),
+            decision: "allow".to_owned(),
+            summary: "model=openai/gpt-test trace words".to_owned(),
+            trace_id: Some("trace-1".to_owned()),
+            rule: Some("project-budget".to_owned()),
+            decision_reason: None,
+            model_check: None,
+            limit_hits: 0,
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test".to_owned()),
+            cost_usd: Some(0.01),
+            estimated_tokens: Some(10),
+            actual_tokens: None,
+            tool_calls: None,
+            matched_entity: matched_entity.map(str::to_owned),
+            entities: entities.into_iter().map(str::to_owned).collect(),
+            timeline: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn app_run_query_matches_explicit_entities() {
+        let run = run_with_entities(vec!["project:noether", "user:lgrossi"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: Some("project:noether".to_owned()),
+            q: None,
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_matches_entities() {
+        let run = run_with_entities(vec!["project:noether", "team:core"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("team:core".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_entity_prefix_matches_entities() {
+        let run = run_with_entities(vec!["project:spillio", "user:lgrossi"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("entity=project:spillio".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_matches_multiple_entity_terms_and_remaining_text() {
+        let run = run_with_entities(vec!["project:spillio", "user:lgrossi"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("entity=project:spillio entity:user:lgrossi trace words".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_rejects_missing_entity_terms() {
+        let run = run_with_entities(vec!["project:spillio"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("entity=project:spillio entity:user:lgrossi".to_owned()),
+        };
+
+        assert!(!app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_ors_entity_terms_in_same_namespace() {
+        let run = run_with_entities(vec!["project:spillio"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("entity=project:noether entity=project:spillio".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_accepts_query_prefix_before_entity_syntax() {
+        let run = run_with_entities(vec!["project:spillio"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("q:entity=project:noether entity=project:spillio".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_accepts_bare_entity_tokens_as_shorthand() {
+        let run = run_with_entities(vec!["project:spillio"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("project:noether project:spillio".to_owned()),
+        };
+
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_keeps_unknown_colon_tokens_as_free_text() {
+        let mut run = run_with_entities(vec!["project:spillio"], None);
+        run.summary.push_str(" url:model:gpt-test");
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("model:openai".to_owned()),
+        };
+
+        assert!(!app_run_matches_query(&run, &query));
+        let query = AppRunsQuery {
+            q: Some("url:model:gpt-test".to_owned()),
+            ..query
+        };
+        assert!(app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_search_entity_terms_are_exact() {
+        let run = run_with_entities(vec!["project:noether-archive"], None);
+        let query = AppRunsQuery {
+            limit: 80,
+            offset: 0,
+            decision: None,
+            rule: None,
+            entity: None,
+            q: Some("project:noether".to_owned()),
+        };
+
+        assert!(!app_run_matches_query(&run, &query));
+    }
+
+    #[test]
+    fn app_run_row_prefers_finalized_usage_cost_over_estimate() {
+        let mut usage_by_agent_run = std::collections::BTreeMap::new();
+        usage_by_agent_run.insert(
+            "run-usage".to_owned(),
+            AppRunUsage {
+                cost_usd: 0.20,
+                tokens: 42,
+                request_count: 1,
+            },
+        );
+        let mut item = TraceReportItem {
+            occurred_at: chrono::Utc::now(),
+            kind: "decision.allow".to_owned(),
+            trace_id: Some("trace-usage".to_owned()),
+            agent_run_id: Some("run-usage".to_owned()),
+            summary: "estimated_cost=0.25".to_owned(),
+            routing: None,
+            limit_hits: None,
+            binding_limit: None,
+            entities: Vec::new(),
+        };
+
+        let run = app_run_row(&item, &usage_by_agent_run);
+        assert_eq!(run.cost_usd, Some(0.20));
+        item.agent_run_id = None;
+        let run = app_run_row(&item, &usage_by_agent_run);
+        assert_eq!(run.cost_usd, Some(0.25));
+    }
+
+    #[test]
+    fn app_run_row_adds_project_and_subject_summary_entities() {
+        let item = TraceReportItem {
+            occurred_at: chrono::Utc::now(),
+            kind: "decision.allow".to_owned(),
+            trace_id: Some("trace-entity".to_owned()),
+            agent_run_id: Some("run-entity".to_owned()),
+            summary: "project=noether subject=lgrossi".to_owned(),
+            routing: None,
+            limit_hits: None,
+            binding_limit: None,
+            entities: Vec::new(),
+        };
+
+        let run = app_run_row(&item, &std::collections::BTreeMap::new());
+        assert!(run.entities.contains(&"project:noether".to_owned()));
+        assert!(run.entities.contains(&"user:lgrossi".to_owned()));
+    }
 }

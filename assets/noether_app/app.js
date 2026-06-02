@@ -3,6 +3,7 @@ const state = {
   policy: null,
   runs: null,
   replay: null,
+  replayJob: null,
   policySource: "",
   policyEditorDirty: false,
   runsFilter: { decision: "any", rule: "any", q: "" },
@@ -18,6 +19,7 @@ let runFilterTimer = null;
 let runFetchController = null;
 let policyHighlightTimer = null;
 let reportUpdates = null;
+let replayPollJobId = null;
 
 function html(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -101,6 +103,8 @@ async function load(mode, force = false) {
       renderTopStatus();
     }
     state.replay = await json("/v1/app/replay");
+    state.replayJob = state.replay.current_job || state.replayJob;
+    if (state.replayJob?.status === "running") pollReplayJob(state.replayJob.id).catch(renderError);
   }
   if (mode === "policy" && state.policy && !state.policyEditorDirty && !state.policySource) {
     state.policySource = policyEditorSource(state.policy);
@@ -348,6 +352,12 @@ function renderSuggestionEvidence(suggestion) {
   `;
 }
 
+function resetReplayState() {
+  state.replay = null;
+  state.replayJob = null;
+  replayPollJobId = null;
+}
+
 async function savePolicy() {
   const status = $("[data-policy-save-state]");
   status.textContent = "Saving draft...";
@@ -358,7 +368,7 @@ async function savePolicy() {
       body: JSON.stringify({ source: state.policySource }),
     }), { resetEditor: true });
     state.policyEditorDirty = false;
-    state.replay = null;
+    resetReplayState();
     renderPolicy();
     status.textContent = hasDraftChanges(state.policy)
       ? "Draft saved. Replay before enforcing."
@@ -378,7 +388,7 @@ async function enforcePolicy() {
       body: JSON.stringify({ confirm_replay: true }),
     }), { resetEditor: true });
     state.policyEditorDirty = false;
-    state.replay = null;
+    resetReplayState();
     renderPolicy();
     status.textContent = "Draft enforced.";
   } catch (error) {
@@ -398,7 +408,7 @@ async function discardPolicyDraft() {
   try {
     storePolicy(await json("/v1/app/policy/proposal", { method: "DELETE" }), { resetEditor: true });
     state.policyEditorDirty = false;
-    state.replay = null;
+    resetReplayState();
     renderPolicy();
     status.textContent = "Saved draft discarded.";
   } catch (error) {
@@ -412,15 +422,56 @@ async function applySuggestion(id) {
   });
   storePolicy(response.policy, { resetEditor: true });
   state.policyEditorDirty = false;
-  state.replay = null;
+  resetReplayState();
   renderPolicy();
+}
+
+async function startFullReplay() {
+  if (state.replayJob?.status === "running") return;
+  state.replayJob = await json("/v1/app/replay/jobs", { method: "POST" });
+  renderReplay();
+  pollReplayJob(state.replayJob.id).catch(renderError);
+}
+
+async function pollReplayJob(jobId) {
+  if (replayPollJobId === jobId) return;
+  replayPollJobId = jobId;
+  try {
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const job = await json(`/v1/app/replay/jobs/${encodeURIComponent(jobId)}`);
+      if (replayPollJobId !== jobId || state.replayJob?.id !== jobId) return;
+      state.replayJob = job;
+      if (job.status === "completed" && job.result) {
+        state.replay = job.result;
+        state.replay.current_job = {
+          id: job.id,
+          status: job.status,
+          history_window_days: job.history_window_days,
+          created_at: job.created_at,
+          completed_at: job.completed_at,
+          error: job.error,
+        };
+        renderReplay();
+        return;
+      }
+      renderReplay();
+      if (job.status !== "running") return;
+    }
+  } finally {
+    if (replayPollJobId === jobId) replayPollJobId = null;
+    if (state.replayJob?.id === jobId && state.replayJob.status === "running") {
+      state.replayJob = null;
+      if (state.replay) renderReplay();
+    }
+  }
 }
 
 function renderRuns() {
   const { totals, runs, filtered_total, next_offset } = state.runs;
   renderRunRuleOptions();
   syncRunFilterControls();
-  $("[data-runs-status]").innerHTML = `<div class="big">${money(totals.spend_usd)}</div><div class="sub">${number(filtered_total)} matching · ${number(totals.runs)} total</div>`;
+  $("[data-runs-status]").innerHTML = `<div class="big">${money(totals.spend_usd)}</div><div class="sub">${number(filtered_total)} matching runs · ${number(totals.tokens)} matching tokens</div>`;
   const groups = groupRunsByDay(runs);
   $("[data-runs-list]").innerHTML = groups.map(([day, dayRuns]) => {
     const daySpend = dayRuns.reduce((sum, run) => sum + Number(run.cost_usd || 0), 0);
@@ -430,7 +481,7 @@ function renderRuns() {
     `;
   }).join("") + `
     <div class="runs-foot">
-      <span><b>${number(runs.length)}</b> shown · <b>${number(filtered_total)}</b> matching · <b>${number(totals.tokens)}</b> tokens total</span>
+      <span><b>${number(runs.length)}</b> shown · <b>${number(filtered_total)}</b> matching · <b>${number(totals.tokens)}</b> matching tokens</span>
       <span class="grow"></span>
       ${next_offset == null ? "" : `<button class="btn primary" type="button" data-runs-more>Load more</button>`}
       <button class="btn" type="button">Export ledger (soon)</button>
@@ -922,15 +973,37 @@ function kv(key, value) {
 }
 
 function renderReplay() {
-  const { baseline, proposal, has_proposed_policy, message, history_window_days } = state.replay;
+  const { baseline, proposal, has_proposed_policy, message, history_window_days, snapshots = [] } = state.replay;
   const windowLabel = history_window_days === 1 ? "last 24 hours" : history_window_days ? `last ${number(history_window_days)} days` : "local history";
-  $("[data-replay-status]").innerHTML = `<div class="big">local ledger</div><div class="sub">${number(baseline.runs)} real runs · ${money(baseline.spend_usd)} baseline · ${html(windowLabel)}</div>`;
+  const scopeLabel = replayScopeLabel(proposal?.scope, windowLabel);
+  const replayJob = state.replayJob || state.replay.current_job;
+  const replayRunning = replayJob?.status === "running";
+  const rerunButton = document.querySelector("[data-refresh-replay]");
+  if (rerunButton) {
+    rerunButton.disabled = replayRunning || !has_proposed_policy;
+    rerunButton.textContent = replayRunning ? "Replay running..." : proposal ? "Re-run replay" : "Run replay";
+  }
+  $("[data-replay-status]").innerHTML = `<div class="big">recorded history</div><div class="sub">${number(baseline.runs)} runs · ${money(baseline.spend_usd)} baseline · ${html(windowLabel)}${proposal?.scope ? ` · replay ${html(scopeLabel)}` : ""}</div>`;
   if (!has_proposed_policy) {
     $("[data-replay-body]").innerHTML = `
       <div class="replay-empty">
         <div class="title">No proposed changes yet.</div>
         <p>Edit Policy and save a draft to see the proposed card and diff here.</p>
       </div>
+      ${renderReplayJobStatus(replayJob)}
+      ${renderReplaySnapshots(snapshots)}
+    `;
+    return;
+  }
+  if (!proposal) {
+    $("[data-replay-body]").innerHTML = `
+      ${renderReplayJobStatus(replayJob)}
+      <div class="replay-empty">
+        <div class="title">Run replay in the background.</div>
+        <p>${html(message)}</p>
+        <button class="btn primary" type="button" data-start-full-replay ${replayRunning ? "disabled" : ""}>${replayRunning ? "Replay running..." : "Run replay"}</button>
+      </div>
+      ${renderReplaySnapshots(snapshots)}
     `;
     return;
   }
@@ -939,7 +1012,9 @@ function renderReplay() {
   const changedRuns = proposal?.changed_runs || [];
   const recommendations = proposal?.recommendations || [];
   const proposed = proposal?.proposed || baseline;
+  const scopedBaseline = proposal?.baseline || baseline;
   const delta = proposal?.spend_delta_usd || 0;
+  const replayStatus = renderReplayJobStatus(replayJob);
   if (!hasPolicyDiff) {
     $("[data-replay-body]").innerHTML = `
       <div class="scenarios">
@@ -951,7 +1026,7 @@ function renderReplay() {
         <div class="scenario">
           <div class="h"><span class="name">no policy diff</span><span class="tag">draft matches current</span></div>
           <p class="desc">The saved draft is identical to the active policy, so there is nothing meaningful to simulate or enforce.</p>
-          <div class="diff diff-list"><span class="same">Edit Policy and save a changed draft to compare outcomes over ${html(windowLabel)}.</span></div>
+          <div class="diff diff-list"><span class="same">Edit Policy and save a changed draft to compare outcomes over ${html(scopeLabel)}.</span></div>
         </div>
       </div>
       <div class="reco">
@@ -963,6 +1038,7 @@ function renderReplay() {
           <button class="btn primary" type="button" data-link-button="/policy">Edit policy</button>
         </div>
       </div>
+      ${renderReplaySnapshots(snapshots)}
     `;
     return;
   }
@@ -974,12 +1050,12 @@ function renderReplay() {
   $("[data-replay-body]").innerHTML = `
     <div class="scenarios">
       <div class="scenario">
-        <div class="h"><span class="name">recorded history</span><span class="tag">${html(windowLabel)}</span><span class="ribbon"><span class="pill"><span class="ball"></span>baseline</span></span></div>
-        <p class="desc">What Noether actually recorded in the replay window.</p>
-        ${scenarioStats(baseline)}
+        <div class="h"><span class="name">recorded baseline</span><span class="tag">${html(scopeLabel)}</span><span class="ribbon"><span class="pill"><span class="ball"></span>same scope</span></span></div>
+        <p class="desc">Recorded outcomes for exactly the authorizations replayed below. Full 30-day history remains in the page header.</p>
+        ${scenarioStats(scopedBaseline)}
       </div>
       <div class="scenario winner">
-        <div class="h"><span class="name">draft impact</span><span class="tag">${number(changed)} changed lines</span><span class="ribbon"><span class="pill allow"><span class="ball"></span>replayed</span></span></div>
+        <div class="h"><span class="name">draft impact</span><span class="tag">${html(scopeLabel)}</span><span class="ribbon"><span class="pill allow"><span class="ball"></span>${number(changed)} changed lines</span></span></div>
         <p class="desc">${html(message)}</p>
         <div class="diff diff-list">${renderDiffPreview(proposal)}</div>
         ${scenarioStats(proposed)}
@@ -995,6 +1071,7 @@ function renderReplay() {
         ${proposal?.can_enforce ? `<button class="btn primary" type="button" data-policy-enforce>Adopt &amp; save →</button>` : ""}
       </div>
     </div>
+    ${replayStatus}
     <div class="card changed-runs">
       <div class="eyebrow">impact summary</div>
       ${renderReplayImpact(changedRuns, delta)}
@@ -1007,7 +1084,59 @@ function renderReplay() {
       <div class="eyebrow">example affected runs</div>
       ${renderChangedRuns(changedRuns)}
     </div>
+    ${renderReplaySnapshots(snapshots)}
   `;
+}
+
+function renderReplayJobStatus(job) {
+  if (!job) return "";
+  const result = job.status === "completed"
+    ? `Completed full replay${job.snapshot ? ` · saved snapshot ${html(job.snapshot.id.slice(0, 8))}` : ""}.`
+    : job.status === "failed"
+      ? `Full replay failed: ${html(job.error || "unknown error")}`
+      : "Full replay is running in the background...";
+  return `
+    <div class="card changed-runs">
+      <div class="eyebrow">full replay job</div>
+      <div class="recommendation">
+        <div><b>${html(job.status)}</b></div>
+        <div class="sub">${result}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderReplaySnapshots(snapshots) {
+  if (!snapshots.length) return "";
+  return `
+    <div class="card changed-runs">
+      <div class="eyebrow">replay history</div>
+      ${snapshots.slice(0, 6).map((snapshot) => `
+        <div class="changed-run">
+          <div>
+            <div><span class="mono">${html(snapshot.id.slice(0, 8))}</span> ${html(replayScopeLabel(snapshot.scope, "last 30 days"))}</div>
+            <div class="sub">${html(new Date(snapshot.completed_at).toLocaleString())}${snapshot.policy_stale ? " · stale policy" : " · current policy"} · ${number(snapshot.proposed.allow)} allow · ${number(snapshot.proposed.warn)} warn · ${number(snapshot.proposed.deny)} deny</div>
+          </div>
+          <div class="right">${deltaMoney(snapshot.spend_delta_usd)}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function replayScopeLabel(scope, windowLabel) {
+  if (!scope) return windowLabel;
+  if (scope.mode === "preview" && scope.request_cap) {
+    const shown = scope.requests_replayed ?? scope.request_cap;
+    const total = scope.total_requests_in_window ?? shown;
+    if (!scope.has_more_history && shown === total) {
+      return `all ${number(shown)} authorization${shown === 1 ? "" : "s"} in ${windowLabel}`;
+    }
+    const more = scope.has_more_history ? ` of ${number(total)} in ${windowLabel}` : "";
+    return `latest ${number(shown)} authorization${shown === 1 ? "" : "s"}${more}`;
+  }
+  if (scope.mode === "full_month") return `full ${windowLabel}`;
+  return windowLabel;
 }
 
 function scenarioStats(totals) {
@@ -1181,7 +1310,11 @@ document.addEventListener("click", (event) => {
     return;
   }
   if (event.target.closest("[data-refresh-replay]")) {
-    load("replay", true);
+    startFullReplay().catch(renderError);
+    return;
+  }
+  if (event.target.closest("[data-start-full-replay]")) {
+    startFullReplay().catch(renderError);
     return;
   }
   if (event.target.closest("[data-runs-more]")) {
@@ -1208,6 +1341,7 @@ document.addEventListener("input", (event) => {
   }
   if (event.target.matches("[data-runs-filter]")) {
     state.runsFilter[event.target.dataset.runsFilter] = event.target.value;
+    syncRunFilterControls();
     clearTimeout(runFilterTimer);
     runFilterTimer = setTimeout(() => reloadRuns().catch(renderError), 180);
   }
@@ -1216,6 +1350,7 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", (event) => {
   if (event.target.matches("[data-runs-filter]")) {
     state.runsFilter[event.target.dataset.runsFilter] = event.target.value;
+    syncRunFilterControls();
     reloadRuns().catch(renderError);
   }
 });
