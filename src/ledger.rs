@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -1612,6 +1612,107 @@ impl ApprovalAuditStore for BudgetLedger {
     }
 }
 
+struct SpendScopeSeedRow {
+    scope_key: String,
+    amount_usd: f64,
+    created_at: DateTime<Utc>,
+    current_window_started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SpendScopeTotalsOptions {
+    pub since: DateTime<Utc>,
+    pub before: DateTime<Utc>,
+    pub window: Duration,
+    pub mode: SpendWindowMode,
+    pub trust_tumbling_window_state: bool,
+}
+
+fn spend_seed_totals_from_rows(
+    rows: Vec<SpendScopeSeedRow>,
+    options: SpendScopeTotalsOptions,
+) -> Vec<SpendScopeTotal> {
+    let mut rows_by_scope = BTreeMap::<String, Vec<SpendScopeSeedRow>>::new();
+    for row in rows {
+        rows_by_scope
+            .entry(row.scope_key.clone())
+            .or_default()
+            .push(row);
+    }
+    rows_by_scope
+        .into_iter()
+        .filter_map(|(scope_key, mut rows)| {
+            rows.sort_by_key(|row| row.created_at);
+            let window_started_at = match options.mode {
+                SpendWindowMode::Rolling => options.since,
+                SpendWindowMode::Tumbling => tumbling_replay_seed_window_start(
+                    &rows,
+                    options.window,
+                    options.before,
+                    options.trust_tumbling_window_state,
+                )?,
+            };
+            let amount_usd = rows
+                .iter()
+                .filter(|row| row.created_at >= window_started_at)
+                .map(|row| row.amount_usd)
+                .sum::<f64>();
+            (amount_usd > 0.0).then_some(SpendScopeTotal {
+                scope_key,
+                amount_usd,
+                window_started_at,
+            })
+        })
+        .collect()
+}
+
+fn tumbling_replay_seed_window_start(
+    rows: &[SpendScopeSeedRow],
+    window: Duration,
+    before: DateTime<Utc>,
+    trust_tumbling_window_state: bool,
+) -> Option<DateTime<Utc>> {
+    if let Some(current_window_started_at) = trust_tumbling_window_state
+        .then(|| rows.iter().find_map(|row| row.current_window_started_at))
+        .flatten()
+    {
+        if current_window_started_at == before {
+            return None;
+        }
+        let window_started_at = replay_seed_window_start(current_window_started_at, window, before);
+        if window_started_at >= before {
+            return None;
+        }
+        let has_active_spend_before_window = rows
+            .iter()
+            .any(|row| row.created_at < window_started_at && row.created_at + window > before);
+        if !has_active_spend_before_window
+            && rows.iter().any(|row| row.created_at >= window_started_at)
+        {
+            return Some(window_started_at);
+        }
+    }
+    rows.iter()
+        .filter(|row| row.created_at + window > before)
+        .map(|row| row.created_at)
+        .min()
+}
+
+fn replay_seed_window_start(
+    current_window_started_at: DateTime<Utc>,
+    window: Duration,
+    before: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let mut window_started_at = current_window_started_at;
+    while window_started_at >= before {
+        window_started_at -= window;
+    }
+    while window_started_at + window <= before {
+        window_started_at += window;
+    }
+    window_started_at
+}
+
 impl BudgetLedger {
     pub fn set_advisory_config(&mut self, config: AdvisoryConfig) {
         self.advisory_config = config;
@@ -3076,64 +3177,82 @@ impl BudgetLedger {
         &self,
         rule_id: &str,
         limit_id: &str,
-        since: DateTime<Utc>,
-        before: DateTime<Utc>,
+        options: SpendScopeTotalsOptions,
     ) -> Result<Vec<SpendScopeTotal>, NoetError> {
         if let LedgerStore::Postgres(pg_conn) = &self.store {
             let rows = pg_conn.0.lock().expect("postgres mutex").query(
                 "
-                SELECT scope_key, COALESCE(SUM(amount_usd), 0)::DOUBLE PRECISION, MIN(created_at)
-                FROM reservation_limit_scopes
-                WHERE rule_id = $1
-                  AND limit_id = $2
-                  AND created_at >= $3
-                  AND created_at < $4
-                GROUP BY scope_key
-                HAVING COALESCE(SUM(amount_usd), 0) > 0
+                SELECT r.scope_key,
+                       r.amount_usd,
+                       r.created_at,
+                       l.started_at
+                FROM reservation_limit_scopes r
+                LEFT JOIN limit_window_states l
+                  ON l.rule_id = r.rule_id
+                 AND l.limit_id = r.limit_id
+                 AND l.scope_key = r.scope_key
+                WHERE r.rule_id = $1
+                  AND r.limit_id = $2
+                  AND r.created_at >= $3
+                  AND r.created_at < $4
                 ",
                 &[
                     &rule_id,
                     &limit_id,
-                    &since.to_rfc3339(),
-                    &before.to_rfc3339(),
+                    &options.since.to_rfc3339(),
+                    &options.before.to_rfc3339(),
                 ],
             )?;
-            return Ok(rows
+            let rows = rows
                 .into_iter()
-                .map(|row| SpendScopeTotal {
+                .map(|row| SpendScopeSeedRow {
                     scope_key: row.get(0),
                     amount_usd: row.get(1),
-                    first_spend_at: parse_time(row.get::<_, String>(2)),
+                    created_at: parse_time(row.get::<_, String>(2)),
+                    current_window_started_at: row.get::<_, Option<String>>(3).map(parse_time),
                 })
-                .collect());
+                .collect();
+            return Ok(spend_seed_totals_from_rows(rows, options));
         }
         let LedgerStore::Sqlite(conn) = &self.store else {
             return Ok(Vec::new());
         };
         let mut stmt = conn.prepare(
             "
-            SELECT scope_key, COALESCE(SUM(amount_usd), 0), MIN(created_at)
-            FROM reservation_limit_scopes
-            WHERE rule_id = ?1
-              AND limit_id = ?2
-              AND created_at >= ?3
-              AND created_at < ?4
-            GROUP BY scope_key
-            HAVING COALESCE(SUM(amount_usd), 0) > 0
+            SELECT r.scope_key,
+                   r.amount_usd,
+                   r.created_at,
+                   l.started_at
+            FROM reservation_limit_scopes r
+            LEFT JOIN limit_window_states l
+              ON l.rule_id = r.rule_id
+             AND l.limit_id = r.limit_id
+             AND l.scope_key = r.scope_key
+            WHERE r.rule_id = ?1
+              AND r.limit_id = ?2
+              AND r.created_at >= ?3
+              AND r.created_at < ?4
             ",
         )?;
-        stmt.query_map(
-            params![rule_id, limit_id, since.to_rfc3339(), before.to_rfc3339()],
-            |row| {
-                Ok(SpendScopeTotal {
-                    scope_key: row.get(0)?,
-                    amount_usd: row.get(1)?,
-                    first_spend_at: parse_time(row.get::<_, String>(2)?),
-                })
-            },
-        )?
-        .collect::<Result<_, _>>()
-        .map_err(NoetError::from)
+        let rows: Vec<SpendScopeSeedRow> = stmt
+            .query_map(
+                params![
+                    rule_id,
+                    limit_id,
+                    options.since.to_rfc3339(),
+                    options.before.to_rfc3339()
+                ],
+                |row| {
+                    Ok(SpendScopeSeedRow {
+                        scope_key: row.get(0)?,
+                        amount_usd: row.get(1)?,
+                        created_at: parse_time(row.get::<_, String>(2)?),
+                        current_window_started_at: row.get::<_, Option<String>>(3)?.map(parse_time),
+                    })
+                },
+            )?
+            .collect::<Result<_, _>>()?;
+        Ok(spend_seed_totals_from_rows(rows, options))
     }
 
     pub fn usage_activity_report(&self) -> Result<Vec<UsageActivityRecord>, NoetError> {
@@ -8599,6 +8718,56 @@ mod tests {
             panic!("expected sqlite ledger store");
         };
         conn
+    }
+
+    #[test]
+    fn replay_seed_totals_skip_spend_expired_at_exact_tumbling_boundary() {
+        let before = Utc.with_ymd_and_hms(2026, 6, 2, 12, 0, 0).unwrap();
+        let rows = vec![SpendScopeSeedRow {
+            scope_key: "global".to_owned(),
+            amount_usd: 0.007,
+            created_at: before - Duration::minutes(1),
+            current_window_started_at: Some(before),
+        }];
+
+        let totals = spend_seed_totals_from_rows(
+            rows,
+            SpendScopeTotalsOptions {
+                since: before - Duration::minutes(10),
+                before,
+                window: Duration::minutes(10),
+                mode: SpendWindowMode::Tumbling,
+                trust_tumbling_window_state: true,
+            },
+        );
+
+        assert!(totals.is_empty());
+    }
+
+    #[test]
+    fn replay_seed_totals_fall_back_when_stale_start_drops_active_spend() {
+        let before = Utc.with_ymd_and_hms(2026, 6, 2, 12, 0, 0).unwrap();
+        let rows = vec![SpendScopeSeedRow {
+            scope_key: "global".to_owned(),
+            amount_usd: 0.007,
+            created_at: before - Duration::minutes(50),
+            current_window_started_at: Some(before + Duration::minutes(20)),
+        }];
+
+        let totals = spend_seed_totals_from_rows(
+            rows,
+            SpendScopeTotalsOptions {
+                since: before - Duration::hours(1),
+                before,
+                window: Duration::hours(1),
+                mode: SpendWindowMode::Tumbling,
+                trust_tumbling_window_state: true,
+            },
+        );
+
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].amount_usd, 0.007);
+        assert_eq!(totals[0].window_started_at, before - Duration::minutes(50));
     }
 
     fn policy(limit_usd: f64, warn_at_fraction: f64) -> PolicyFile {

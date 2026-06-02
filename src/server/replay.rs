@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::contract::SpendWindowMode;
 use crate::error::NoetError;
-use crate::ledger::{BudgetLedger, ReplaySpendSeed};
+use crate::ledger::{BudgetLedger, ReplaySpendSeed, SpendScopeTotalsOptions};
 use crate::policy_workbench::{
     AppPolicyProposal, app_display_policy_source, app_policy_proposal, app_run_totals_from_report,
 };
@@ -171,6 +171,7 @@ pub(super) async fn start_app_replay_job(
     }
     let jobs = state.replay_jobs.clone();
     let snapshots_path = state.replay_snapshots_path.clone();
+    let replay_snapshot_writes = state.replay_snapshot_writes.clone();
     let replay_state = state.clone();
     let replay_active_source = active_source.clone();
     let replay_proposal = proposal.clone();
@@ -191,6 +192,7 @@ pub(super) async fn start_app_replay_job(
                 proposed_policy_path: &proposed_policy_path,
             };
             let snapshot = replay_snapshot_from_result(context, result);
+            let _snapshot_write_guard = replay_snapshot_writes.lock().await;
             append_replay_snapshot(&snapshots_path, snapshot.clone())
                 .await
                 .map(|_| snapshot)
@@ -273,6 +275,7 @@ async fn replay_ledger_changed_since(
 
 fn full_replay_spend_seeds(
     ledger: &BudgetLedger,
+    active_policy: Option<&crate::policy::PolicyFile>,
     policy: &crate::policy::PolicyFile,
     history_window_start: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<ReplaySpendSeed>, NoetError> {
@@ -286,13 +289,43 @@ fn full_replay_spend_seeds(
                 continue;
             };
             let limit_id = limit.id.as_deref().unwrap_or(limit.window.as_str());
+            let trust_tumbling_window_state = active_policy
+                .and_then(|active_policy| {
+                    active_policy
+                        .budgets
+                        .iter()
+                        .find(|active_rule| active_rule.id == rule.id)
+                })
+                .and_then(|active_rule| {
+                    active_rule.limits.spend.iter().find(|active_limit| {
+                        active_limit
+                            .id
+                            .as_deref()
+                            .unwrap_or(active_limit.window.as_str())
+                            == limit_id
+                    })
+                })
+                .map(|active_limit| {
+                    mode == SpendWindowMode::Tumbling
+                        && active_limit.mode == Some(SpendWindowMode::Tumbling)
+                        && active_limit.window == limit.window
+                })
+                .unwrap_or(false);
             let since = history_window_start - window;
-            for total in
-                ledger.spend_scope_totals(&rule.id, limit_id, since, history_window_start)?
-            {
+            for total in ledger.spend_scope_totals(
+                &rule.id,
+                limit_id,
+                SpendScopeTotalsOptions {
+                    since,
+                    before: history_window_start,
+                    window,
+                    mode,
+                    trust_tumbling_window_state,
+                },
+            )? {
                 let seeded_at = history_window_start - chrono::Duration::seconds(1);
                 if mode == SpendWindowMode::Tumbling
-                    && total.first_spend_at + window <= history_window_start
+                    && total.window_started_at + window <= history_window_start
                 {
                     continue;
                 }
@@ -304,7 +337,7 @@ fn full_replay_spend_seeds(
                     mode,
                     seeded_at,
                     window_started_at: match mode {
-                        SpendWindowMode::Tumbling => total.first_spend_at,
+                        SpendWindowMode::Tumbling => total.window_started_at,
                         SpendWindowMode::Rolling => since,
                     },
                 });
@@ -398,6 +431,11 @@ async fn app_replay_full_month_response(
     let history_window_end = chrono::Utc::now();
     let history_window_start =
         history_window_end - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+    let active_policy = if active_source.trim().is_empty() {
+        None
+    } else {
+        Some(crate::policy::parse_policy_bytes(active_source.as_bytes())?)
+    };
     let proposed_policy = crate::policy::parse_policy_bytes(proposal.source.as_bytes())?;
     let (total_requests, historical_requests, usage_by_agent_run, baseline, spend_seeds) = state
         .read_ledger(move |ledger| {
@@ -411,8 +449,12 @@ async fn app_replay_full_month_response(
             let baseline = app_run_totals_from_report(
                 ledger.run_totals_report_since(Some(history_window_start))?,
             );
-            let spend_seeds =
-                full_replay_spend_seeds(ledger, &proposed_policy, history_window_start)?;
+            let spend_seeds = full_replay_spend_seeds(
+                ledger,
+                active_policy.as_ref(),
+                &proposed_policy,
+                history_window_start,
+            )?;
             Ok((
                 total_requests,
                 historical_requests,

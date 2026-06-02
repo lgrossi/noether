@@ -83,6 +83,7 @@ pub struct AppState {
     pub ledger_backend: LedgerBackend,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
+    replay_snapshot_writes: Arc<Mutex<()>>,
     replay_snapshots_path: PathBuf,
     metrics: AppMetrics,
 }
@@ -382,6 +383,7 @@ impl AppState {
             ledger_backend: LedgerBackend::in_memory(),
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            replay_snapshot_writes: Arc::new(Mutex::new(())),
             replay_snapshots_path: PathBuf::from(".noet/replay-snapshots.json"),
             metrics: AppMetrics::default(),
         }
@@ -3714,6 +3716,372 @@ budgets:
                 .expect("changed runs")
                 .len(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_uses_persisted_tumbling_window_start_for_seed() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut policy = strict_policy();
+        policy.budgets[0].limits.spend[0].window = "10m".to_owned();
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let replay_window_start =
+                chrono::Utc::now() - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+            ledger
+                .try_authorize_at(
+                    Some(&policy),
+                    &report_request("trace-anchor", "request-anchor", "gpt-4.1", 0.0),
+                    replay_window_start - chrono::Duration::minutes(9),
+                )
+                .expect("anchor authorization");
+            ledger
+                .try_authorize_at(
+                    Some(&policy),
+                    &report_request(
+                        "trace-prior-window",
+                        "request-prior-window",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start - chrono::Duration::minutes(2),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-after-anchor-expired",
+                        "request-after-anchor-expired",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start + chrono::Duration::seconds(30),
+                )
+                .expect("historical authorization");
+            ledger
+                .try_authorize_at(
+                    Some(&policy),
+                    &report_request(
+                        "trace-advance-window",
+                        "request-advance-window",
+                        "gpt-4.1",
+                        0.0,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(20),
+                )
+                .expect("advance window authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["allow"], 1);
+        assert_eq!(proposal["proposed"]["deny"], 1);
+        assert_eq!(
+            proposal["changed_runs"]
+                .as_array()
+                .expect("changed runs")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_rolling_seed_ignores_persisted_tumbling_window_start() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut tumbling_policy = strict_policy();
+        tumbling_policy.budgets[0].limits.spend[0].window = "10m".to_owned();
+        let mut rolling_policy = tumbling_policy.clone();
+        rolling_policy.budgets[0].limits.spend[0].window = "1h".to_owned();
+        rolling_policy.budgets[0].limits.spend[0].mode = Some(SpendWindowMode::Rolling);
+        rolling_policy.budgets[0].limits.spend[0].anchor = None;
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&rolling_policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let replay_window_start =
+                chrono::Utc::now() - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+            ledger
+                .try_authorize_at(
+                    Some(&tumbling_policy),
+                    &report_request(
+                        "trace-prior-rolling",
+                        "request-prior-rolling",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start - chrono::Duration::minutes(50),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-rolling-replay",
+                        "request-rolling-replay",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(1),
+                )
+                .expect("historical authorization");
+            ledger
+                .try_authorize_at(
+                    Some(&tumbling_policy),
+                    &report_request(
+                        "trace-advance-rolling-state",
+                        "request-advance-rolling-state",
+                        "gpt-4.1",
+                        0.0,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(20),
+                )
+                .expect("advance window authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["deny"], 1);
+        assert_eq!(
+            proposal["changed_runs"]
+                .as_array()
+                .expect("changed runs")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_tumbling_seed_handles_duration_change() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut old_policy = strict_policy();
+        old_policy.budgets[0].limits.spend[0].window = "10m".to_owned();
+        let mut proposed_policy = old_policy.clone();
+        proposed_policy.budgets[0].limits.spend[0].window = "1h".to_owned();
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&proposed_policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let replay_window_start =
+                chrono::Utc::now() - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+            ledger
+                .try_authorize_at(
+                    Some(&old_policy),
+                    &report_request(
+                        "trace-prior-duration",
+                        "request-prior-duration",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start - chrono::Duration::minutes(50),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-duration-replay",
+                        "request-duration-replay",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(1),
+                )
+                .expect("historical authorization");
+            ledger
+                .try_authorize_at(
+                    Some(&old_policy),
+                    &report_request(
+                        "trace-advance-duration-state",
+                        "request-advance-duration-state",
+                        "gpt-4.1",
+                        0.0,
+                    ),
+                    replay_window_start + chrono::Duration::minutes(20),
+                )
+                .expect("advance window authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["deny"], 1);
+        assert_eq!(
+            proposal["changed_runs"]
+                .as_array()
+                .expect("changed runs")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_tumbling_seed_uses_prior_spend_without_persisted_window() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut rolling_policy = strict_policy();
+        rolling_policy.budgets[0].limits.spend[0].window = "10m".to_owned();
+        rolling_policy.budgets[0].limits.spend[0].mode = Some(SpendWindowMode::Rolling);
+        let mut tumbling_policy = rolling_policy.clone();
+        tumbling_policy.budgets[0].limits.spend[0].mode = Some(SpendWindowMode::Tumbling);
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&tumbling_policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let replay_window_start =
+                chrono::Utc::now() - chrono::Duration::days(APP_REPLAY_HISTORY_WINDOW_DAYS);
+            ledger
+                .try_authorize_at(
+                    Some(&rolling_policy),
+                    &report_request(
+                        "trace-prior-tumbling",
+                        "request-prior-tumbling",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start - chrono::Duration::minutes(9),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-tumbling-replay",
+                        "request-tumbling-replay",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    replay_window_start + chrono::Duration::seconds(30),
+                )
+                .expect("historical authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["deny"], 1);
+        assert_eq!(
+            proposal["changed_runs"]
+                .as_array()
+                .expect("changed runs")
+                .len(),
+            1
         );
     }
 
