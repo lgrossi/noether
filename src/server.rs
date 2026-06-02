@@ -83,6 +83,7 @@ pub struct AppState {
     pub ledger_backend: LedgerBackend,
     pub report_updates: broadcast::Sender<ReportUpdate>,
     replay_jobs: Arc<Mutex<BTreeMap<String, AppReplayJob>>>,
+    replay_snapshots_path: PathBuf,
     metrics: AppMetrics,
 }
 
@@ -131,7 +132,6 @@ struct AppPolicyApplyResponse {
 }
 
 const APP_REPLAY_HISTORY_WINDOW_DAYS: i64 = 30;
-const APP_REPLAY_PREVIEW_REQUEST_CAP: usize = 5_000;
 const APP_REPLAY_CHANGED_RUNS_CAP: usize = 100;
 const APP_REPLAY_MAX_JOBS: usize = 8;
 const APP_REPLAY_JOB_RETENTION_MINUTES: i64 = 30;
@@ -382,6 +382,7 @@ impl AppState {
             ledger_backend: LedgerBackend::in_memory(),
             report_updates,
             replay_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            replay_snapshots_path: PathBuf::from(".noet/replay-snapshots.json"),
             metrics: AppMetrics::default(),
         }
     }
@@ -553,6 +554,11 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
         .parent()
         .unwrap_or_else(|| Path::new(".noet"))
         .join("policy.proposed.yaml");
+    let replay_snapshots_path = config
+        .simulation_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(".noet"))
+        .join("replay-snapshots.json");
     let policy_runtime = match (config.policy_path, config.policy) {
         (Some(policy_path), Some(policy)) => {
             let source_bytes = fs::read(&policy_path).await?;
@@ -568,6 +574,7 @@ pub async fn serve(config: ServeConfig) -> Result<(), NoetError> {
     );
     state.simulation_dir = config.simulation_dir;
     state.policy_proposal_path = policy_proposal_path;
+    state.replay_snapshots_path = replay_snapshots_path;
     state.routes = config.routes;
     state.api_key = normalize_api_key(config.api_key).map(Arc::from);
     state.actor_header = normalize_actor_header(config.actor_header).map(Arc::from);
@@ -961,7 +968,8 @@ mod tests {
     use crate::proxy::{ProxyRoute, ProxyRoutes};
     use crate::redaction::REDACTED;
     use crate::replay_workbench::{
-        ReplayScopeOptions, app_replay_proposal, replay_historical_requests,
+        AppRunUsage, ReplayScopeOptions, app_replay_proposal, replay_baseline_totals,
+        replay_historical_requests,
     };
     use crate::reporting;
 
@@ -1011,6 +1019,30 @@ mod tests {
                 upstream_base_url,
             }],
         }
+    }
+
+    async fn wait_for_replay_job(app: &axum::Router, job_id: &str) -> serde_json::Value {
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v1/app/replay/jobs/{job_id}"))
+                        .body(Body::empty())
+                        .expect("job status request"),
+                )
+                .await
+                .expect("job status response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("job status body");
+            let status: serde_json::Value = serde_json::from_slice(&body).expect("job status json");
+            if status["status"] != "running" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("replay job did not complete");
     }
 
     #[test]
@@ -3199,7 +3231,7 @@ budgets:
     }
 
     #[tokio::test]
-    async fn noether_app_replay_reevaluates_historical_requests_against_draft_policy() {
+    async fn noether_app_replay_job_reevaluates_historical_requests_against_draft_policy() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
         state.ledger = Arc::new(Mutex::new(
@@ -3231,36 +3263,50 @@ budgets:
 
         let app = build_router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/app/replay")
+                    .method("POST")
+                    .uri("/v1/app/replay/jobs")
                     .body(Body::empty())
-                    .expect("replay request"),
+                    .expect("job request"),
             )
             .await
-            .expect("replay response");
+            .expect("job response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("replay body");
-        let replay: serde_json::Value =
-            serde_json::from_slice(&body).expect("replay response json");
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let replay = wait_for_replay_job(&app, &job_id).await;
 
-        assert_eq!(replay["baseline"]["allow"], 1);
-        assert_eq!(replay["proposal"]["proposed"]["deny"], 1);
+        assert_eq!(replay["result"]["baseline"]["allow"], 1);
+        assert_eq!(replay["result"]["proposal"]["proposed"]["deny"], 1);
         assert_eq!(
-            replay["proposal"]["changed_runs"][0]["run_id"],
+            replay["result"]["proposal"]["changed_runs"][0]["run_id"],
             "run-replay"
         );
-        assert_eq!(replay["proposal"]["changed_runs"][0]["from"], "allow");
-        assert_eq!(replay["proposal"]["changed_runs"][0]["to"], "deny");
         assert_eq!(
-            replay["proposal"]["recommendations"][0]["action"],
+            replay["result"]["proposal"]["changed_runs"][0]["from"],
+            "allow"
+        );
+        assert_eq!(
+            replay["result"]["proposal"]["changed_runs"][0]["to"],
+            "deny"
+        );
+        assert_eq!(
+            replay["result"]["proposal"]["recommendations"][0]["action"],
             "review_changed_runs"
         );
-        assert_eq!(replay["proposal"]["mode"], "draft_impact");
-        assert_eq!(replay["proposal"]["can_enforce"], true);
-        assert_eq!(replay["proposal"]["spend_delta_usd"], -1.25);
+        assert_eq!(replay["result"]["proposal"]["mode"], "draft_impact");
+        assert_eq!(replay["result"]["proposal"]["can_enforce"], true);
+        assert_eq!(replay["result"]["proposal"]["spend_delta_usd"], -1.25);
+        assert_eq!(replay["result"]["proposal"]["scope"]["mode"], "full_month");
+        assert_eq!(
+            replay["result"]["proposal"]["scope"]["request_cap"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -3297,10 +3343,10 @@ budgets:
             &std::collections::BTreeMap::new(),
             &[],
             ReplayScopeOptions {
-                mode: "preview".to_owned(),
-                request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
+                mode: "full_month".to_owned(),
+                request_cap: None,
                 total_requests_in_window: 150,
-                full_replay_available: true,
+                full_replay_available: false,
                 changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
                 window_seeded: false,
             },
@@ -3313,8 +3359,57 @@ budgets:
             replay.scope.changed_runs_returned,
             APP_REPLAY_CHANGED_RUNS_CAP
         );
-        assert_eq!(replay.scope.mode, "preview");
-        assert!(replay.scope.full_replay_available);
+        assert_eq!(replay.scope.mode, "full_month");
+        assert!(!replay.scope.full_replay_available);
+    }
+
+    #[test]
+    fn noether_app_replay_counts_proposed_outcomes_per_authorization() {
+        let policy = PolicyFile {
+            version: 0,
+            routing: Default::default(),
+            budgets: Vec::new(),
+            policies: Vec::new(),
+        };
+        let occurred_at = chrono::Utc::now();
+        let historical_requests = (0..3)
+            .map(|index| {
+                let mut request = report_request(
+                    "trace-shared-run",
+                    &format!("request-shared-run-{index}"),
+                    "gpt-4.1",
+                    0.01,
+                );
+                request
+                    .metadata
+                    .insert("agent_run_id".to_owned(), json!("run-shared"));
+                crate::ledger::HistoricalAuthorizeRequest {
+                    occurred_at: occurred_at + chrono::Duration::seconds(index),
+                    decision_id: format!("decision-shared-run-{index}"),
+                    baseline_outcome: DecisionOutcome::Allow,
+                    request,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let (totals, changed_runs, _, changed_runs_total) = replay_historical_requests(
+            &policy,
+            &historical_requests,
+            &std::collections::BTreeMap::new(),
+            &[],
+        )
+        .expect("replay");
+
+        assert_eq!(totals.runs, 1);
+        assert_eq!(totals.allow, 3);
+        assert_eq!(totals.warn, 0);
+        assert_eq!(
+            totals.allow + totals.warn + totals.deny + totals.ask,
+            historical_requests.len() as u64
+        );
+        assert_eq!(totals.spend_usd, 0.03);
+        assert!(changed_runs.is_empty());
+        assert_eq!(changed_runs_total, 0);
     }
 
     #[tokio::test]
@@ -3326,6 +3421,7 @@ budgets:
                 .expect("sqlite ledger"),
         ));
         state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
         std::fs::write(
             &state.policy_proposal_path,
             serde_yaml::to_string(&require_project_policy()).expect("policy yaml"),
@@ -3392,6 +3488,161 @@ budgets:
             completed["result"]["proposal"]["changed_runs"][0]["to"],
             "deny"
         );
+        assert_eq!(completed["snapshot"]["scope"]["mode"], "full_month");
+        assert_eq!(completed["snapshot"]["policy_stale"], false);
+        assert!(tempdir.path().join("replay-snapshots.json").exists());
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value = serde_json::from_slice(&body).expect("replay json");
+        assert_eq!(replay["snapshots"][0]["id"], completed["id"]);
+    }
+
+    #[tokio::test]
+    async fn noether_app_full_replay_job_seeds_prior_spend_windows() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        let mut policy = strict_policy();
+        policy.budgets[0].limits.spend[0].window = "31d".to_owned();
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&policy).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let now = chrono::Utc::now();
+            ledger
+                .try_authorize_at(
+                    Some(&policy),
+                    &report_request("trace-prior-spend", "request-prior-spend", "gpt-4.1", 0.007),
+                    now - chrono::Duration::days(30) - chrono::Duration::seconds(5),
+                )
+                .expect("prior authorization");
+            ledger
+                .try_authorize_at(
+                    None,
+                    &report_request(
+                        "trace-window-replay",
+                        "request-window-replay",
+                        "gpt-4.1",
+                        0.007,
+                    ),
+                    now,
+                )
+                .expect("historical authorization");
+        }
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+
+        assert_eq!(completed["status"], "completed");
+        let proposal = &completed["result"]["proposal"];
+        assert_eq!(proposal["scope"]["window_seeded"], true);
+        assert_eq!(proposal["proposed"]["deny"], 1);
+        assert_eq!(proposal["changed_runs"][0]["to"], "deny");
+    }
+
+    #[tokio::test]
+    async fn noether_app_replay_does_not_reuse_job_result_after_ledger_changes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = state_with_dir(tempdir.path().join("fixtures"), None, DecisionMode::DryRun);
+        state.ledger = Arc::new(Mutex::new(
+            BudgetLedger::open_sqlite(&tempdir.path().join("noether.sqlite"))
+                .expect("sqlite ledger"),
+        ));
+        state.policy_proposal_path = tempdir.path().join("policy.proposed.yaml");
+        state.replay_snapshots_path = tempdir.path().join("replay-snapshots.json");
+        std::fs::write(
+            &state.policy_proposal_path,
+            serde_yaml::to_string(&require_project_policy()).expect("policy yaml"),
+        )
+        .expect("write proposal");
+        {
+            let mut ledger = state.ledger.lock().await;
+            let mut request =
+                report_request("trace-stale-job", "request-stale-job", "gpt-4.1", 0.01);
+            request.project = None;
+            request.entities = Vec::new();
+            ledger.try_authorize(None, &request).expect("authorize");
+        }
+
+        let app = build_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/app/replay/jobs")
+                    .body(Body::empty())
+                    .expect("job request"),
+            )
+            .await
+            .expect("job response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let completed = wait_for_replay_job(&app, &job_id).await;
+        assert_eq!(completed["status"], "completed");
+
+        {
+            let mut ledger = state.ledger.lock().await;
+            let request = report_request(
+                "trace-after-replay",
+                "request-after-replay",
+                "gpt-4.1",
+                0.01,
+            );
+            ledger.try_authorize(None, &request).expect("authorize");
+        }
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/app/replay")
+                    .body(Body::empty())
+                    .expect("replay request"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay: serde_json::Value = serde_json::from_slice(&body).expect("replay json");
+        assert_eq!(replay["proposal"], serde_json::Value::Null);
+        assert_eq!(replay["current_job"]["status"], "completed");
     }
 
     #[tokio::test]
@@ -3426,33 +3677,39 @@ budgets:
 
         let app = build_router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/app/replay")
+                    .method("POST")
+                    .uri("/v1/app/replay/jobs")
                     .body(Body::empty())
-                    .expect("replay request"),
+                    .expect("job request"),
             )
             .await
-            .expect("replay response");
+            .expect("job response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("replay body");
-        let replay: serde_json::Value =
-            serde_json::from_slice(&body).expect("replay response json");
+            .expect("job body");
+        let started: serde_json::Value = serde_json::from_slice(&body).expect("job json");
+        let job_id = started["id"].as_str().expect("job id").to_owned();
+        let replay = wait_for_replay_job(&app, &job_id).await;
 
-        assert_eq!(replay["proposal"]["proposed"]["allow"], 1);
+        assert_eq!(replay["result"]["proposal"]["proposed"]["allow"], 1);
         assert_eq!(
-            replay["proposal"]["changed_runs"].as_array().unwrap().len(),
+            replay["result"]["proposal"]["changed_runs"]
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
-        assert_eq!(replay["proposal"]["mode"], "draft_impact");
-        assert_eq!(replay["proposal"]["can_enforce"], true);
+        assert_eq!(replay["result"]["proposal"]["mode"], "draft_impact");
+        assert_eq!(replay["result"]["proposal"]["can_enforce"], true);
         assert_eq!(
-            replay["proposal"]["recommendations"][0]["action"],
+            replay["result"]["proposal"]["recommendations"][0]["action"],
             "review_policy_diff"
         );
-        assert_eq!(replay["proposal"]["spend_delta_usd"], 0.0);
+        assert_eq!(replay["result"]["proposal"]["spend_delta_usd"], 0.0);
     }
 
     #[test]
@@ -3476,8 +3733,8 @@ budgets:
             &std::collections::BTreeMap::new(),
             &[],
             ReplayScopeOptions {
-                mode: "preview".to_owned(),
-                request_cap: Some(APP_REPLAY_PREVIEW_REQUEST_CAP),
+                mode: "full_month".to_owned(),
+                request_cap: None,
                 total_requests_in_window: 0,
                 full_replay_available: false,
                 changed_runs_cap: APP_REPLAY_CHANGED_RUNS_CAP,
@@ -3590,6 +3847,28 @@ budgets:
             changed_runs[0].rule.as_deref(),
             Some("tiny.spend_window.budget-cap")
         );
+    }
+
+    #[test]
+    fn noether_app_replay_baseline_uses_estimate_when_agent_run_usage_is_missing() {
+        let mut request = report_request("trace-estimate", "request-estimate", "gpt-4.1", 0.25);
+        request
+            .metadata
+            .insert("agent_run_id".to_owned(), json!("run-estimate"));
+        request.estimated_tokens = Some(250);
+        let totals = replay_baseline_totals(
+            &[crate::ledger::HistoricalAuthorizeRequest {
+                occurred_at: chrono::Utc::now(),
+                decision_id: "decision-estimate".to_owned(),
+                baseline_outcome: DecisionOutcome::Allow,
+                request,
+            }],
+            &std::collections::BTreeMap::<String, AppRunUsage>::new(),
+        );
+
+        assert_eq!(totals.runs, 1);
+        assert_eq!(totals.spend_usd, 0.25);
+        assert_eq!(totals.tokens, 250);
     }
 
     #[test]

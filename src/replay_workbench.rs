@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::contract::{AuthorizeRequest, DecisionOutcome, SpendWindowMode};
+use crate::contract::{AuthorizeRequest, DecisionOutcome};
 use crate::error::NoetError;
 use crate::ledger::{BudgetLedger, ReplaySpendSeed};
 use crate::policy::PolicyFile;
@@ -34,10 +34,14 @@ pub(crate) struct AppReplayResponse {
     pub(crate) history_window_start: chrono::DateTime<chrono::Utc>,
     pub(crate) history_window_end: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) current_job: Option<AppReplayJobStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) snapshots: Vec<AppReplaySnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) proposal: Option<AppReplayProposal>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct AppReplayScope {
     pub(crate) mode: String,
     pub(crate) request_cap: Option<usize>,
@@ -60,6 +64,7 @@ pub(crate) struct AppReplayProposal {
     pub(crate) changed_lines: u64,
     pub(crate) added_lines: u64,
     pub(crate) removed_lines: u64,
+    pub(crate) baseline: AppRunTotals,
     pub(crate) proposed: AppRunTotals,
     pub(crate) changed_runs: Vec<AppReplayChangedRun>,
     pub(crate) recommendations: Vec<AppReplayRecommendation>,
@@ -103,6 +108,19 @@ pub(crate) struct AppReplayJobResponse {
     pub(crate) error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) result: Option<AppReplayResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot: Option<AppReplaySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AppReplayJobStatus {
+    pub(crate) id: String,
+    pub(crate) status: String,
+    pub(crate) history_window_days: i64,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +131,24 @@ pub(crate) struct AppReplayJob {
     pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) error: Option<String>,
     pub(crate) result: Option<AppReplayResponse>,
+    pub(crate) snapshot: Option<AppReplaySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub(crate) struct AppReplaySnapshot {
+    pub(crate) id: String,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) completed_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) active_policy_hash: String,
+    pub(crate) proposed_policy_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) active_policy_path: Option<String>,
+    pub(crate) proposed_policy_path: String,
+    pub(crate) policy_stale: bool,
+    pub(crate) scope: AppReplayScope,
+    pub(crate) baseline: AppRunTotals,
+    pub(crate) proposed: AppRunTotals,
+    pub(crate) spend_delta_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -162,6 +198,7 @@ pub(crate) fn app_replay_proposal(
             usage_by_agent_run,
             spend_seeds,
         )?;
+    let baseline = replay_baseline_totals(historical_requests, usage_by_agent_run);
     let recommendations = app_replay_recommendations(&changed_runs, spend_delta_usd);
     changed_runs.truncate(scope_options.changed_runs_cap);
     let changed_runs_returned = changed_runs.len();
@@ -184,6 +221,7 @@ pub(crate) fn app_replay_proposal(
         changed_lines,
         added_lines,
         removed_lines,
+        baseline,
         proposed,
         changed_runs,
         recommendations,
@@ -211,45 +249,6 @@ pub(crate) struct ReplayScopeOptions {
     pub(crate) full_replay_available: bool,
     pub(crate) changed_runs_cap: usize,
     pub(crate) window_seeded: bool,
-}
-
-pub(crate) fn app_replay_spend_seeds(
-    ledger: &BudgetLedger,
-    proposed_policy: &PolicyFile,
-    history_window_start: chrono::DateTime<chrono::Utc>,
-    preview_start: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<ReplaySpendSeed>, NoetError> {
-    if preview_start <= history_window_start {
-        return Ok(Vec::new());
-    }
-    let seed_at = preview_start - chrono::Duration::nanoseconds(1);
-    let mut seeds = Vec::new();
-    for rule in &proposed_policy.budgets {
-        for limit in &rule.limits.spend {
-            let Some(window) = crate::policy::parse_limit_window(&limit.window) else {
-                continue;
-            };
-            let limit_id = limit.id.as_deref().unwrap_or(limit.window.as_str());
-            let mode = limit.mode.unwrap_or(SpendWindowMode::Tumbling);
-            let since = match mode {
-                SpendWindowMode::Rolling => (preview_start - window).max(history_window_start),
-                SpendWindowMode::Tumbling => (preview_start - window).max(history_window_start),
-            };
-            let totals = ledger.spend_scope_totals(&rule.id, limit_id, since, preview_start)?;
-            for total in totals {
-                seeds.push(ReplaySpendSeed {
-                    rule_id: rule.id.clone(),
-                    limit_id: limit_id.to_owned(),
-                    scope_key: total.scope_key,
-                    amount_usd: total.amount_usd,
-                    mode,
-                    seeded_at: seed_at,
-                    window_started_at: since,
-                });
-            }
-        }
-    }
-    Ok(seeds)
 }
 
 fn app_replay_recommendations(
@@ -338,6 +337,8 @@ pub(crate) fn replay_historical_requests(
         replay_ledger.seed_replay_spend(seed.clone());
     }
     let mut runs = std::collections::BTreeMap::<String, ReplayRunAggregate>::new();
+    let mut totals = AppRunTotals::default();
+    let mut replay_run_keys = std::collections::BTreeSet::<String>::new();
 
     for historical in historical_requests {
         let decision = replay_ledger.try_authorize_replay_at(
@@ -362,6 +363,7 @@ pub(crate) fn replay_historical_requests(
                     historical.request.model.as_deref().unwrap_or("unknown")
                 )
             });
+        replay_run_keys.insert(key.clone());
         let run_id = agent_run_id
             .clone()
             .or_else(|| trace_id.clone())
@@ -383,6 +385,13 @@ pub(crate) fn replay_historical_requests(
             entry.cost_usd += historical.request.estimated_cost_usd.unwrap_or(0.0);
             entry.tokens += historical.request.estimated_tokens.unwrap_or(0);
         }
+        match proposed_label {
+            "allow" => totals.allow += 1,
+            "warn" => totals.warn += 1,
+            "deny" => totals.deny += 1,
+            "ask" => totals.ask += 1,
+            _ => {}
+        }
         if app_decision_rank(baseline_label) > app_decision_rank(&entry.baseline_decision) {
             entry.baseline_decision = baseline_label.to_owned();
         }
@@ -398,28 +407,18 @@ pub(crate) fn replay_historical_requests(
         }
     }
 
-    let mut totals = AppRunTotals {
-        runs: runs.len() as u64,
-        ..AppRunTotals::default()
-    };
+    totals.runs = replay_run_keys.len() as u64;
     let mut changed_runs = Vec::new();
     let mut baseline_spend = 0.0;
     let mut proposed_spend = 0.0;
+    let mut proposed_tokens = 0;
     for run in runs.into_values() {
-        totals.tokens += run.tokens;
-        match run.proposed_decision.as_str() {
-            "allow" => totals.allow += 1,
-            "warn" => totals.warn += 1,
-            "deny" => totals.deny += 1,
-            "ask" => totals.ask += 1,
-            _ => {}
-        }
         if run.baseline_decision != "deny" {
             baseline_spend += run.cost_usd;
         }
         if run.proposed_decision != "deny" {
             proposed_spend += run.cost_usd;
-            totals.spend_usd += run.cost_usd;
+            proposed_tokens += run.tokens;
         }
         if run.baseline_decision != run.proposed_decision {
             changed_runs.push(AppReplayChangedRun {
@@ -433,6 +432,8 @@ pub(crate) fn replay_historical_requests(
             });
         }
     }
+    totals.spend_usd = proposed_spend;
+    totals.tokens = proposed_tokens;
     changed_runs.sort_by(|left, right| right.cost_usd.total_cmp(&left.cost_usd));
     let changed_runs_total = changed_runs.len();
     Ok((
@@ -441,6 +442,60 @@ pub(crate) fn replay_historical_requests(
         proposed_spend - baseline_spend,
         changed_runs_total,
     ))
+}
+
+pub(crate) fn replay_baseline_totals(
+    historical_requests: &[crate::ledger::HistoricalAuthorizeRequest],
+    usage_by_agent_run: &std::collections::BTreeMap<String, AppRunUsage>,
+) -> AppRunTotals {
+    let mut totals = AppRunTotals::default();
+    let mut run_keys = std::collections::BTreeSet::<String>::new();
+    let mut run_usage_keys = std::collections::BTreeSet::<String>::new();
+    for historical in historical_requests {
+        let baseline_label = decision_outcome_label(historical.baseline_outcome);
+        let agent_run_id = string_metadata_value(&historical.request, "agent_run_id");
+        let trace_id = string_metadata_value(&historical.request, "trace_id");
+        let key = agent_run_id
+            .clone()
+            .map(|id| format!("agent-run:{id}"))
+            .or_else(|| trace_id.clone().map(|id| format!("trace:{id}")))
+            .unwrap_or_else(|| {
+                let minute_bucket = historical.occurred_at.timestamp() / 60;
+                format!(
+                    "untraced:{}:{}:{}:{minute_bucket}",
+                    baseline_label,
+                    "unattributed",
+                    historical.request.model.as_deref().unwrap_or("unknown")
+                )
+            });
+        run_keys.insert(key);
+        match baseline_label {
+            "allow" => totals.allow += 1,
+            "warn" => totals.warn += 1,
+            "deny" => totals.deny += 1,
+            "ask" => totals.ask += 1,
+            _ => {}
+        }
+        if baseline_label == "deny" {
+            continue;
+        }
+        if let Some(agent_run_id) = agent_run_id
+            && usage_by_agent_run.contains_key(&agent_run_id)
+        {
+            run_usage_keys.insert(agent_run_id);
+        } else {
+            totals.spend_usd += historical.request.estimated_cost_usd.unwrap_or(0.0);
+            totals.tokens += historical.request.estimated_tokens.unwrap_or(0);
+        }
+    }
+    totals.runs = run_keys.len() as u64;
+    for key in run_usage_keys {
+        if let Some(usage) = usage_by_agent_run.get(&key) {
+            totals.spend_usd += usage.cost_usd;
+            totals.tokens += usage.tokens;
+        }
+    }
+    totals
 }
 
 fn decision_outcome_label(outcome: DecisionOutcome) -> &'static str {
