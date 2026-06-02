@@ -47,7 +47,8 @@ pub(super) async fn app_replay(
         proposed_hash.as_deref(),
     )
     .await?;
-    let latest_job = latest_replay_job(&state).await;
+    let latest_job =
+        latest_replay_job_matching_policy(&state, &active_hash, proposed_hash.as_deref()).await;
     if let Some((job_id, job)) = latest_job.as_ref() {
         let job_is_fresh = if let Some(result) = job.result.as_ref() {
             !replay_ledger_changed_since(&state, result.history_window_end).await?
@@ -136,7 +137,14 @@ pub(super) async fn start_app_replay_job(
     {
         let mut jobs = state.replay_jobs.lock().await;
         prune_replay_jobs(&mut jobs, created_at);
-        if jobs.values().any(|job| job.status == "running") {
+        if jobs.values().any(|job| {
+            job.status == "running"
+                && replay_job_matches_policy_hashes(
+                    job,
+                    &active_policy_hash,
+                    Some(&proposed_policy_hash),
+                )
+        }) {
             return Err(NoetError::TooManyRequests(
                 "a full replay job is already running".to_owned(),
             ));
@@ -153,6 +161,8 @@ pub(super) async fn start_app_replay_job(
                 history_window_days: APP_REPLAY_HISTORY_WINDOW_DAYS,
                 created_at,
                 completed_at: None,
+                active_policy_hash: active_policy_hash.clone(),
+                proposed_policy_hash: proposed_policy_hash.clone(),
                 error: None,
                 result: None,
                 snapshot: None,
@@ -235,9 +245,16 @@ fn prune_replay_jobs(
     });
 }
 
-async fn latest_replay_job(state: &AppState) -> Option<(String, AppReplayJob)> {
+async fn latest_replay_job_matching_policy(
+    state: &AppState,
+    active_policy_hash: &str,
+    proposed_policy_hash: Option<&str>,
+) -> Option<(String, AppReplayJob)> {
     let jobs = state.replay_jobs.lock().await;
     jobs.iter()
+        .filter(|(_, job)| {
+            replay_job_matches_policy_hashes(job, active_policy_hash, proposed_policy_hash)
+        })
         .max_by_key(|(_, job)| (job.status == "running", job.created_at))
         .map(|(id, job)| (id.clone(), job.clone()))
 }
@@ -274,6 +291,11 @@ fn full_replay_spend_seeds(
                 ledger.spend_scope_totals(&rule.id, limit_id, since, history_window_start)?
             {
                 let seeded_at = history_window_start - chrono::Duration::seconds(1);
+                if mode == SpendWindowMode::Tumbling
+                    && total.first_spend_at + window <= history_window_start
+                {
+                    continue;
+                }
                 seeds.push(ReplaySpendSeed {
                     rule_id: rule.id.clone(),
                     limit_id: limit_id.to_owned(),
@@ -282,7 +304,7 @@ fn full_replay_spend_seeds(
                     mode,
                     seeded_at,
                     window_started_at: match mode {
-                        SpendWindowMode::Tumbling => seeded_at,
+                        SpendWindowMode::Tumbling => total.first_spend_at,
                         SpendWindowMode::Rolling => since,
                     },
                 });
@@ -306,6 +328,17 @@ fn replay_job_matches_policy(
             .unwrap_or(false)
 }
 
+fn replay_job_matches_policy_hashes(
+    job: &AppReplayJob,
+    active_policy_hash: &str,
+    proposed_policy_hash: Option<&str>,
+) -> bool {
+    job.active_policy_hash == active_policy_hash
+        && proposed_policy_hash
+            .map(|hash| job.proposed_policy_hash == hash)
+            .unwrap_or(false)
+}
+
 pub(super) async fn app_replay_job(
     State(state): State<AppState>,
     AxumPath(job_id): AxumPath<String>,
@@ -315,6 +348,21 @@ pub(super) async fn app_replay_job(
         .get(&job_id)
         .cloned()
         .ok_or_else(|| NoetError::NotFound(format!("replay job {job_id}")))?;
+    drop(jobs);
+    let active_source = state
+        .active_policy_source()
+        .await
+        .map(|(_, _, policy)| app_display_policy_source(policy.as_ref()))
+        .transpose()?
+        .unwrap_or_default();
+    let active_hash = policy_hash(&active_source);
+    let proposed_hash = app_policy_proposal(&state.policy_proposal_path)
+        .await?
+        .as_ref()
+        .map(|proposal| policy_hash(&proposal.source));
+    if !replay_job_matches_policy_hashes(&job, &active_hash, proposed_hash.as_deref()) {
+        return Err(NoetError::NotFound(format!("replay job {job_id}")));
+    }
     Ok(Json(app_replay_job_response(job_id, job)))
 }
 
